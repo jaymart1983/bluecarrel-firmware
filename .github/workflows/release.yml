@@ -83,6 +83,18 @@ jobs:
       - name: Build
         run: pio run -e "$PIO_ENV" -j1
 
+      # A release must be the firmware that was tested: refuse an image missing the
+      # Bluetooth link (a release env once lost FREEINK_CAP_BLE_TRANSFER unnoticed).
+      - name: Check the image has the X4 Pro features
+        run: |
+          image=".pio/build/$PIO_ENV/firmware.bin"
+          for marker in "X4AUTH2|host|" "X4FW1|" "Bluecarrel"; do
+            if ! grep -aqF "$marker" "$image"; then
+              echo "::error::$image is missing '$marker'; the release env does not match env:x4pro"
+              exit 1
+            fi
+          done
+
       # Written after the build so no build script runs while the key is on disk.
       - name: Write signing key
         env:

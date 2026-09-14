@@ -284,15 +284,27 @@ updates.
 Pairing happens on the Bluetooth section of the Settings page. On the X4 Pro, open the Control Centre and tap
 **Settings**. (The same page is **Settings > System > Bluetooth**.)
 
-- **Not paired yet:** the page shows a six-digit code. Type it into the app. The reader remembers the phone as soon as
-  the code is accepted.
-- **Already paired:** the code is hidden. The page shows **Paired with** and the phone's name (as the app reports it),
-  whether it is connected, and a **Forget** button.
+To pair:
 
-If the app reports that the reader does not recognise it, tap **Forget** on the reader; the code appears again and you
-can pair afresh.
+1. Open the Settings page on the reader. While no phone is paired it reads **Pair your phone**.
+2. In the X4 Pro Sync app, start pairing and choose the reader.
+3. The reader shows a six-digit passkey under **Type this passkey on your phone**. Type it into the pairing dialog on
+   your phone.
 
-The reader remembers **one** phone at a time. Pairing a second replaces the first.
+Pairing works only while the Settings page is open. Leaving the page closes it.
+
+Once paired, the page shows **Paired with** and the phone's name, whether it is connected, and two buttons:
+
+- **Pair new phone:** opens pairing for a different phone. When the new phone pairs, the old one is removed.
+- **Forget:** removes the phone from the reader.
+
+After three wrong passkeys the page shows **Pairing locked, try again in 60 s** (counting down).
+
+To pair a phone again after **Forget**, or after another phone replaced it, first remove the reader from the phone's
+Bluetooth settings, then pair as above.
+
+The reader remembers **one** phone at a time. The link is encrypted, and the app and reader check each other on every
+connection.
 
 ### 3.5.3 USB Drive
 
@@ -318,13 +330,19 @@ Firmware updates are files in a folder called `firmware` at the root of the SD c
 ```
 /firmware/firmware.bin            the firmware image
 /firmware/firmware.bin.sha256     its SHA-256 checksum
-/firmware/firmware.bin.version    the version (optional; written by the app)
+/firmware/firmware.bin.version    its version, such as 20260913.1914
+/firmware/firmware.bin.sig        its signature
 ```
 
-**From the app.** The X4 Pro Sync app sends the image over Bluetooth and the reader writes these files itself.
+**Only signed firmware installs this way.** The reader checks the signature against the project's key, and only
+offers an image that is newer than the running version.
 
-**By hand.** Plug the reader into a computer (USB Drive), copy `firmware.bin` into `/firmware`, and add
-`firmware.bin.sha256` with its checksum. The output of `sha256sum firmware.bin` works as-is:
+**From the app.** The X4 Pro Sync app sends the image over Bluetooth and the reader writes all four files itself.
+
+**By hand.** Plug the reader into a computer (USB Drive) and copy all four files into `/firmware`. A release has
+`crosspoint-x4pro-<version>.bin` and `crosspoint-x4pro-<version>.bin.sig`: copy them as `firmware.bin` and
+`firmware.bin.sig`. Write the version into `firmware.bin.version`, and the checksum into `firmware.bin.sha256`. The
+output of `sha256sum firmware.bin` works as-is:
 
 ```
 9f2c…a1  firmware.bin
@@ -333,8 +351,9 @@ Firmware updates are files in a folder called `firmware` at the root of the SD c
 On macOS use `shasum -a 256 firmware.bin`; on Windows, `certutil -hashfile firmware.bin SHA256` (paste just the hash).
 Eject the drive. Both routes then behave the same way.
 
-**What happens next.** The reader checks the folder about every 30 seconds. When it finds an image whose checksum
-matches, it shows **Firmware update found** over whatever is on screen, including an open book, with three choices:
+**What happens next.** The reader checks the folder about every 30 seconds. When it finds a signed, newer image whose
+checksum matches, it shows **Firmware update found** over whatever is on screen, including an open book, with three
+choices:
 
 - **Update Now:** closes the book (saving your place), installs, and restarts.
 - **Later:** installs the next time the reader goes to sleep, then goes back to sleep. When you wake it, it is on the
@@ -344,22 +363,32 @@ matches, it shows **Firmware update found** over whatever is on screen, includin
 The question stays on screen until you choose one. You can also leave it by going Home from the Control Centre; the
 update then waits in Settings.
 
-After a successful install the files are deleted, so the update is not offered again. An image whose checksum does not
-match is ignored and left on the card.
+Just before installing, the reader checks the image again. If it changed since you approved it, the install stops with
+*Image changed*. After a successful install the files are deleted, so the update is not offered again.
 
 **Auto-install.** With **Settings > System > Auto-install Firmware Updates** on, there is no question: a verified update
-installs the next time the reader sleeps.
+installs the next time the reader sleeps. This can only be changed on the reader, not from the app.
 
 **Where to see it.** The **Firmware** section of the Settings page (Control Centre > Settings on the X4 Pro) shows the
 running version (a build stamp such as `20260913.1914`) and the state of the card: *Up to date*, *Checking*,
-*ready to install*, *installs at sleep*, or *Invalid image*. The **Firmware Update** row in **Settings > System** shows
-the same state. When an update is ready, tap either one to get the same three choices.
+*ready to install* or *installs at sleep*. When an image is refused it shows why, and the files stay on the card:
+
+| Shown | Meaning |
+| --- | --- |
+| *Unsigned image* | No `firmware.bin.sig` |
+| *Bad signature* | The signature is not from the project's key, or does not match the image and version |
+| *Not newer* | The version is not newer than the running firmware |
+| *No version* | `firmware.bin.version` is missing or not in the `yyyyMMdd.HHmm` form |
+| *Hash mismatch* | The image does not match `firmware.bin.sha256` |
+| *Invalid image* | `firmware.bin.sha256` is unusable, or the image is too small |
+
+The **Firmware Update** row in **Settings > System** shows the same state. When an update is ready, tap either one to
+get the same three choices.
 
 > [!NOTE]
-> **The checksum is there to catch a bad copy, not to prove where the firmware came from.** Anyone who can write
-> `firmware.bin` onto the card can write `firmware.bin.sha256` beside it, so a matching checksum tells you the image is
-> intact, not that it is trustworthy. Only install firmware from a source you trust. The reader also checks that the
-> image is a valid firmware image for this device before installing it.
+> **Settings > System > SD Card Firmware Update** is different: it lets you pick any `.bin` on the card and installs it
+> after checking only that it is a valid image for this device. It does not need a signature, so use it only with
+> firmware you trust. Flashing over USB with `esptool` also always works.
 
 ### 3.6 Settings
 
@@ -507,7 +536,7 @@ The Settings screen allows you to configure the device's behavior. There are a f
 
 - **Clear Reading Cache**: Clear the internal SD card cache.
 
-- **Bluetooth**: Opens the Settings page with the Bluetooth and Firmware sections: pair a phone, see which phone is paired, or forget it. On the X4 Pro the Control Centre's Settings tile opens the same page — see [3.5.2](#352-bluetooth). *(Only on builds with the Bluetooth link, such as the X4 Pro.)*
+- **Bluetooth**: Opens the Settings page with the Bluetooth and Firmware sections: pair a phone, see which phone is paired, pair a new phone, or forget it. On the X4 Pro the Control Centre's Settings tile opens the same page — see [3.5.2](#352-bluetooth). *(Only on builds with the Bluetooth link, such as the X4 Pro.)*
 - **Firmware Update** *(Bluetooth builds)*: Shows whether an update is waiting on the SD card; tap it when one is ready. See [3.5.4](#354-firmware-updates-from-the-sd-card).
 - **Auto-install Firmware Updates**: Off (default) asks with Update Now / Later / Cancel when an update is found. On installs it at the next sleep without asking.
 - **Check for updates** *(not on the X4 Pro build)*: Check for Crosspoint firmware updates over Wi-Fi. On the X4 Pro, updates come from the X4 Pro Sync app or a file copied to `/firmware` — see [3.5.4](#354-firmware-updates-from-the-sd-card).

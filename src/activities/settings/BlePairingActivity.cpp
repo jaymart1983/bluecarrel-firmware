@@ -7,6 +7,7 @@
 #include <Logging.h>
 
 #include <algorithm>
+#include <cstdio>
 #include <string>
 
 #include "FirmwareReadyActivity.h"
@@ -20,10 +21,14 @@
 namespace {
 
 constexpr unsigned long STAGE_POLL_MS = 1000;
+// The lockout countdown repaints in steps of this many seconds, not every second.
+constexpr uint32_t LOCK_STEP_SECONDS = 5;
 
 bool hitRect(const Rect& r, const int x, const int y) {
   return r.height > 0 && x >= r.x && x < r.x + r.width && y >= r.y && y < r.y + r.height;
 }
+
+uint32_t lockStep(const uint32_t secondsLeft) { return (secondsLeft + LOCK_STEP_SECONDS - 1) / LOCK_STEP_SECONDS; }
 
 }  // namespace
 
@@ -33,11 +38,14 @@ void BlePairingActivity::onEnter() {
   // start here too -- begin() is idempotent.
   BLE_LINK.begin();
   BLE_LINK.setObserver(this);
+  if (!BLE_LINK.hasTrustedHost()) BLE_LINK.openPairingWindow();
   refreshFirmwareStage();
+  selected_ = firmwareReady_ ? Row::FIRMWARE : Row::PAIR_NEW;
   requestUpdate();
 }
 
 void BlePairingActivity::onExit() {
+  BLE_LINK.closePairingWindow();
   BLE_LINK.clearObserver(this);
   Activity::onExit();
 }
@@ -53,6 +61,56 @@ void BlePairingActivity::refreshFirmwareStage() {
   }
 }
 
+size_t BlePairingActivity::visibleRows(Row rows[MAX_ROWS]) const {
+  size_t count = 0;
+  if (BLE_LINK.hasTrustedHost()) {
+    if (!BLE_LINK.pairingWindowOpen() && BLE_LINK.pairingLockSecondsLeft() == 0) rows[count++] = Row::PAIR_NEW;
+    rows[count++] = Row::FORGET;
+  }
+  if (firmwareReady_) rows[count++] = Row::FIRMWARE;
+  return count;
+}
+
+BlePairingActivity::Row BlePairingActivity::effectiveSelection() const {
+  Row rows[MAX_ROWS];
+  const size_t count = visibleRows(rows);
+  if (count == 0) return selected_;
+  for (size_t i = 0; i < count; i++) {
+    if (rows[i] == selected_) return selected_;
+  }
+  return rows[0];
+}
+
+void BlePairingActivity::moveSelection(const int delta) {
+  Row rows[MAX_ROWS];
+  const size_t count = visibleRows(rows);
+  if (count == 0) return;
+  const Row current = effectiveSelection();
+  size_t index = 0;
+  for (size_t i = 0; i < count; i++) {
+    if (rows[i] == current) index = i;
+  }
+  const int total = static_cast<int>(count);
+  selected_ = rows[static_cast<size_t>((static_cast<int>(index) + delta % total + total) % total)];
+  requestUpdate();
+}
+
+void BlePairingActivity::activate(const Row row) {
+  switch (row) {
+    case Row::PAIR_NEW:
+      selected_ = Row::FORGET;
+      BLE_LINK.openPairingWindow();
+      requestUpdate();
+      return;
+    case Row::FORGET:
+      promptForget();
+      return;
+    case Row::FIRMWARE:
+      openFirmware();
+      return;
+  }
+}
+
 void BlePairingActivity::loop() {
   if (mappedInput.wasPressed(MappedInputManager::Button::Back)) {
     finish();
@@ -61,30 +119,36 @@ void BlePairingActivity::loop() {
 
   // The staged image changes on its own -- a hash finishing, an upload landing --
   // and nothing tells this screen, so look once a second and repaint on a change.
-  if (millis() - lastStageCheckMs_ >= STAGE_POLL_MS) refreshFirmwareStage();
-
-  const bool canForget = BLE_LINK.hasTrustedHost();
+  // The lockout countdown rides the same poll.
+  if (millis() - lastStageCheckMs_ >= STAGE_POLL_MS) {
+    refreshFirmwareStage();
+    const uint32_t step = lockStep(BLE_LINK.pairingLockSecondsLeft());
+    if (step != lastLockStep_) {
+      lastLockStep_ = step;
+      requestUpdate();
+    }
+  }
 
   int x = 0;
   int y = 0;
   if (mappedInput.wasScreenTapped(x, y)) {
-    if (firmwareReady_ && hitRect(firmwareRect_, x, y)) {
-      openFirmware();
-      return;
-    }
-    if (canForget && hitRect(forgetRect_, x, y)) {
-      promptForget();
-      return;
+    Row rows[MAX_ROWS];
+    const size_t count = visibleRows(rows);
+    for (size_t i = 0; i < count; i++) {
+      const Rect& rect = rows[i] == Row::PAIR_NEW ? pairNewRect_ : rows[i] == Row::FORGET ? forgetRect_ : firmwareRect_;
+      if (hitRect(rect, x, y)) {
+        activate(rows[i]);
+        return;
+      }
     }
   }
 
+  if (mappedInput.wasPressed(MappedInputManager::Button::Up)) moveSelection(-1);
+  if (mappedInput.wasPressed(MappedInputManager::Button::Down)) moveSelection(1);
+
   if (mappedInput.wasPressed(MappedInputManager::Button::Confirm)) {
-    // The highlighted row: the waiting update when there is one, else Forget.
-    if (firmwareReady_) {
-      openFirmware();
-    } else if (canForget) {
-      promptForget();
-    }
+    Row rows[MAX_ROWS];
+    if (visibleRows(rows) > 0) activate(effectiveSelection());
   }
 }
 
@@ -98,6 +162,8 @@ void BlePairingActivity::promptForget() {
           RenderLock lock(*this);
           if (!BLE_LINK.forgetTrustedHost()) LOG_ERR("BLE", "could not forget the trusted host");
         }
+        // Nobody is paired and this screen is up, so pairing is open again.
+        if (!BLE_LINK.hasTrustedHost()) BLE_LINK.openPairingWindow();
         requestUpdate();
       });
 }
@@ -121,6 +187,11 @@ void BlePairingActivity::render(RenderLock&&) {
   const bool paired = BLE_LINK.hasTrustedHost();
   const std::string hostLabel = BLE_LINK.trustedHostLabel();
   const std::string& authError = BLE_LINK.authError();
+  const bool windowOpen = BLE_LINK.pairingWindowOpen();
+  const uint32_t lockSeconds = BLE_LINK.pairingLockSecondsLeft();
+  uint32_t passkey = 0;
+  const bool pairingInProgress = BLE_LINK.pairingPasskey(passkey);
+  const Row selection = effectiveSelection();
 
   renderer.clearScreen();
   GUI.drawHeader(renderer, Rect{0, metrics.topPadding, pageWidth, metrics.headerHeight}, tr(STR_SETTINGS_TITLE));
@@ -155,6 +226,7 @@ void BlePairingActivity::render(RenderLock&&) {
 
   // --- Bluetooth -------------------------------------------------------------
   sectionTitle(tr(STR_BLUETOOTH));
+  pairNewRect_ = Rect{0, 0, 0, 0};
   forgetRect_ = Rect{0, 0, 0, 0};
   if (paired) {
     line(UI_10_FONT_ID, std::string(tr(STR_BLE_PAIRED_WITH)) + " " + hostLabel, EpdFontFamily::BOLD);
@@ -162,16 +234,35 @@ void BlePairingActivity::render(RenderLock&&) {
          EpdFontFamily::REGULAR);
   } else {
     line(UI_10_FONT_ID, tr(STR_BLE_PAIR_PHONE), EpdFontFamily::BOLD);
-    line(SMALL_FONT_ID, tr(STR_BLE_PAIR_HINT), EpdFontFamily::REGULAR);
+  }
+
+  if (lockSeconds > 0) {
+    char locked[64];
+    snprintf(locked, sizeof(locked), tr(STR_BLE_PAIRING_LOCKED_FORMAT),
+             static_cast<unsigned>(lockStep(lockSeconds) * LOCK_STEP_SECONDS));
     y += metrics.verticalSpacing;
-    // The code only while no phone is paired: a paired phone reconnects over its
-    // saved credential and never sends it. Forget brings it back.
-    line(UI_12_FONT_ID, std::string(tr(STR_BLE_TRANSFER_CODE)) + BLE_LINK.sessionCode(), EpdFontFamily::BOLD);
+    line(UI_10_FONT_ID, locked, EpdFontFamily::BOLD);
+  } else if (pairingInProgress) {
+    y += metrics.verticalSpacing;
+    line(SMALL_FONT_ID, tr(STR_BLE_PASSKEY_HINT), EpdFontFamily::REGULAR);
+    char digits[8];
+    snprintf(digits, sizeof(digits), "%03u %03u", static_cast<unsigned>(passkey / 1000),
+             static_cast<unsigned>(passkey % 1000));
+#ifndef OMIT_FONTS
+    line(NOTOSANS_18_FONT_ID, digits, EpdFontFamily::BOLD);
+#else
+    line(UI_12_FONT_ID, digits, EpdFontFamily::BOLD);
+#endif
+  } else if (windowOpen) {
+    line(SMALL_FONT_ID, tr(STR_BLE_PAIR_HINT), EpdFontFamily::REGULAR);
   }
   if (!authError.empty()) {
-    line(SMALL_FONT_ID, std::string(tr(STR_ERROR_MSG)) + ": " + authError, EpdFontFamily::REGULAR);
+    line(SMALL_FONT_ID, std::string(tr(STR_ERROR_MSG)) + " " + authError, EpdFontFamily::REGULAR);
   }
-  if (paired) forgetRect_ = actionRow(tr(STR_FORGET_BUTTON), !firmwareReady_);
+  if (paired && !windowOpen && lockSeconds == 0) {
+    pairNewRect_ = actionRow(tr(STR_BLE_PAIR_NEW_PHONE), selection == Row::PAIR_NEW);
+  }
+  if (paired) forgetRect_ = actionRow(tr(STR_FORGET_BUTTON), selection == Row::FORGET);
   y += metrics.verticalSpacing * 3;
 
   // --- Firmware --------------------------------------------------------------
@@ -181,7 +272,7 @@ void BlePairingActivity::render(RenderLock&&) {
   const std::string status = firmwareStageStatusText();
   if (firmwareReady_) {
     // A row, because it does something: Update Now / Later / Cancel.
-    firmwareRect_ = actionRow(status, true);
+    firmwareRect_ = actionRow(status, selection == Row::FIRMWARE);
   } else {
     line(SMALL_FONT_ID, status, EpdFontFamily::REGULAR);
   }

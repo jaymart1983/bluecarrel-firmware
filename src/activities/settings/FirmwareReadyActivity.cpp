@@ -49,8 +49,7 @@ void FirmwareReadyActivity::choose(const int index) {
     return;
   }
   if (index == CHOICE_LATER) {
-    LOG_INF("FWDROP", "update deferred to the next sleep");
-    FIRMWARE_WATCHER.deferToSleep();
+    if (FIRMWARE_WATCHER.deferToSleep()) LOG_INF("FWDROP", "update deferred to the next sleep");
   } else {
     LOG_INF("FWDROP", "update cancelled; offered again after a restart");
   }

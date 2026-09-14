@@ -9,23 +9,25 @@ engine and reading experience; see [Credits](#credits).
 
 ## Download
 
-Prebuilt images are on the [Releases page](https://github.com/jaymart1983/crosspoint-reader/releases). Each release has:
+Prebuilt images are on the [Releases page](https://github.com/jaymart1983/crosspoint-reader/releases). Tags ending in
+`-test` are pre-releases. Each release has:
 
 | File | Use |
 |---|---|
 | `crosspoint-x4pro-<version>-full.bin` | First install over USB (bootloader, partition table and firmware) |
 | `crosspoint-x4pro-<version>.bin` | Firmware only: USB reinstall, or hosting your own update page |
-| `firmware.json` | Update-page manifest for the app |
+| `crosspoint-x4pro-<version>.bin.sig` | Signature for the firmware image; copy to `/firmware/firmware.bin.sig` for a hand-copied update |
+| `firmware.json` | Update-page manifest for the app, including the signature |
 | `SHA256SUMS` | Checksums |
 
 ## Features
 
-- **Bluetooth link to the app.** Pair once with the six-digit code on the reader's Settings page
-  (Control Centre > Settings). The phone reconnects on its own and shows up by its own name.
+- **Bluetooth link to the app.** Pair once: open the reader's Settings page (Control Centre > Settings), start pairing
+  in the app, and type the passkey the reader shows. The phone reconnects on its own and shows up by its own name.
 - **Library from your server.** Books you keep offline in the app are copied to the reader; removing one removes it
   from both. The reader's Store browses your Calibre library through the phone.
 - **Reading positions** sync to KOReader-compatible kosync through the app while you read.
-- **Firmware updates over Bluetooth.** The app sends a new build; the reader verifies it and offers
+- **Firmware updates over Bluetooth.** The app sends a new signed build; the reader verifies it and offers
   **Update Now / Later / Cancel**. Later installs the next time the reader sleeps, or turn on automatic install.
 - **Touch page turns.** The screen is a 4x4 grid: the middle two cells on the left turn back, on the right turn
   forward. Links in books open with a tap. The touchscreen switch in the Control Centre turns touch off.
@@ -38,6 +40,19 @@ Prebuilt images are on the [Releases page](https://github.com/jaymart1983/crossp
 The X4 Pro build is Bluetooth only: no Wi-Fi, web server, WebDAV, OPDS browser or HTTP updates are compiled in.
 
 See the [User Guide](./USER_GUIDE.md) for everything else.
+
+## Security
+
+- **Encrypted pairing.** Bluetooth uses LE Secure Connections with a passkey shown on the reader, and pairing is only
+  possible while the reader's Settings page is open. After that, the app and the reader prove a shared secret to each
+  other on every connection.
+- **Signed updates.** Firmware sent by the app or copied to `/firmware` installs only if it is signed with the project
+  key and newer than the running version.
+- **Not protected:** anyone with USB access can flash any firmware with `esptool` (there is no secure boot), and the
+  **SD Card Firmware Update** picker in Settings installs unsigned images you choose on the device.
+- The app only talks to the library server and update page over HTTPS.
+
+Design: [docs/security-v2.md](./docs/security-v2.md).
 
 ## First install over USB
 
@@ -71,8 +86,8 @@ To return to stock, write your backup back with `write_flash 0x0 x4pro-stock-ful
 ## Updates
 
 After the first install, updates arrive over Bluetooth from the app. The app reads a `firmware.json` from an update
-page you set in its Settings: point it at a folder holding a release's `firmware.json` and `.bin`, served by any
-static web server. `scripts/make_firmware_json.sh` builds that folder from your own build.
+page you set in its Settings: point it at an `https://` folder holding a release's `firmware.json` and `.bin`. The
+manifest must carry a signature, and the reader installs only images signed with the key it was built with.
 
 ## Build
 
@@ -89,7 +104,37 @@ pio run -e x4pro
   `src/network/BuildStamp.h` at build time. Set `X4_BUILD_STAMP` to pin it.
 - Fixes this project needs in the `freeink-sdk` submodule are kept as patches in `scripts/freeink_patches/` and applied
   automatically.
-- Releases are built by GitHub Actions when a tag `x4pro-<yyyyMMdd.HHmm>` is pushed (`.github/workflows/release.yml`).
+- Releases are built by GitHub Actions when a tag `x4pro-<yyyyMMdd.HHmm>` is pushed (`.github/workflows/release.yml`),
+  and signed with the `FIRMWARE_SIGNING_KEY` repository secret. A tag `x4pro-<stamp>-test` publishes a pre-release.
+
+### Signing your own firmware
+
+A reader only installs Bluetooth and `/firmware` updates signed with the key compiled into it. To run and update your own
+builds:
+
+1. Create an EC P-256 key and keep it private. Never commit it.
+
+   ```bash
+   openssl ecparam -name prime256v1 -genkey -noout -out firmware-signing-key.pem
+   ```
+
+2. Replace the public key in `src/network/FirmwareSigningKey.h` with yours (DER SubjectPublicKeyInfo bytes):
+
+   ```bash
+   openssl pkey -in firmware-signing-key.pem -pubout -outform DER | xxd -i
+   ```
+
+3. Build, install that build once over USB (see [First install over USB](#first-install-over-usb)), then sign each
+   update:
+
+   ```bash
+   FIRMWARE_SIGNING_KEY_FILE=firmware-signing-key.pem scripts/make_firmware_json.sh <update-page-dir>
+   ```
+
+   This writes the `.bin`, its `.bin.sig` and `firmware.json` into the folder, and refuses if the key does not match
+   `FirmwareSigningKey.h`.
+
+A reader with your key refuses official releases, and the reverse.
 
 Developer notes: [AGENTS.md](./AGENTS.md). Bluetooth protocol: [docs/ble-transfer-protocol.md](./docs/ble-transfer-protocol.md).
 

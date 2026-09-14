@@ -166,7 +166,6 @@ constexpr size_t BLE_RESUME_HASH_CHUNK_BYTES = 512;
 constexpr size_t MAX_FILENAME_BYTES = 96;
 constexpr size_t BLE_HOST_ID_MAX_BYTES = 64;
 constexpr size_t BLE_HOST_NAME_MAX_BYTES = 48;
-constexpr size_t BLE_SHARED_SECRET_HEX_BYTES = 64;
 constexpr size_t BLE_NONCE_BYTES = 16;
 constexpr size_t BLE_PROGRESS_STATUS_INTERVAL_BYTES = 4UL * 1024UL;
 constexpr size_t BLE_PROGRESS_DISPLAY_INTERVAL_BYTES = 128UL * 1024UL;
@@ -246,10 +245,24 @@ constexpr unsigned STATUS_DETAIL_MAX = 5;
 static_assert(BLE_STATUS_NOTIFY_MAX_BYTES <= 517 - BLE_ATT_NOTIFY_OVERHEAD,
               "the notify cap must fit the largest MTU this server asks for");
 
-std::string makeSessionCode() {
-  char buffer[7];
-  snprintf(buffer, sizeof(buffer), "%06u", static_cast<unsigned>(esp_random() % 1000000UL));
-  return buffer;
+static_assert(BleLink::NO_CONNECTION == BLE_HS_CONN_HANDLE_NONE, "NO_CONNECTION must match NimBLE");
+
+constexpr int BLE_PROTOCOL_VERSION = 2;
+constexpr size_t BLE_CLIENT_NONCE_HEX_CHARS = 32;
+constexpr size_t BLE_HMAC_HEX_CHARS = 64;
+constexpr size_t BLE_FIRMWARE_SIGNATURE_MAX_HEX_CHARS = 256;
+constexpr size_t BLE_BUILD_STAMP_CHARS = 13;  // yyyyMMdd.HHmm
+constexpr uint32_t BLE_PASSKEY_RANGE = 1000000UL;
+constexpr const char* HOST_PROOF_PREFIX = "X4AUTH2|host|";
+constexpr const char* READER_PROOF_PREFIX = "X4AUTH2|reader|";
+
+// Six digits from esp_random(), without modulo bias. Only called while the
+// radio is on, when esp_random() is a true RNG.
+uint32_t makePasskey() {
+  constexpr uint32_t limit = UINT32_MAX - (UINT32_MAX % BLE_PASSKEY_RANGE);
+  uint32_t value = esp_random();
+  while (value >= limit) value = esp_random();
+  return value % BLE_PASSKEY_RANGE;
 }
 
 std::string bytesToHex(const uint8_t* data, const size_t length) {
@@ -290,6 +303,43 @@ bool isHexString(const std::string& value, const size_t length) {
 }
 
 bool isHexSha256(const std::string& value) { return isHexString(value, 64); }
+
+bool isLowerHex(const std::string& value, const size_t length) {
+  if (value.length() != length) return false;
+  return std::all_of(value.begin(), value.end(),
+                     [](const char c) { return (c >= '0' && c <= '9') || (c >= 'a' && c <= 'f'); });
+}
+
+int hexNibble(const char c) {
+  if (c >= '0' && c <= '9') return c - '0';
+  if (c >= 'a' && c <= 'f') return c - 'a' + 10;
+  return -1;
+}
+
+// Lowercase hex of exactly out.size() bytes.
+bool hexToBytes(const std::string& hex, std::array<uint8_t, BleTrustedHostStore::SECRET_BYTES>& out) {
+  if (hex.size() != out.size() * 2) return false;
+  for (size_t i = 0; i < out.size(); i++) {
+    const int high = hexNibble(hex[i * 2]);
+    const int low = hexNibble(hex[i * 2 + 1]);
+    if (high < 0 || low < 0) return false;
+    out[i] = static_cast<uint8_t>((high << 4) | low);
+  }
+  return true;
+}
+
+bool isBuildStamp(const std::string& value) {
+  if (value.size() != BLE_BUILD_STAMP_CHARS || value[8] != '.') return false;
+  for (size_t i = 0; i < value.size(); i++) {
+    if (i != 8 && !std::isdigit(static_cast<unsigned char>(value[i]))) return false;
+  }
+  return true;
+}
+
+bool isFirmwareSignatureHex(const std::string& value) {
+  return !value.empty() && value.size() <= BLE_FIRMWARE_SIGNATURE_MAX_HEX_CHARS && value.size() % 2 == 0 &&
+         isLowerHex(value, value.size());
+}
 
 bool endsWithSuffix(const std::string& value, const char* suffix, const size_t suffixLen) {
   if (value.length() < suffixLen) return false;
@@ -482,16 +532,13 @@ std::string transferKindName(const BleLink::TransferKind kind) {
 
 std::string sha256ToHex(const uint8_t digest[32]) { return bytesToHex(digest, 32); }
 
-std::string trustedHostMessage(const std::string& nonce, const std::string& hostId) {
-  return nonce + "|" + hostId + "|1";
-}
-
-std::string hmacSha256Hex(const std::string& secret, const std::string& message) {
+std::string hmacSha256Hex(const std::array<uint8_t, BleTrustedHostStore::SECRET_BYTES>& key,
+                          const std::string& message) {
   uint8_t output[32] = {};
   const mbedtls_md_info_t* md = mbedtls_md_info_from_type(MBEDTLS_MD_SHA256);
   if (!md) return "";
-  const int ret = mbedtls_md_hmac(md, reinterpret_cast<const uint8_t*>(secret.data()), secret.size(),
-                                  reinterpret_cast<const uint8_t*>(message.data()), message.size(), output);
+  const int ret = mbedtls_md_hmac(md, key.data(), key.size(), reinterpret_cast<const uint8_t*>(message.data()),
+                                  message.size(), output);
   if (ret != 0) return "";
   return bytesToHex(output, sizeof(output));
 }
@@ -558,11 +605,23 @@ bool hashExistingPrefix(const std::string& path, size_t bytes, mbedtls_sha256_co
   return true;
 }
 
+bool linkIsSecure(const NimBLEConnInfo& connInfo) {
+  return connInfo.isEncrypted() && connInfo.isAuthenticated() && connInfo.isBonded();
+}
+
+// Runs on the NimBLE host task. Every event is bound to the one connection the
+// link holds; events for any other handle are ignored.
 class ServerCallbacks final : public NimBLEServerCallbacks {
  public:
   explicit ServerCallbacks(BleLink& link) : link_(link) {}
 
   void onConnect(NimBLEServer* server, NimBLEConnInfo& connInfo) override {
+    const uint16_t handle = connInfo.getConnHandle();
+    if (!link_.bindConnection(handle)) {
+      LOG_ERR("BLE", "refusing a second connection (%u)", static_cast<unsigned>(handle));
+      server->disconnect(handle);
+      return;
+    }
     // 7.5-15 ms interval, no slave latency, 4 s supervision timeout.
     //
     // The timeout was 1.2 s (120 units). That is legal but tight: it is the
@@ -576,8 +635,8 @@ class ServerCallbacks final : public NimBLEServerCallbacks {
     // Latency stays 0: the peripheral answers every event, which is what keeps
     // a notification prompt and a transfer fast. The cost is the modem floor
     // while awake, which is already the price of the radio being always on.
-    server->updateConnParams(connInfo.getConnHandle(), 6, 12, 0, 400);
-    server->setDataLen(connInfo.getConnHandle(), 251);
+    server->updateConnParams(handle, 6, 12, 0, 400);
+    server->setDataLen(handle, 251);
     // BLE 5.0 2M PHY: double the symbol rate, which is the only throughput lever
     // left on this link. The interval is already at the 7.5 ms spec minimum and
     // the PDU is already the 251-byte maximum, so everything else is spent.
@@ -586,16 +645,18 @@ class ServerCallbacks final : public NimBLEServerCallbacks {
     // negotiates 1M instead of failing the procedure. Nothing depends on the
     // outcome -- it is a speed optimisation, and a phone that stays on 1M simply
     // transfers at the 1M rate. onPhyUpdate logs what was actually agreed.
-    server->updatePhy(connInfo.getConnHandle(), BLE_GAP_LE_PHY_1M_MASK | BLE_GAP_LE_PHY_2M_MASK,
+    server->updatePhy(handle, BLE_GAP_LE_PHY_1M_MASK | BLE_GAP_LE_PHY_2M_MASK,
                       BLE_GAP_LE_PHY_1M_MASK | BLE_GAP_LE_PHY_2M_MASK, 0);
     // Still the 23-byte default at this point on most stacks; onMTUChange
     // corrects it a moment later. Recorded either way so a peer that never
     // exchanges is sized for honestly rather than optimistically.
     link_.noteBleMtu(connInfo.getMTU());
-    link_.enqueueBleConnected();
+    link_.enqueueBleConnected(handle);
   }
 
-  void onMTUChange(uint16_t mtu, NimBLEConnInfo&) override { link_.noteBleMtu(mtu); }
+  void onMTUChange(uint16_t mtu, NimBLEConnInfo& connInfo) override {
+    if (connInfo.getConnHandle() == link_.boundConnection()) link_.noteBleMtu(mtu);
+  }
 
   void onPhyUpdate(NimBLEConnInfo&, const uint8_t txPhy, const uint8_t rxPhy) override {
     // Logged because it is otherwise invisible: a transfer that runs at half the
@@ -605,21 +666,80 @@ class ServerCallbacks final : public NimBLEServerCallbacks {
             rxPhy == BLE_GAP_LE_PHY_2M ? "2M" : "1M");
   }
 
-  void onDisconnect(NimBLEServer*, NimBLEConnInfo&, int) override {
+  void onDisconnect(NimBLEServer*, NimBLEConnInfo& connInfo, int) override {
+    const uint16_t handle = connInfo.getConnHandle();
+    if (!link_.releaseConnection(handle)) return;
     link_.noteBleMtu(0);
-    link_.enqueueBleDisconnected();
+    link_.enqueueBleDisconnected(handle);
+  }
+
+  // Called for each pairing attempt. NimBLE passes no connection; with one
+  // connection allowed it is the bound one. A closed window still gets a random
+  // passkey (the stack injects whatever is returned) and loses the link.
+  uint32_t onPassKeyDisplay() override {
+    const uint32_t passkey = makePasskey();
+    const uint16_t handle = link_.boundConnection();
+    if (handle == BleLink::NO_CONNECTION) return passkey;
+    if (!link_.pairingWindowOpen()) {
+      LOG_INF("BLE", "pairing refused: the pairing window is closed");
+      NimBLEDevice::getServer()->disconnect(handle);
+      return passkey;
+    }
+    link_.notePairingStarted(passkey);
+    return passkey;
+  }
+
+  // Fires on every encryption change, successful or not.
+  void onAuthenticationComplete(NimBLEConnInfo& connInfo) override {
+    const uint16_t handle = connInfo.getConnHandle();
+    if (handle != link_.boundConnection()) return;
+
+    const bool newBond = link_.takePairingStarted();
+    const bool windowOpen = link_.pairingWindowOpen();
+    const bool secure = linkIsSecure(connInfo);
+    // Encrypted but unauthenticated is Just Works: a pairing attempt too.
+    const bool attempted = newBond || (connInfo.isEncrypted() && !connInfo.isAuthenticated());
+    // A bond without a passkey on this connection is one the reader already had.
+    const bool accepted = secure && (!newBond || windowOpen);
+
+    if (!accepted) {
+      if (attempted && windowOpen) link_.notePairingFailed();
+      if (connInfo.isEncrypted()) {
+        // The keys this pairing produced must not outlive the connection.
+        NimBLEDevice::deleteBond(connInfo.getIdAddress());
+      }
+      LOG_INF("BLE", "link refused (encrypted=%d authenticated=%d bonded=%d new=%d window=%d)",
+              connInfo.isEncrypted(), connInfo.isAuthenticated(), connInfo.isBonded(), newBond, windowOpen);
+      NimBLEDevice::getServer()->disconnect(handle);
+      link_.enqueueSecurityResult(handle, false, newBond, {});
+      return;
+    }
+
+    link_.markConnectionSecure();
+    std::string peerIdAddress;
+    if (newBond) {
+      const NimBLEAddress id = connInfo.getIdAddress();
+      peerIdAddress.assign(reinterpret_cast<const char*>(id.getBase()), sizeof(ble_addr_t));
+    }
+    link_.enqueueSecurityResult(handle, true, newBond, peerIdAddress);
   }
 
  private:
   BleLink& link_;
 };
 
+// Writes count only from the bound connection once it is secure.
 class ControlCallbacks final : public NimBLECharacteristicCallbacks {
  public:
   explicit ControlCallbacks(BleLink& link) : link_(link) {}
 
-  void onWrite(NimBLECharacteristic* characteristic, NimBLEConnInfo&) override {
-    link_.enqueueControlWrite(characteristic->getValue());
+  void onWrite(NimBLECharacteristic* characteristic, NimBLEConnInfo& connInfo) override {
+    const uint16_t handle = connInfo.getConnHandle();
+    if (!linkIsSecure(connInfo) || !link_.boundConnectionSecure(handle)) {
+      LOG_DBG("BLE", "control write ignored: link not secure");
+      return;
+    }
+    link_.enqueueControlWrite(handle, characteristic->getValue());
   }
 
  private:
@@ -630,8 +750,10 @@ class DataCallbacks final : public NimBLECharacteristicCallbacks {
  public:
   explicit DataCallbacks(BleLink& link) : link_(link) {}
 
-  void onWrite(NimBLECharacteristic* characteristic, NimBLEConnInfo&) override {
-    link_.enqueueDataWrite(characteristic->getValue());
+  void onWrite(NimBLECharacteristic* characteristic, NimBLEConnInfo& connInfo) override {
+    const uint16_t handle = connInfo.getConnHandle();
+    if (!linkIsSecure(connInfo) || !link_.boundConnectionSecure(handle)) return;
+    link_.enqueueDataWrite(handle, characteristic->getValue());
   }
 
  private:
@@ -657,6 +779,12 @@ struct BleLinkRuntime {
 
   bool begin() {
     NimBLEDevice::init(BLE_DEVICE_NAME);
+    // LE Secure Connections with bonding and MITM protection by passkey entry:
+    // the reader displays the passkey, the phone types it.
+    NimBLEDevice::setSecurityAuth(true, true, true);
+    NimBLEDevice::setSecurityIOCap(BLE_HS_IO_DISPLAY_ONLY);
+    // The radio is on now, so esp_random() draws from the true RNG.
+    link.deviceNonce_ = makeNonceHex();
     // Before the server starts, and before any peer can connect: the preferred
     // MTU is what an exchange is answered with, and NimBLE latches it into a
     // connection when the connection is made. Setting it after a peer is on the
@@ -675,9 +803,15 @@ struct BleLinkRuntime {
     service = server->createService(BLE_SERVICE_UUID);
     if (!service) return false;
 
-    control = service->createCharacteristic(BLE_CONTROL_UUID, NIMBLE_PROPERTY::WRITE);
-    dataIn = service->createCharacteristic(BLE_DATA_IN_UUID, NIMBLE_PROPERTY::WRITE | NIMBLE_PROPERTY::WRITE_NR);
-    status = service->createCharacteristic(BLE_STATUS_UUID, NIMBLE_PROPERTY::READ | NIMBLE_PROPERTY::NOTIFY);
+    // The stack refuses these reads and writes on a link that is not encrypted
+    // with an authenticated key; the callbacks check the bond as well.
+    control = service->createCharacteristic(
+        BLE_CONTROL_UUID, NIMBLE_PROPERTY::WRITE | NIMBLE_PROPERTY::WRITE_ENC | NIMBLE_PROPERTY::WRITE_AUTHEN);
+    dataIn = service->createCharacteristic(BLE_DATA_IN_UUID, NIMBLE_PROPERTY::WRITE | NIMBLE_PROPERTY::WRITE_NR |
+                                                                 NIMBLE_PROPERTY::WRITE_ENC |
+                                                                 NIMBLE_PROPERTY::WRITE_AUTHEN);
+    status = service->createCharacteristic(BLE_STATUS_UUID, NIMBLE_PROPERTY::READ | NIMBLE_PROPERTY::READ_ENC |
+                                                                NIMBLE_PROPERTY::READ_AUTHEN | NIMBLE_PROPERTY::NOTIFY);
     dataOut = service->createCharacteristic(BLE_DATA_OUT_UUID, NIMBLE_PROPERTY::NOTIFY);
     if (!control || !dataIn || !status || !dataOut) return false;
 
@@ -733,10 +867,12 @@ struct BleLinkRuntime {
 
     const size_t notifyCap = link.notifyCapBytes();
     const uint16_t mtu = peerMtu();
-    if (!hasPeer()) {
-      // A doorbell with nobody at the door. NimBLE would drop it anyway; logging
-      // it as a publish made it look as though the app had been told something.
-      LOG_DBG("BLE", "status: read %u bytes, no peer -- notify skipped", static_cast<unsigned>(readJson.size()));
+    const uint16_t handle = link.boundConnection();
+    if (!hasPeer() || !link.boundConnectionSecure(handle)) {
+      // Nobody to ring, or a link that is not yet encrypted, authenticated and
+      // bonded: treated as not subscribed.
+      LOG_DBG("BLE", "status: read %u bytes, no secure peer -- notify skipped",
+              static_cast<unsigned>(readJson.size()));
       return;
     }
     if (notifyJson.empty()) {
@@ -751,11 +887,13 @@ struct BleLinkRuntime {
     LOG_DBG("BLE", "status: notify %u bytes, read %u bytes, cap %u (mtu %u)",
             static_cast<unsigned>(notifyJson.size()), static_cast<unsigned>(readJson.size()),
             static_cast<unsigned>(notifyCap), static_cast<unsigned>(mtu));
-    status->notify(reinterpret_cast<const uint8_t*>(notifyJson.data()), notifyJson.size());
+    status->notify(reinterpret_cast<const uint8_t*>(notifyJson.data()), notifyJson.size(), handle);
   }
 
   void notifyData(const uint8_t* data, const size_t length) {
     if (!dataOut) return;
+    const uint16_t handle = link.boundConnection();
+    if (!link.boundConnectionSecure(handle)) return;
     const size_t notifyCap = link.notifyCapBytes();
     // The client picks the chunk size and its resume arithmetic depends on it,
     // so this is never silently shrunk -- but a frame the link cannot carry is
@@ -764,8 +902,11 @@ struct BleLinkRuntime {
       LOG_DBG("BLE", "data frame %u bytes exceeds notify cap %u", static_cast<unsigned>(length),
               static_cast<unsigned>(notifyCap));
     }
-    dataOut->setValue(data, length);
-    dataOut->notify();
+    dataOut->notify(data, length, handle);
+  }
+
+  void disconnect(const uint16_t handle) const {
+    if (server) server->disconnect(handle);
   }
 
   void startAdvertising() {
@@ -860,13 +1001,15 @@ void BleLink::begin() {
     }
   }
 
-  // The code is regenerated once per wake, not once per screen. A user copying
-  // six digits off the pairing page must not have them change underneath them
-  // because they walked back to the home screen on the way to their phone.
-  sessionCode_ = makeSessionCode();
   deviceId_ = makeDeviceId();
-  deviceNonce_ = makeNonceHex();
-  BLE_TRUSTED_HOSTS.loadFromFile();
+  // Set by BleLinkRuntime::begin() once the radio is up.
+  deviceNonce_.clear();
+  BLE_TRUSTED_HOSTS.load();
+  connHandle_.store(NO_CONNECTION);
+  linkSecure_.store(false);
+  pairingInProgress_.store(false);
+  helloAccepted_ = false;
+  authHandle_ = NO_CONNECTION;
   mbedtls_sha256_init(&shaContext_);
   state_ = State::STARTING;
   errorMessage_.clear();
@@ -908,8 +1051,15 @@ void BleLink::end() {
   if (Storage.exists(PROGRESS_RESULT_PATH)) Storage.remove(PROGRESS_RESULT_PATH);
   mbedtls_sha256_free(&shaContext_);
   helloAccepted_ = false;
-  trustedHelloAccepted_ = false;
+  authHandle_ = NO_CONNECTION;
+  hostPaired_ = false;
   trustedHostName_.clear();
+  readerProof_.clear();
+  connHandle_.store(NO_CONNECTION);
+  linkSecure_.store(false);
+  pairingInProgress_.store(false);
+  connectedAtMs_ = 0;
+  securedAtMs_ = 0;
   state_ = State::STARTING;
   LOG_INF("BLE", "link stopped");
 }
@@ -929,6 +1079,7 @@ void BleLink::tick() {
   if (!ble_) return;
 
   processBleEvents();
+  checkConnectionDeadlines();
 
   // A delete waiting on its book to close (delete_book with close:true).
   if (!pendingDeletePath_.empty()) {
@@ -992,7 +1143,7 @@ void BleLink::attachStore(BleStoreController* store) {
   // The Store screen opened onto a link that may already be through the gate --
   // which is the entire point of the radio outliving the screen. Tell it so,
   // rather than making it wait for a reconnect that is not coming.
-  if (helloAccepted_) store_->onAppReady();
+  if (sessionAuthenticated()) store_->onAppReady();
 }
 
 void BleLink::detachStore(const BleStoreController* store) {
@@ -1008,24 +1159,120 @@ void BleLink::notifyObserver() {
 bool BleLink::hasTrustedHost() const { return BLE_TRUSTED_HOSTS.hasHosts(); }
 
 std::string BleLink::trustedHostLabel() const {
-  const auto& hosts = BLE_TRUSTED_HOSTS.getHosts();
-  if (hosts.empty()) return {};
-  return hosts.front().name.empty() ? hosts.front().hostId : hosts.front().name;
+  const BleTrustedHost* host = BLE_TRUSTED_HOSTS.host();
+  if (!host) return {};
+  return host->name.empty() ? host->hostId : host->name;
 }
 
 bool BleLink::forgetTrustedHost() {
   if (!BLE_TRUSTED_HOSTS.clearAll()) return false;
-  // Whatever was on the link authenticated as a host that no longer exists. Shut
-  // the gate so the next hello has to come through the code again.
+  // The bond without the host record is useless; unpairing also drops the link.
+  if (ble_ && !NimBLEDevice::deleteAllBonds()) LOG_ERR("BLE", "could not delete every bond");
   helloAccepted_ = false;
-  trustedHelloAccepted_ = false;
+  authHandle_ = NO_CONNECTION;
   trustedHostName_.clear();
+  readerProof_.clear();
   hostPaired_ = false;
   authErrorMessage_.clear();
   deviceNonce_ = makeNonceHex();
   setState(isPeerConnected() ? State::CONNECTED : State::ADVERTISING);
   publishStatus();
   return true;
+}
+
+void BleLink::openPairingWindow() {
+  // A fresh window starts with a clean attempt count; a running lockout stays.
+  if (!pairingWindowRequested_.exchange(true)) failedPairings_.store(0);
+  LOG_INF("BLE", "pairing window open");
+  statusDirty_ = true;
+  notifyObserver();
+}
+
+void BleLink::closePairingWindow() {
+  if (pairingWindowRequested_.exchange(false)) LOG_INF("BLE", "pairing window closed");
+  statusDirty_ = true;
+}
+
+bool BleLink::pairingWindowOpen() const {
+  if (!pairingWindowRequested_.load()) return false;
+  return !(pairingLocked_.load() && millis() - pairingLockedAtMs_.load() < PAIRING_LOCK_MS);
+}
+
+uint32_t BleLink::pairingLockSecondsLeft() const {
+  if (!pairingLocked_.load()) return 0;
+  const unsigned long elapsed = millis() - pairingLockedAtMs_.load();
+  if (elapsed >= PAIRING_LOCK_MS) return 0;
+  return static_cast<uint32_t>((PAIRING_LOCK_MS - elapsed + 999UL) / 1000UL);
+}
+
+bool BleLink::pairingPasskey(uint32_t& passkey) const {
+  if (!pairingInProgress_.load() || !pairingWindowOpen()) return false;
+  passkey = passkey_.load();
+  return true;
+}
+
+bool BleLink::bindConnection(const uint16_t connHandle) {
+  uint16_t expected = NO_CONNECTION;
+  if (connHandle == NO_CONNECTION || !connHandle_.compare_exchange_strong(expected, connHandle)) return false;
+  linkSecure_.store(false);
+  pairingInProgress_.store(false);
+  return true;
+}
+
+bool BleLink::releaseConnection(const uint16_t connHandle) {
+  uint16_t expected = connHandle;
+  if (connHandle == NO_CONNECTION || !connHandle_.compare_exchange_strong(expected, NO_CONNECTION)) return false;
+  linkSecure_.store(false);
+  // Gone with a passkey still on screen: the attempt failed.
+  if (pairingInProgress_.exchange(false) && pairingWindowRequested_.load()) notePairingFailed();
+  return true;
+}
+
+void BleLink::notePairingStarted(const uint32_t passkey) {
+  passkey_.store(passkey);
+  pairingInProgress_.store(true);
+  enqueueBleEvent({BleEventType::PAIRING, {}});
+}
+
+void BleLink::notePairingFailed() {
+  const auto failures = static_cast<uint8_t>(failedPairings_.load() + 1);
+  failedPairings_.store(failures);
+  if (failures >= MAX_FAILED_PAIRINGS) {
+    pairingLockedAtMs_.store(millis());
+    pairingLocked_.store(true);
+    failedPairings_.store(0);
+    LOG_INF("BLE", "pairing locked for %lu s after %u failed attempts", PAIRING_LOCK_MS / 1000UL,
+            static_cast<unsigned>(failures));
+  }
+  enqueueBleEvent({BleEventType::PAIRING, {}});
+}
+
+void BleLink::checkConnectionDeadlines() {
+  const unsigned long now = millis();
+  if (pairingLocked_.load() && now - pairingLockedAtMs_.load() >= PAIRING_LOCK_MS) {
+    pairingLocked_.store(false);
+    failedPairings_.store(0);
+    LOG_INF("BLE", "pairing lockout over");
+    statusDirty_ = true;
+    notifyObserver();
+  }
+
+  if (connHandle_.load() == NO_CONNECTION || sessionAuthenticated() || connectedAtMs_ == 0) return;
+  if (linkSecure_.load()) {
+    if (securedAtMs_ != 0 && now - securedAtMs_ >= HELLO_TIMEOUT_MS) disconnectPeer("no hello after encryption");
+  } else if (now - connectedAtMs_ >= SECURE_LINK_TIMEOUT_MS) {
+    disconnectPeer("link not secured in time");
+  }
+}
+
+void BleLink::disconnectPeer(const char* reason) {
+  const uint16_t handle = connHandle_.load();
+  // Once per connection: the deadlines stop counting until the next connect.
+  connectedAtMs_ = 0;
+  securedAtMs_ = 0;
+  if (!ble_ || handle == NO_CONNECTION) return;
+  LOG_INF("BLE", "disconnecting: %s", reason);
+  ble_->disconnect(handle);
 }
 
 bool BleLink::isPeerConnected() const { return ble_ && ble_->hasPeer(); }
@@ -1052,15 +1299,38 @@ void BleLink::enqueueBleEvent(BleEvent event) {
   xSemaphoreGive(eventMutex_);
 }
 
-void BleLink::enqueueBleConnected() { enqueueBleEvent({BleEventType::CONNECTED, {}}); }
-
-void BleLink::enqueueBleDisconnected() { enqueueBleEvent({BleEventType::DISCONNECTED, {}}); }
-
-void BleLink::enqueueControlWrite(const std::string& value) {
-  enqueueBleEvent({BleEventType::CONTROL, value});
+void BleLink::enqueueBleConnected(const uint16_t connHandle) {
+  BleEvent event{BleEventType::CONNECTED, {}};
+  event.connHandle = connHandle;
+  enqueueBleEvent(std::move(event));
 }
 
-void BleLink::enqueueDataWrite(const std::string& value) { enqueueBleEvent({BleEventType::DATA, value}); }
+void BleLink::enqueueBleDisconnected(const uint16_t connHandle) {
+  BleEvent event{BleEventType::DISCONNECTED, {}};
+  event.connHandle = connHandle;
+  enqueueBleEvent(std::move(event));
+}
+
+void BleLink::enqueueSecurityResult(const uint16_t connHandle, const bool accepted, const bool newBond,
+                                    const std::string& peerIdAddress) {
+  BleEvent event{BleEventType::SECURITY, peerIdAddress};
+  event.connHandle = connHandle;
+  event.accepted = accepted;
+  event.newBond = newBond;
+  enqueueBleEvent(std::move(event));
+}
+
+void BleLink::enqueueControlWrite(const uint16_t connHandle, const std::string& value) {
+  BleEvent event{BleEventType::CONTROL, value};
+  event.connHandle = connHandle;
+  enqueueBleEvent(std::move(event));
+}
+
+void BleLink::enqueueDataWrite(const uint16_t connHandle, const std::string& value) {
+  BleEvent event{BleEventType::DATA, value};
+  event.connHandle = connHandle;
+  enqueueBleEvent(std::move(event));
+}
 
 void BleLink::processBleEvents() {
   while (true) {
@@ -1084,37 +1354,90 @@ void BleLink::processBleEvents() {
       xSemaphoreGive(eventMutex_);
     }
     if (hasOverflow) {
+      // Dropped events may include a connect or disconnect, so the session can no
+      // longer be trusted to belong to the connection that is up.
       resetTransfer(true);
+      helloAccepted_ = false;
+      authHandle_ = NO_CONNECTION;
+      readerProof_.clear();
       setError("BLE event queue overflow");
+      disconnectPeer("event queue overflow");
       return;
     }
     if (!hasEvent) return;
 
+    const bool fromSecureLink = event.connHandle == connHandle_.load() && linkSecure_.load();
     switch (event.type) {
       case BleEventType::CONNECTED:
-        onBleConnected();
+        onBleConnected(event.connHandle);
         break;
       case BleEventType::DISCONNECTED:
-        onBleDisconnected();
+        onBleDisconnected(event.connHandle);
+        break;
+      case BleEventType::SECURITY:
+        onSecurityResult(event);
+        break;
+      case BleEventType::PAIRING:
+        statusDirty_ = true;
+        notifyObserver();
         break;
       case BleEventType::CONTROL:
-        onControlWrite(event.value);
+        if (fromSecureLink) onControlWrite(event.value);
         break;
       case BleEventType::DATA:
-        onDataWrite(event.value);
+        if (fromSecureLink) onDataWrite(event.value);
         break;
     }
   }
 }
 
-void BleLink::onBleConnected() {
+void BleLink::onBleConnected(const uint16_t connHandle) {
+  // A connection that has already gone again; its disconnect follows.
+  if (connHandle != connHandle_.load()) return;
   helloAccepted_ = false;
-  trustedHelloAccepted_ = false;
+  authHandle_ = NO_CONNECTION;
+  hostPaired_ = false;
   trustedHostName_.clear();
+  readerProof_.clear();
+  authErrorMessage_.clear();
+  invalidHellos_ = 0;
+  connectedAtMs_ = millis();
+  securedAtMs_ = 0;
   setState(State::CONNECTED);
 }
 
-void BleLink::onBleDisconnected() {
+void BleLink::onSecurityResult(const BleEvent& event) {
+  statusDirty_ = true;
+  // The passkey, if one was showing, leaves the screen either way.
+  notifyObserver();
+  if (!event.accepted || event.connHandle != connHandle_.load()) return;
+  securedAtMs_ = millis();
+  if (event.newBond) adoptNewBond(event.value);
+}
+
+void BleLink::adoptNewBond(const std::string& peerIdAddress) {
+  // One bond: the phone that just paired.
+  if (peerIdAddress.size() == sizeof(ble_addr_t)) {
+    ble_addr_t raw{};
+    memcpy(&raw, peerIdAddress.data(), sizeof(raw));
+    const NimBLEAddress keep(raw);
+    for (int i = NimBLEDevice::getNumBonds() - 1; i >= 0; i--) {
+      const NimBLEAddress bonded = NimBLEDevice::getBondedAddress(i);
+      if (bonded == keep) continue;
+      if (!NimBLEDevice::deleteBond(bonded)) LOG_ERR("BLE", "could not delete an old bond");
+    }
+  } else {
+    LOG_ERR("BLE", "new bond without a peer address; old bonds kept");
+  }
+  // The old phone's secret goes with its bond; the new phone sends `pair`.
+  if (BLE_TRUSTED_HOSTS.hasHosts() && !BLE_TRUSTED_HOSTS.clearAll()) {
+    LOG_ERR("BLE", "could not clear the previous trusted host");
+  }
+  failedPairings_.store(0);
+  LOG_INF("BLE", "new bond accepted");
+}
+
+void BleLink::onBleDisconnected(const uint16_t) {
   // The Store is live or it is nothing: with the link gone there is no
   // catalogue to show, so it drops what it had rather than leaving a page on
   // screen that no longer describes anything reachable.
@@ -1125,8 +1448,12 @@ void BleLink::onBleDisconnected() {
     resetTransfer(!keepPartialUpload);
     if (keepPartialUpload) {
       helloAccepted_ = false;
-      trustedHelloAccepted_ = false;
+      authHandle_ = NO_CONNECTION;
+      hostPaired_ = false;
       trustedHostName_.clear();
+      readerProof_.clear();
+      connectedAtMs_ = 0;
+      securedAtMs_ = 0;
       deviceNonce_ = makeNonceHex();
       setState(State::ADVERTISING);
       if (ble_) ble_->startAdvertising();
@@ -1140,8 +1467,12 @@ void BleLink::onBleDisconnected() {
     setError("client disconnected");
   }
   helloAccepted_ = false;
-  trustedHelloAccepted_ = false;
+  authHandle_ = NO_CONNECTION;
+  hostPaired_ = false;
   trustedHostName_.clear();
+  readerProof_.clear();
+  connectedAtMs_ = 0;
+  securedAtMs_ = 0;
   deviceNonce_ = makeNonceHex();
   setState(State::ADVERTISING);
   if (ble_) ble_->startAdvertising();
@@ -1159,87 +1490,98 @@ void BleLink::onControlWrite(const std::string& value) {
 
   const std::string op = doc["op"] | "";
   if (op == "hello") {
+    // Mutual HMAC over the reader's nonce D, the client's nonce C, the host id H
+    // and the device id I, keyed with the 32 raw secret bytes.
     const int version = doc["version"] | 0;
-    const std::string code = doc["code"] | "";
     const std::string hostId = doc["host_id"] | "";
-    const std::string response = toLowerAscii(doc["response"] | "");
-    if (version != 1) {
-      setError("unsupported protocol version");
+    const std::string clientNonce = doc["client_nonce"] | "";
+    const std::string response = doc["response"] | "";
+    if (version != BLE_PROTOCOL_VERSION) {
+      refuseHello("unsupported protocol version");
+      return;
+    }
+    if (!isSafeHostId(hostId) || !isLowerHex(clientNonce, BLE_CLIENT_NONCE_HEX_CHARS) ||
+        !isLowerHex(response, BLE_HMAC_HEX_CHARS)) {
+      refuseHello("invalid hello");
+      return;
+    }
+    const BleTrustedHost* host = BLE_TRUSTED_HOSTS.findHost(hostId);
+    if (!host) {
+      refuseHello("unknown trusted host");
+      return;
+    }
+    const std::string fields = deviceNonce_ + "|" + clientNonce + "|" + hostId + "|" + deviceId_;
+    const std::string expected = hmacSha256Hex(host->secret, HOST_PROOF_PREFIX + fields);
+    if (expected.empty() || !constantTimeEquals(expected, response)) {
+      refuseHello("invalid trusted host auth");
+      return;
+    }
+    const std::string proof = hmacSha256Hex(host->secret, READER_PROOF_PREFIX + fields);
+    if (proof.empty()) {
+      refuseHello("invalid trusted host auth");
       return;
     }
 
-    if (!hostId.empty() && !response.empty()) {
-      if (!isSafeHostId(hostId) || !isHexString(response, 64)) {
-        setAuthError("invalid trusted host auth");
-        return;
-      }
-      const BleTrustedHost* host = BLE_TRUSTED_HOSTS.findHost(hostId);
-      if (!host) {
-        setAuthError("unknown trusted host");
-        return;
-      }
-      const std::string expected = hmacSha256Hex(host->secret, trustedHostMessage(deviceNonce_, hostId));
-      if (expected.empty() || !constantTimeEquals(expected, response)) {
-        setAuthError("invalid trusted host auth");
-        return;
-      }
-      helloAccepted_ = true;
-      trustedHelloAccepted_ = true;
-      trustedHostName_ = host->name.empty() ? hostId : host->name;
-      // A phone that renamed itself says so on every hello; keep the stored
-      // label in step so Settings shows the current name.
-      {
-        const std::string offeredName = sanitizeHostName(doc["host_name"] | "");
-        if (!offeredName.empty() && offeredName != host->name) {
-          BleTrustedHost renamed = *host;  // copied: addOrReplaceHost may move `host`
-          renamed.name = offeredName;
-          if (BLE_TRUSTED_HOSTS.addOrReplaceHost(renamed)) trustedHostName_ = offeredName;
-        }
-      }
-      authErrorMessage_.clear();
-      deviceNonce_ = makeNonceHex();
-      LOG_INF("BLE", "trusted host '%s' accepted", trustedHostName_.c_str());
-      setState(State::CONNECTED);
-      // The gate is the only thing the Store was waiting for: ask for page one.
-      if (store_) store_->onAppReady();
-      return;
-    }
-
-    if (code != sessionCode_) {
-      setAuthError("invalid session code");
-      return;
-    }
-    // The six digits were right. If the client offered a credential, it is saved
-    // NOW -- see saveTrustedHost(). A client that offers none simply gets a
-    // code-only session, which is what the CLI and the browser companion do.
-    const std::string pairHostId = doc["pair_host_id"] | "";
-    const std::string pairSecret = toLowerAscii(doc["pair_secret"] | "");
-    if (!pairHostId.empty() || !pairSecret.empty()) {
-      if (!saveTrustedHost(pairHostId, doc["pair_host_name"] | "", pairSecret)) {
-        setAuthError("invalid trusted host setup");
-        return;
-      }
-    }
+    readerProof_ = proof;
     helloAccepted_ = true;
-    trustedHelloAccepted_ = false;
+    authHandle_ = connHandle_.load();
+    invalidHellos_ = 0;
+    trustedHostName_ = host->name.empty() ? hostId : host->name;
+    // A phone that renamed itself says so on every hello; keep the stored
+    // label in step so Settings shows the current name.
+    const std::string offeredName = sanitizeHostName(doc["host_name"] | "");
+    if (offeredName != host->name) {
+      BleTrustedHost renamed = *host;
+      renamed.name = offeredName;
+      if (BLE_TRUSTED_HOSTS.addOrReplaceHost(renamed)) trustedHostName_ = offeredName;
+    }
     authErrorMessage_.clear();
+    deviceNonce_ = makeNonceHex();
+    LOG_INF("BLE", "trusted host '%s' accepted", trustedHostName_.c_str());
+    setState(State::CONNECTED);
+    // The gate is the only thing the Store was waiting for: ask for page one.
+    if (store_) store_->onAppReady();
+    return;
+  }
+
+  if (op == "pair") {
+    // The link is already bonded (onControlWrite only runs on a secure link);
+    // the window is the user's consent to store this phone's secret.
+    if (!pairingWindowOpen()) {
+      setAuthError("pairing window closed");
+      return;
+    }
+    const int version = doc["version"] | 0;
+    const std::string hostId = doc["host_id"] | "";
+    const std::string secretHex = doc["secret"] | "";
+    BleTrustedHost host;
+    if (version != BLE_PROTOCOL_VERSION || !isSafeHostId(hostId) ||
+        !isLowerHex(secretHex, BleTrustedHostStore::SECRET_BYTES * 2) || !hexToBytes(secretHex, host.secret)) {
+      setAuthError("invalid pair request");
+      return;
+    }
+    host.hostId = hostId;
+    host.name = sanitizeHostName(doc["host_name"] | "");
+    if (!BLE_TRUSTED_HOSTS.addOrReplaceHost(host)) {
+      setAuthError("could not save the pairing");
+      return;
+    }
+    closePairingWindow();
+    helloAccepted_ = true;
+    authHandle_ = connHandle_.load();
+    hostPaired_ = true;
+    invalidHellos_ = 0;
+    trustedHostName_ = host.name;
+    readerProof_.clear();
+    authErrorMessage_.clear();
+    LOG_INF("BLE", "paired with '%s' and saved", host.name.c_str());
     setState(State::CONNECTED);
     if (store_) store_->onAppReady();
     return;
   }
 
-  if (!helloAccepted_) {
-    setAuthError("session code required");
-    return;
-  }
-
-  if (op == "save_host") {
-    // Kept so an older client's explicit save does not read as a protocol error,
-    // but it has nothing left to do: a credential offered with the right code was
-    // written to flash the moment it arrived. The answer is the status document,
-    // where `paired` already says so.
-    statusDirty_ = true;
-    publishStatus();
+  if (!sessionAuthenticated()) {
+    setAuthError("hello required");
     return;
   }
 
@@ -1342,15 +1684,6 @@ void BleLink::onControlWrite(const std::string& value) {
     // which is exactly what an ordinary Bluetooth Transfer upload sends.
     const uint32_t responseReq = doc["req"] | 0u;
     fileName_ = doc["name"] | "";
-    {
-      // A build stamp the app sends with a firmware image ("yyyyMMdd.HHmm"), shown
-      // on the update screens. Dropped unless it looks like one: it is displayed.
-      std::string version = doc["version"] | "";
-      const bool plain = version.size() <= 32 && std::all_of(version.begin(), version.end(), [](const char c) {
-                           return std::isalnum(static_cast<unsigned char>(c)) || c == '.' || c == '-' || c == '_';
-                         });
-      firmwareVersion_ = plain ? version : "";
-    }
     expectedSize_ = doc["size"] | 0;
     // Asked for explicitly, never inferred. Replacing a book is how a Calibre
     // update reaches the card; "exists" is still the answer for an ordinary
@@ -1533,6 +1866,16 @@ void BleLink::onControlWrite(const std::string& value) {
       partPath_ = CATALOG_PART_PATH;
       finalPath_ = CATALOG_PATH;
     } else if (kind == "firmware") {
+      // Only signed images are staged. Both are written beside the image at
+      // commit, where FirmwareWatcher checks the signature over them.
+      const std::string version = doc["version"] | "";
+      const std::string signature = doc["signature"] | "";
+      if (!isBuildStamp(version) || !isFirmwareSignatureHex(signature)) {
+        setError("signature required");
+        return;
+      }
+      firmwareVersion_ = version;
+      firmwareSignature_ = signature;
       if (!isSafeBleFirmwareName(fileName_)) {
         setError("unsafe firmware filename");
         return;
@@ -1900,7 +2243,12 @@ void BleLink::processCommit() {
     setError("could not write the firmware hash file");
     return;
   }
-  if (!firmwareVersion_.empty()) firmware_staging::writeVersion(firmwareVersion_);
+  // Validated at start_put; FirmwareWatcher verifies the signature over both.
+  if (!firmware_staging::writeVersion(firmwareVersion_) || !firmware_staging::writeSignature(firmwareSignature_)) {
+    firmware_staging::clearStaged();
+    setError("could not write the firmware signature");
+    return;
+  }
   LOG_INF("BLE", "firmware staged at %s; the update prompt is the watcher's", firmware_staging::IMAGE_PATH);
   savedPath_ = finalPath_;
   setState(State::SAVED);
@@ -2140,7 +2488,13 @@ bool BleLink::applySettingsDocument() {
   // fromJson() is the same path a settings file read at boot goes through, so
   // an app-sent document gets the identical validation, clamping and revision
   // migration -- there is no second, laxer way into the settings store.
-  if (!SETTINGS.fromJson(doc.as<JsonVariantConst>())) {
+  //
+  // Auto-install is a device-only setting: whatever the document says, the
+  // device keeps its own value.
+  const auto autoInstallFirmware = SETTINGS.autoInstallFirmware;
+  const bool accepted = SETTINGS.fromJson(doc.as<JsonVariantConst>());
+  SETTINGS.autoInstallFirmware = autoInstallFirmware;
+  if (!accepted) {
     setError("settings rejected");
     return false;
   }
@@ -2329,31 +2683,10 @@ void BleLink::pumpDownload() {
   }
 }
 
-bool BleLink::saveTrustedHost(const std::string& hostId, const std::string& hostName,
-                              const std::string& secret) {
-  // Written the instant a code-authenticated hello offers a credential, so both
-  // sides commit at the same moment. The phone saves its half of the pairing
-  // immediately; if the reader waited for anything later, the phone could hold a
-  // credential this reader never kept, and its next reconnect would be refused
-  // as an unknown trusted host.
-  //
-  // The user's consent is the six digits. They read them off the reader's own
-  // pairing page and typed them into the phone; there is no second question
-  // worth asking.
-  if (!isSafeHostId(hostId) || !isHexString(secret, BLE_SHARED_SECRET_HEX_BYTES)) return false;
-  const std::string name = sanitizeHostName(hostName);
-  if (!BLE_TRUSTED_HOSTS.addOrReplaceHost(BleTrustedHost{hostId, name, secret})) {
-    LOG_ERR("BLE", "could not persist the trusted host");
-    return false;
-  }
-  trustedHostName_ = name;
-  hostPaired_ = true;
-  LOG_INF("BLE", "paired with '%s' and saved", name.c_str());
-  return true;
-}
-
 void BleLink::resetTransfer(const bool removePart) {
   replaceExisting_ = false;
+  firmwareVersion_.clear();
+  firmwareSignature_.clear();
   if (shaActive_) {
     mbedtls_sha256_free(&shaContext_);
     mbedtls_sha256_init(&shaContext_);
@@ -2411,21 +2744,22 @@ void BleLink::setError(const std::string& error, const bool notifyStore) {
 
 void BleLink::setAuthError(const std::string& error) {
   authErrorMessage_ = error;
-  // Deliberately not State::ERROR. A refused hello is not a failed session: the
-  // link is up, the code is still valid, and reading that code off the pairing
-  // page is the ONLY way a client whose credential this reader does not have can
-  // recover.
-  //
-  // Whether a host is stored is half of any diagnosis of one of these, so it
-  // goes on the same line as the reason.
-  LOG_ERR("BLE", "hello refused: %s (a trusted host is stored: %s)", error.c_str(),
+  // Not State::ERROR: a refused hello is not a failed session and the link stays
+  // up. Whether a host is stored is half of any diagnosis, so it is logged too.
+  LOG_ERR("BLE", "auth refused: %s (a trusted host is stored: %s)", error.c_str(),
           BLE_TRUSTED_HOSTS.hasHosts() ? "yes" : "no");
   helloAccepted_ = false;
-  trustedHelloAccepted_ = false;
+  authHandle_ = NO_CONNECTION;
   trustedHostName_.clear();
+  readerProof_.clear();
   statusDirty_ = true;
   publishStatus();
   notifyObserver();
+}
+
+void BleLink::refuseHello(const std::string& error) {
+  setAuthError(error);
+  if (++invalidHellos_ >= MAX_INVALID_HELLOS) disconnectPeer("too many invalid hellos");
 }
 
 void BleLink::noteBleMtu(const uint16_t mtu) { negotiatedMtu_.store(mtu, std::memory_order_relaxed); }
@@ -2543,8 +2877,9 @@ void BleLink::publishStatus() {
   // the pairing page usually holds it, so most screens never hear about the
   // link at all. Not while a book is open: a page of text is the one place a
   // repaint costs the user something, and the indicator is not worth it.
-  if (helloAccepted_ != lastPublishedAuth_) {
-    lastPublishedAuth_ = helloAccepted_;
+  const bool authenticated = sessionAuthenticated();
+  if (authenticated != lastPublishedAuth_) {
+    lastPublishedAuth_ = authenticated;
     if (!activityManager.isReaderActivity()) activityManager.requestUpdate();
   }
 }
@@ -2583,6 +2918,22 @@ std::string BleLink::buildStatusJson(const StatusScope scope, const unsigned det
   const bool pendingTerse = !full && detail < 3;
 
   doc["state"] = state.c_str();
+  if (!sessionAuthenticated()) {
+    // Before hello or pair: only what authentication needs.
+    if (full || detail >= 4) doc["protocol_version"] = BLE_PROTOCOL_VERSION;
+    if (full) {
+      doc["device_id"] = deviceId_.c_str();
+      doc["device_nonce"] = deviceNonce_.c_str();
+    }
+    if (full || detail >= 3) {
+      doc["has_trusted_host"] = BLE_TRUSTED_HOSTS.hasHosts();
+      doc["pairing_window"] = pairingWindowOpen();
+    }
+    if ((full || detail >= 2) && !authErrorMessage_.empty()) doc["auth_error"] = authErrorMessage_.c_str();
+    String preAuth;
+    serializeJson(doc, preAuth);
+    return preAuth.c_str();
+  }
   // The heartbeat payload. Small and deliberately never shed: it is the whole
   // reason a notification is worth sending at all, and everything the shrink
   // ladder drops below is re-readable while these are what tell the app there
@@ -2600,7 +2951,7 @@ std::string BleLink::buildStatusJson(const StatusScope scope, const unsigned det
   if (pingPct_ >= 0.0f) doc["pct"] = pingPct_;
   if (pingOpen_) doc["open"] = true;
   if (sleeping_) doc["sleeping"] = true;
-  if (wantSession) doc["protocol_version"] = 1;
+  if (wantSession) doc["protocol_version"] = BLE_PROTOCOL_VERSION;
   if (full) {
     if (wantDecoration) {
       doc["firmware_name"] = "CrossPoint Reader";
@@ -2641,13 +2992,10 @@ std::string BleLink::buildStatusJson(const StatusScope scope, const unsigned det
     doc["device_nonce"] = deviceNonce_.c_str();
   }
   if (wantIdentity) {
-    // Promoted out of the READ-only block: this is the field that separates "you
-    // were never saved here, pair with the code" from "your credential is
-    // wrong", and a client that only listens to the doorbell needs it at exactly
-    // the moment its trusted hello was refused. The reader stores at most one
-    // host, so false means nobody is remembered, full stop.
     doc["has_trusted_host"] = BLE_TRUSTED_HOSTS.hasHosts();
     if (!trustedHostName_.empty()) doc["trusted_host"] = trustedHostName_.c_str();
+    // The app trusts this reader only once it has checked this proof.
+    if (!readerProof_.empty()) doc["reader_proof"] = readerProof_.c_str();
     if (hostPaired_) doc["paired"] = true;
   }
   if (wantProgress && (expectedSize_ > 0 || state_ == State::SENDING || state_ == State::SENT)) {
@@ -2681,10 +3029,9 @@ std::string BleLink::buildStatusJson(const StatusScope scope, const unsigned det
   // `state` already says ERROR; the message is the part that can be any length,
   // so it is the part that goes when the payload is tight.
   if (wantProgress && state_ == State::ERROR && !errorMessage_.empty()) doc["error"] = errorMessage_.c_str();
-  // Why the last hello was refused. Separate from `error` and not tied to
-  // State::ERROR, because a refused hello leaves the session healthy and the code
-  // on screen; read together with `has_trusted_host` it tells the client whether
-  // to forget its saved credential or fix it. Cleared by the next accepted hello.
+  // Why the last hello or pair was refused. Separate from `error` and not tied to
+  // State::ERROR, because a refused hello leaves the session healthy. Cleared by
+  // the next accepted hello.
   if (wantProgress && !authErrorMessage_.empty()) doc["auth_error"] = authErrorMessage_.c_str();
   // The request channel. When the device wants something from the app it says so
   // here, and the app answers with an upload naming the same `req`. Absent

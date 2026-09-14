@@ -155,11 +155,10 @@ bool Xtc::generateCoverBmp() const {
   // Allocate buffer for page data
   // XTG (1-bit): Row-major, ((width+7)/8) * height bytes
   // XTH (2-bit): Two bit planes, column-major, ((width * height + 7) / 8) * 2 bytes
-  size_t bitmapSize;
-  if (bitDepth == 2) {
-    bitmapSize = ((static_cast<size_t>(pageInfo.width) * pageInfo.height + 7) / 8) * 2;
-  } else {
-    bitmapSize = ((pageInfo.width + 7) / 8) * pageInfo.height;
+  const size_t bitmapSize = xtc::pageBitmapSize(pageInfo.width, pageInfo.height, bitDepth);
+  if (bitmapSize == 0) {
+    LOG_ERR("XTC", "Unsupported cover size %ux%u", pageInfo.width, pageInfo.height);
+    return false;
   }
   uint8_t* pageBuffer = static_cast<uint8_t*>(malloc(bitmapSize));
   if (!pageBuffer) {
@@ -349,11 +348,10 @@ bool Xtc::generateThumbBmp(int height) const {
           thumbHeight, scale);
 
   // Allocate buffer for page data
-  size_t bitmapSize;
-  if (bitDepth == 2) {
-    bitmapSize = ((static_cast<size_t>(pageInfo.width) * pageInfo.height + 7) / 8) * 2;
-  } else {
-    bitmapSize = ((pageInfo.width + 7) / 8) * pageInfo.height;
+  const size_t bitmapSize = xtc::pageBitmapSize(pageInfo.width, pageInfo.height, bitDepth);
+  if (bitmapSize == 0) {
+    LOG_ERR("XTC", "Unsupported cover size %ux%u", pageInfo.width, pageInfo.height);
+    return false;
   }
   uint8_t* pageBuffer = static_cast<uint8_t*>(malloc(bitmapSize));
   if (!pageBuffer) {

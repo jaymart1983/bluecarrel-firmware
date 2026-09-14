@@ -39,6 +39,10 @@ DEFAULT_FIRMWARE_WINDOW_BYTES = 16 * 1024
 DEFAULT_DOWNLOAD_CHUNK_BYTES = 160
 PROGRESS_PRINT_BYTES = 4096
 PROGRESS_PRINT_SECONDS = 1.0
+V1_ONLY_NOTICE = (
+    "Note: ble_transfer.py supports only BLE protocol v1 readers. Readers running protocol v2 firmware "
+    "(bonded pairing, signed firmware) refuse it; use the companion app for those."
+)
 
 
 def sha256_file(path: Path) -> str:
@@ -241,6 +245,10 @@ async def authorize_session(
         return get_status()
 
     final_status = get_status()
+    protocol_version = final_status.get("protocol_version")
+    if isinstance(protocol_version, int) and protocol_version >= 2:
+        print(V1_ONLY_NOTICE, file=sys.stderr)
+        return False, None, None
     device_id = final_status.get("device_id")
     device_nonce = final_status.get("device_nonce")
     if not args.force_code and isinstance(device_id, str) and isinstance(device_nonce, str):
@@ -263,7 +271,7 @@ async def authorize_session(
                 trusted_version,
             )
             if status.get("trusted_host"):
-                print(f"Trusted host accepted: {status['trusted_host']}")
+                print("Trusted host accepted.")
                 return True, None, None
             print("Trusted host auth was not accepted; using visible code.", file=sys.stderr)
 
@@ -642,6 +650,7 @@ def build_parser() -> argparse.ArgumentParser:
 
 def main() -> int:
     args = build_parser().parse_args()
+    print(V1_ONLY_NOTICE, file=sys.stderr)
     if args.command == "put-book":
         return asyncio.run(put_file(args, kind="book", suffix=".epub", success_states={"saved"}))
     if args.command == "put-bmp":

@@ -33,11 +33,12 @@ struct BleLinkRuntime;
 // Store additionally attaches its controller so the request channel has
 // somewhere to publish to. Neither owns the radio and neither can take it down.
 //
-// PAIRING UI is BlePairingActivity. A host is written to flash the instant a
-// `hello` carrying the right six-digit code also carries a credential, because
-// the phone saves its half of the pairing immediately: if the reader waited for
-// anything later (such as a completed upload), every reconnect could
-// authenticate against a credential the reader had never kept.
+// SECURITY (docs/security-v2.md). The link is LE Secure Connections with
+// bonding and passkey MITM protection; nothing is read, written or notified
+// until the one connection is encrypted, authenticated and bonded. A new bond
+// is accepted only while BlePairingActivity holds the pairing window open. On
+// top of the bond, the app proves the shared secret with `hello` (or stores it
+// with `pair`) and the reader proves it back.
 class BleLink {
  public:
   enum class State {
@@ -96,21 +97,28 @@ class BleLink {
   void tick();
 
   // --- pairing ---------------------------------------------------------------
-  // The six-digit code for this session. Regenerated on begin(), so it is stable
-  // for as long as the device is awake -- a user reading it off the screen must
-  // not have it change underneath them.
-  const std::string& sessionCode() const { return sessionCode_; }
+  // The pairing window: a new bond, and the `pair` op, are accepted only while
+  // it is open. Opened and closed by BlePairingActivity. Main loop only.
+  void openPairingWindow();
+  void closePairingWindow();
+  // Requested and not locked out. Safe from the NimBLE host task.
+  bool pairingWindowOpen() const;
+  // Seconds left of the lockout after too many failed attempts; 0 when none.
+  uint32_t pairingLockSecondsLeft() const;
+  // The passkey the phone must type for the pairing in progress. False when no
+  // pairing is in progress.
+  bool pairingPasskey(uint32_t& passkey) const;
+
   bool hasTrustedHost() const;
   // The saved host's display name, or an empty string when nobody is paired.
   std::string trustedHostLabel() const;
+  // Removes the trusted host and every bond.
   bool forgetTrustedHost();
-  // Why the last `hello` was refused, if it was. Never an error state: a refused
-  // hello leaves the session healthy, and the only recovery from one is to read
-  // the pairing code, so a refusal must never be what hides it.
+  // Why the last `hello` or `pair` was refused, if it was. Never an error state.
   const std::string& authError() const { return authErrorMessage_; }
   bool isPeerConnected() const;
   // The gate is open: a phone is connected AND authenticated.
-  bool isAuthenticated() const { return helloAccepted_; }
+  bool isAuthenticated() const { return sessionAuthenticated(); }
 
   // --- store hosting ---------------------------------------------------------
   // The Store screen lends its controller to the link for as long as it is on
@@ -154,10 +162,32 @@ class BleLink {
   }
 
   // --- NimBLE host-task entry points ----------------------------------------
-  void enqueueBleConnected();
-  void enqueueBleDisconnected();
-  void enqueueControlWrite(const std::string& value);
-  void enqueueDataWrite(const std::string& value);
+  static constexpr uint16_t NO_CONNECTION = 0xFFFF;  // BLE_HS_CONN_HANDLE_NONE
+
+  // Binds the link to `connHandle`. False when another connection is bound.
+  bool bindConnection(uint16_t connHandle);
+  // Releases the binding. False when `connHandle` is not the bound connection.
+  bool releaseConnection(uint16_t connHandle);
+  uint16_t boundConnection() const { return connHandle_.load(); }
+  // The bound connection passed the security checks (encrypted, authenticated,
+  // bonded, and inside the pairing window if the bond is new).
+  bool boundConnectionSecure(uint16_t connHandle) const {
+    return linkSecure_.load() && connHandle != NO_CONNECTION && connHandle == connHandle_.load();
+  }
+  // A passkey is on screen for the bound connection.
+  void notePairingStarted(uint32_t passkey);
+  // Clears the in-progress flag and returns whether it was set.
+  bool takePairingStarted() { return pairingInProgress_.exchange(false); }
+  // One failed attempt inside the window; the third locks pairing.
+  void notePairingFailed();
+  void markConnectionSecure() { linkSecure_.store(true); }
+
+  void enqueueBleConnected(uint16_t connHandle);
+  void enqueueBleDisconnected(uint16_t connHandle);
+  // `peerIdAddress` is the raw ble_addr_t of the peer when the bond is new.
+  void enqueueSecurityResult(uint16_t connHandle, bool accepted, bool newBond, const std::string& peerIdAddress);
+  void enqueueControlWrite(uint16_t connHandle, const std::string& value);
+  void enqueueDataWrite(uint16_t connHandle, const std::string& value);
   // Called from the NimBLE host task on connect and on every MTU exchange. Zero
   // means "nothing negotiated". This is only a fallback: notifyCapBytes() asks
   // the live connection what the MTU actually is and uses this when there is no
@@ -180,11 +210,43 @@ class BleLink {
 
   BleLink() = default;
 
-  enum class BleEventType { CONNECTED, DISCONNECTED, CONTROL, DATA };
+  // PAIRING: the pairing state changed (passkey shown, attempt failed, lockout).
+  enum class BleEventType { CONNECTED, DISCONNECTED, SECURITY, PAIRING, CONTROL, DATA };
   struct BleEvent {
     BleEventType type;
     std::string value;
+    uint16_t connHandle = NO_CONNECTION;
+    bool accepted = false;
+    bool newBond = false;
   };
+
+  static constexpr uint8_t MAX_FAILED_PAIRINGS = 3;
+  static constexpr unsigned long PAIRING_LOCK_MS = 60UL * 1000UL;
+  static constexpr uint8_t MAX_INVALID_HELLOS = 3;
+  // From encryption to an accepted `hello` or `pair`.
+  static constexpr unsigned long HELLO_TIMEOUT_MS = 20UL * 1000UL;
+  // From connection to a secure link; long enough to type a passkey.
+  static constexpr unsigned long SECURE_LINK_TIMEOUT_MS = 90UL * 1000UL;
+
+  // Shared with the NimBLE host task.
+  std::atomic<uint16_t> connHandle_{NO_CONNECTION};
+  std::atomic<bool> linkSecure_{false};
+  std::atomic<bool> pairingWindowRequested_{false};
+  std::atomic<bool> pairingInProgress_{false};
+  std::atomic<uint32_t> passkey_{0};
+  std::atomic<uint8_t> failedPairings_{0};
+  std::atomic<bool> pairingLocked_{false};
+  std::atomic<unsigned long> pairingLockedAtMs_{0};
+
+  // Main loop only; reset per connection.
+  // The connection an accepted hello or pair belongs to.
+  uint16_t authHandle_ = NO_CONNECTION;
+  bool sessionAuthenticated() const { return helloAccepted_ && authHandle_ == connHandle_.load(); }
+  uint8_t invalidHellos_ = 0;
+  unsigned long connectedAtMs_ = 0;
+  unsigned long securedAtMs_ = 0;
+  // HMAC proof of the secret for the last accepted hello, published in status.
+  std::string readerProof_;
 
   // Borrowed from the Store screen for as long as that screen is up; null the
   // rest of the time, which is most of the time.
@@ -204,18 +266,17 @@ class BleLink {
   size_t queuedBleEventBytes_ = 0;
   bool bleEventOverflow_ = false;
 
-  std::string sessionCode_;
   std::string fileName_;
-  // Build stamp sent with a firmware image, if any (sanitised).
+  // Build stamp (yyyyMMdd.HHmm) and signature (hex DER) sent with a firmware image.
   std::string firmwareVersion_;
+  std::string firmwareSignature_;
   std::string partPath_;
   std::string finalPath_;
   std::string expectedSha256_;
   std::string savedPath_;
   std::string errorMessage_;
-  // Why the last `hello` was refused, if it was. Deliberately not errorMessage_:
-  // a refused hello is not a failed session, and must never take the pairing
-  // code off the screen -- see setAuthError().
+  // Why the last `hello` or `pair` was refused. Not errorMessage_: a refused
+  // hello is not a failed session -- see setAuthError().
   std::string authErrorMessage_;
   std::string deviceId_;
   std::string deviceNonce_;
@@ -246,7 +307,7 @@ class BleLink {
   bool transferOpen_ = false;
   bool downloadOpen_ = false;
   bool downloadAwaitingAck_ = false;
-  bool trustedHelloAccepted_ = false;
+  // A `pair` succeeded on this connection.
   bool hostPaired_ = false;
   bool pendingCommit_ = false;
   bool statusDirty_ = true;
@@ -287,8 +348,14 @@ class BleLink {
 
   void enqueueBleEvent(BleEvent event);
   void processBleEvents();
-  void onBleConnected();
-  void onBleDisconnected();
+  void onBleConnected(uint16_t connHandle);
+  void onBleDisconnected(uint16_t connHandle);
+  void onSecurityResult(const BleEvent& event);
+  // A new bond inside the window: it becomes the only bond.
+  void adoptNewBond(const std::string& peerIdAddress);
+  // Enforces the hello and secure-link timeouts and ends a finished lockout.
+  void checkConnectionDeadlines();
+  void disconnectPeer(const char* reason);
   void onControlWrite(const std::string& value);
   void onDataWrite(const std::string& value);
   void processCommit();
@@ -318,13 +385,10 @@ class BleLink {
   // used for an answer to a question the device is no longer asking, which is a
   // normal race, not an error the user should see.
   void setError(const std::string& error, bool notifyStore);
-  // A refused `hello`. Never State::ERROR: the pairing page shows the reason as a
-  // line under the code rather than in place of it, because a client whose
-  // credential this reader does not have can only recover BY reading that code.
+  // A refused `hello` or `pair`. Never State::ERROR: the link stays up.
   void setAuthError(const std::string& error);
-  // Write the offered credential to flash. Called the moment a code-authenticated
-  // hello supplies one -- see the class comment.
-  bool saveTrustedHost(const std::string& hostId, const std::string& hostName, const std::string& secret);
+  // A refused `hello`; the third on one connection disconnects it.
+  void refuseHello(const std::string& error);
   // Tell whichever screen is up that something changed. Does nothing when the
   // link is running behind a reader page, which is the normal case.
   void notifyObserver();

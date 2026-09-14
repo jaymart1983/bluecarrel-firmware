@@ -70,6 +70,8 @@ class SdFirmwareUpdateActivity : public Activity {
   bool sleepAfter = false;
   // The build stamp staged beside the image, when the app sent one.
   std::string stagedVersion;
+  // Digest the watcher verified (and the user approved) for a staged drop.
+  std::string approvedHash;
   size_t firmwareSize = 0;
   size_t writtenBytes = 0;
   unsigned int lastRenderedPercent = 101;
@@ -81,4 +83,5 @@ class SdFirmwareUpdateActivity : public Activity {
   void promptConfirmation();
   void onConfirmationResult(const ActivityResult& result);
   void performUpdate();
+  bool verifyStagedDrop(std::string& digest);
 };

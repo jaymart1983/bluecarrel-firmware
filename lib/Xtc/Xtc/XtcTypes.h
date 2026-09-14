@@ -12,6 +12,7 @@
 
 #pragma once
 
+#include <cstddef>
 #include <cstdint>
 #include <string>
 
@@ -87,6 +88,19 @@ struct XtgPageHeader {
   //   pixelValue = (bit1 << 1) | bit2
 };
 #pragma pack(pop)
+
+// Largest page side accepted from a file. Real pages match the panel (a few hundred pixels).
+constexpr uint16_t MAX_PAGE_DIMENSION = 4096;
+
+// Bytes of bitmap data for one page, or 0 for a zero or out-of-range size.
+// XTG (1-bit): ((width + 7) / 8) * height. XTH (2-bit): ((width * height + 7) / 8) * 2.
+inline size_t pageBitmapSize(const uint16_t width, const uint16_t height, const uint8_t bitDepth) {
+  if (width == 0 || height == 0 || width > MAX_PAGE_DIMENSION || height > MAX_PAGE_DIMENSION) return 0;
+  const size_t w = width;
+  const size_t h = height;
+  if (bitDepth == 2) return ((w * h + 7) / 8) * 2;
+  return ((w + 7) / 8) * h;
+}
 
 // Page information (internal use, optimized for memory)
 struct PageInfo {

@@ -32,6 +32,7 @@ enum class Result {
   ERASE_FAIL,
   WRITE_FAIL,
   OTADATA_FAIL,
+  DIGEST_MISMATCH,  // bytes written do not hash to the expected SHA-256
 };
 
 // Progress callback: called after every chunk write. `written`/`total` are bytes.
@@ -47,7 +48,12 @@ using ProgressCb = void (*)(size_t written, size_t total, void* ctx);
 // the user the confirmation prompt) skip the redundant second pass. Defaults
 // to false so callers without prior validation (any future entry point) keep
 // the defense-in-depth check.
-Result flashFromSdPath(const char* sdPath, ProgressCb onProgress, void* ctx, bool alreadyValidated = false);
+//
+// `expectedSha256Hex` (64 lowercase hex, optional): the SHA-256 of the bytes
+// streamed into flash must equal it, or otadata is left alone and
+// DIGEST_MISMATCH is returned.
+Result flashFromSdPath(const char* sdPath, ProgressCb onProgress, void* ctx, bool alreadyValidated = false,
+                       const char* expectedSha256Hex = nullptr);
 
 // Full-image integrity check that mirrors the bootloader's verification:
 // header magic, segment table walk, XOR checksum, and SHA256 trailer (when

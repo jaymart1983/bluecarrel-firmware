@@ -24,7 +24,10 @@ void SdFirmwareUpdateActivity::onEnter() {
   Activity::onEnter();
   // Build-identity marker — confirms which firmware build owns the SD update flow.
   LOG_INF("FW", "SdFirmwareUpdateActivity build=%s %s recovery=%d", __DATE__, __TIME__, recoveryMode ? 1 : 0);
-  if (stagedDrop) firmware_staging::readVersion(stagedVersion);
+  if (stagedDrop) {
+    firmware_staging::readVersion(stagedVersion);
+    approvedHash = FIRMWARE_WATCHER.verifiedHash();
+  }
   if (presetPath) {
     // Validate on the first render rather than here: onEnter() runs before the
     // activity has painted anything, and validateFirmware() is seconds of SD
@@ -205,6 +208,19 @@ void SdFirmwareUpdateActivity::performUpdate() {
   BLE_LINK.end();
 #endif
 
+  // Staged drops are checked again from the card now that nothing else can write
+  // to it: same digest as approved, and still signed and newer.
+  std::string verifiedDigest;
+  if (stagedDrop && !verifyStagedDrop(verifiedDigest)) {
+#if FREEINK_CAP_BLE_TRANSFER
+    BLE_LINK.begin();
+#endif
+    RenderLock lock(*this);
+    state = State::FAILED;
+    requestUpdate();
+    return;
+  }
+
   auto progressCb = +[](size_t written, size_t total, void* ctx) {
     auto* self = static_cast<SdFirmwareUpdateActivity*>(ctx);
     self->writtenBytes = written;
@@ -218,15 +234,20 @@ void SdFirmwareUpdateActivity::performUpdate() {
   // pre-confirmation pass. The alreadyValidated parameter on the API stays
   // for callers (e.g. an OTA staging path) where the same byte stream was
   // just hashed and there's no removable-media gap.
-  const auto result = firmware_flash::flashFromSdPath(firmwarePath.c_str(), progressCb, this);
+  const auto result = firmware_flash::flashFromSdPath(firmwarePath.c_str(), progressCb, this, /*alreadyValidated=*/false,
+                                                      stagedDrop ? verifiedDigest.c_str() : nullptr);
   if (result != firmware_flash::Result::OK) {
     LOG_ERR("FW", "flash failed: %s", firmware_flash::resultName(result));
     // BAD_CHIP / WRONG_BOARD here is the TOCTOU re-validation catching a
     // wrong-device image the pre-confirmation pass missed (e.g. the SD card
     // was swapped).
-    errorMessage = result == firmware_flash::Result::BAD_CHIP || result == firmware_flash::Result::WRONG_BOARD
-                       ? tr(STR_FIRMWARE_WRONG_DEVICE)
-                       : tr(STR_FIRMWARE_WRITE_FAILED);
+    if (result == firmware_flash::Result::BAD_CHIP || result == firmware_flash::Result::WRONG_BOARD) {
+      errorMessage = tr(STR_FIRMWARE_WRONG_DEVICE);
+    } else if (result == firmware_flash::Result::DIGEST_MISMATCH) {
+      errorMessage = tr(STR_FIRMWARE_CHANGED);
+    } else {
+      errorMessage = tr(STR_FIRMWARE_WRITE_FAILED);
+    }
     RenderLock lock(*this);
     state = State::FAILED;
     requestUpdate();
@@ -249,6 +270,34 @@ void SdFirmwareUpdateActivity::performUpdate() {
   // on the new build. restartToSleepAfterUpdate() does not return.
   if (sleepAfter) restartToSleepAfterUpdate();
   ESP.restart();
+}
+
+bool SdFirmwareUpdateActivity::verifyStagedDrop(std::string& digest) {
+  digest.clear();
+  if (firmwarePath != firmware_staging::IMAGE_PATH) {
+    LOG_ERR("FW", "staged install of unexpected path %s", firmwarePath.c_str());
+    errorMessage = tr(STR_INVALID_FIRMWARE);
+    return false;
+  }
+  std::string actual;
+  if (!firmware_staging::hashImage(actual)) {
+    errorMessage = tr(STR_FIRMWARE_FILE_OPEN_FAILED);
+    return false;
+  }
+  if (approvedHash.empty() || actual != approvedHash) {
+    LOG_ERR("FW", "staged image %s is not the approved %s", actual.c_str(),
+            approvedHash.empty() ? "(none)" : approvedHash.c_str());
+    errorMessage = tr(STR_FIRMWARE_CHANGED);
+    return false;
+  }
+  const auto verdict = firmware_staging::checkStaged(actual);
+  if (verdict != firmware_signature::Verdict::OK) {
+    LOG_ERR("FW", "staged image refused at install: %s", firmware_signature::verdictName(verdict));
+    errorMessage = firmwareVerdictText(verdict);
+    return false;
+  }
+  digest = std::move(actual);
+  return true;
 }
 
 void SdFirmwareUpdateActivity::loop() {

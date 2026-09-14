@@ -4,11 +4,19 @@ name: Release X4 Pro firmware
 # report to the app) to build the X4 Pro release image and publish a GitHub release:
 #
 #   crosspoint-x4pro-<stamp>.bin       app image: Bluetooth updates, or USB at 0x10000
+#   crosspoint-x4pro-<stamp>.bin.sig   its signature (hex), for copying to /firmware/firmware.bin.sig
 #   crosspoint-x4pro-<stamp>-full.bin  bootloader + partition table + app from 0x0,
 #                                      for a first install over USB
-#   firmware.json                      {version, file, size, sha256} for an update page
+#   firmware.json                      {version, file, size, sha256, signature} for an update page
+#
+# Images are signed with the FIRMWARE_SIGNING_KEY secret (PEM EC P-256 private key
+# matching src/network/FirmwareSigningKey.h).
 #
 #   git tag x4pro-$(date -u +%Y%m%d.%H%M) && git push origin --tags
+#
+# A tag ending in -test (x4pro-<stamp>-test) publishes a pre-release instead. The app's
+# default update page (releases/latest) skips pre-releases, so only a device pointed at
+# that release's download URL picks it up.
 
 on:
   push:
@@ -32,12 +40,18 @@ jobs:
 
       - name: Build stamp from tag
         run: |
-          stamp="${GITHUB_REF_NAME#x4pro-}"
-          if ! [[ "$stamp" =~ ^[0-9]{8}\.[0-9]{4}$ ]]; then
-            echo "Tag must be x4pro-yyyyMMdd.HHmm, got $GITHUB_REF_NAME" >&2
+          rest="${GITHUB_REF_NAME#x4pro-}"
+          prerelease=false
+          if [[ "$rest" == *-test ]]; then
+            rest="${rest%-test}"
+            prerelease=true
+          fi
+          if ! [[ "$rest" =~ ^[0-9]{8}\.[0-9]{4}$ ]]; then
+            echo "Tag must be x4pro-yyyyMMdd.HHmm or x4pro-yyyyMMdd.HHmm-test, got $GITHUB_REF_NAME" >&2
             exit 1
           fi
-          echo "X4_BUILD_STAMP=$stamp" >> "$GITHUB_ENV"
+          echo "X4_BUILD_STAMP=$rest" >> "$GITHUB_ENV"
+          echo "X4_PRERELEASE=$prerelease" >> "$GITHUB_ENV"
 
       - uses: actions/setup-python@v6
         with:
@@ -69,21 +83,49 @@ jobs:
       - name: Build
         run: pio run -e "$PIO_ENV" -j1
 
+      # Written after the build so no build script runs while the key is on disk.
+      - name: Write signing key
+        env:
+          FIRMWARE_SIGNING_KEY: ${{ secrets.FIRMWARE_SIGNING_KEY }}
+        run: |
+          if [ -z "$FIRMWARE_SIGNING_KEY" ]; then
+            echo "::error::The FIRMWARE_SIGNING_KEY secret is empty or not set; refusing to release unsigned firmware"
+            exit 1
+          fi
+          umask 077
+          key="$RUNNER_TEMP/firmware-signing-key.pem"
+          printf '%s\n' "$FIRMWARE_SIGNING_KEY" > "$key"
+          chmod 600 "$key"
+
       - name: Package
+        env:
+          FIRMWARE_SIGNING_KEY_FILE: ${{ runner.temp }}/firmware-signing-key.pem
         run: |
           build=".pio/build/$PIO_ENV"
           grep -q "\"$X4_BUILD_STAMP\"" src/network/BuildStamp.h
           scripts/make_firmware_json.sh dist "$build/firmware.bin"
+          test -s "dist/crosspoint-x4pro-$X4_BUILD_STAMP.bin.sig"
+          grep -q '"signature":"' dist/firmware.json
           # merge_bin fills the gap over otadata (0xe000) with 0xFF, so the reader boots app0.
           python -m esptool --chip esp32s3 merge_bin -o "dist/crosspoint-x4pro-$X4_BUILD_STAMP-full.bin" \
             0x0 "$build/bootloader.bin" 0x8000 "$build/partitions.bin" 0x10000 "$build/firmware.bin"
-          (cd dist && sha256sum *.bin > SHA256SUMS)
+          (cd dist && sha256sum *.bin *.sig > SHA256SUMS)
           ls -l dist
+
+      - name: Remove signing key
+        if: always()
+        run: rm -f "$RUNNER_TEMP/firmware-signing-key.pem"
 
       - name: Publish release
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
-          gh release create "$GITHUB_REF_NAME" dist/* \
-            --title "X4 Pro firmware $X4_BUILD_STAMP" \
-            --notes "Install over Bluetooth from the X4 Pro Sync app, or over USB: see the README (First install over USB). \`firmware.json\` can be served from your own update page."
+          flags=()
+          title="X4 Pro firmware $X4_BUILD_STAMP"
+          if [ "$X4_PRERELEASE" = "true" ]; then
+            flags+=(--prerelease)
+            title="$title (test)"
+          fi
+          gh release create "$GITHUB_REF_NAME" dist/* "${flags[@]}" \
+            --title "$title" \
+            --notes "Install over Bluetooth from the companion app, or over USB: see the README (First install over USB). \`firmware.json\` can be served from your own update page."

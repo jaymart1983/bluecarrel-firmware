@@ -145,11 +145,13 @@ void XtcReaderActivity::renderPage() {
   const uint16_t pageHeight = xtc->getPageHeight();
   const uint8_t bitDepth = xtc->getBitDepth();
 
-  size_t pageBufferSize;
-  if (bitDepth == 2) {
-    pageBufferSize = ((static_cast<size_t>(pageWidth) * pageHeight + 7) / 8) * 2;
-  } else {
-    pageBufferSize = ((pageWidth + 7) / 8) * pageHeight;
+  const size_t pageBufferSize = xtc::pageBitmapSize(pageWidth, pageHeight, bitDepth);
+  if (pageBufferSize == 0) {
+    LOG_ERR("XTR", "Unsupported page size %ux%u", pageWidth, pageHeight);
+    renderer.clearScreen();
+    renderer.drawCenteredText(UI_12_FONT_ID, 300, tr(STR_PAGE_LOAD_ERROR), true, EpdFontFamily::BOLD);
+    renderer.displayBuffer();
+    return;
   }
 
   uint8_t* pageBuffer = static_cast<uint8_t*>(malloc(pageBufferSize));

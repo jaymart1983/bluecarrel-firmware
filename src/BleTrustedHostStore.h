@@ -1,51 +1,45 @@
 #pragma once
 
-#include <ArduinoJson.h>
-#include <PersistableStore.h>
-
+#include <array>
+#include <cstddef>
+#include <cstdint>
 #include <string>
-#include <vector>
 
 struct BleTrustedHost {
   std::string hostId;
   std::string name;
-  std::string secret;  // Plaintext in memory; obfuscated with hardware key on disk.
+  // HMAC-SHA256 key: the raw bytes, not their hex spelling.
+  std::array<uint8_t, 32> secret{};
 };
 
 /**
- * Singleton storing BLE trusted-host credentials on the SD card.
+ * The one phone this reader trusts, kept in NVS (Preferences namespace
+ * "bleauth") so it is not readable from the SD card.
  *
- * Ported from the standalone JsonSettingsIO implementation onto
- * PersistableStore, which replaced it in 63eda54 ("Migrate Settings/State onto
- * PersistableStore"). The base now supplies the singleton, saveToFile(),
- * loadFromFile(), locking, and the legacy-shape resave hook, so this class only
- * has to describe its own JSON.
- *
- * The secret is stored under "password_obf" so it goes through the shared
- * extractPassword()/obfuscateToBase64() path used by every other store rather
- * than growing a second obfuscation scheme.
+ * Main loop only: nothing here is locked.
  */
-class BleTrustedHostStore : public PersistableStore<BleTrustedHostStore> {
- private:
-  std::vector<BleTrustedHost> hosts;
-
-  static constexpr size_t MAX_HOSTS = 1;
-
-  BleTrustedHostStore() = default;
-
-  friend class PersistableStore<BleTrustedHostStore>;
-
+class BleTrustedHostStore {
  public:
-  static const char* getFilePath() { return "/.crosspoint/ble_trusted_hosts.json"; }
-  void toJson(JsonDocument& doc) const;
-  bool fromJson(JsonVariantConst doc);
+  static constexpr size_t SECRET_BYTES = 32;
+
+  static BleTrustedHostStore& getInstance();
+
+  // Reads the record from NVS, and removes the v1 SD-card file if it is still
+  // on the card (v1 pairings do not carry over).
+  void load();
 
   bool addOrReplaceHost(const BleTrustedHost& host);
   const BleTrustedHost* findHost(const std::string& hostId) const;
-  bool hasHosts() const { return !hosts.empty(); }
+  // Null when nobody is paired.
+  const BleTrustedHost* host() const { return hasHost_ ? &host_ : nullptr; }
+  bool hasHosts() const { return hasHost_; }
   bool clearAll();
 
-  const std::vector<BleTrustedHost>& getHosts() const { return hosts; }
+ private:
+  BleTrustedHostStore() = default;
+
+  BleTrustedHost host_;
+  bool hasHost_ = false;
 };
 
 #define BLE_TRUSTED_HOSTS BleTrustedHostStore::getInstance()

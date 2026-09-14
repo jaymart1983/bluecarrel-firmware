@@ -8,7 +8,8 @@ longer any screen a user has to find and keep open before a phone can reach the 
 Advertising runs at a deliberately slow interval — 1000-1285 ms — because this link is for occasional sync, not
 low latency. A scanning phone still finds the reader within a second or two.
 
-The main client is the **X4 Pro Sync** Android app. `scripts/ble_transfer.py` is a command-line client for testing.
+The main client is the **X4 Pro Sync** Android app. `scripts/ble_transfer.py` is a command-line test client for
+protocol 1 readers only.
 The X4 Pro build has no Wi-Fi, so this link is its only wireless path: books, reading positions, settings and
 firmware updates all travel over it.
 
@@ -17,94 +18,155 @@ book opens or closes and just before the device goes to sleep. See [Heartbeat fi
 
 ## Compatibility
 
-- Protocol version: `1`
+- Protocol version: `2`
 - Device name: `CrossPoint Transfer`
 - Service UUID: `6f9f0a00-9b1d-4d1f-9f53-5b6b8b3d0f10`
 
 Clients should discover the service by UUID. The user-visible name is not part of the compatibility contract.
 
+A `hello` or `pair` with any `version` other than `2` is refused. `scripts/ble_transfer.py` speaks only protocol 1 and
+stops when a reader reports `protocol_version` 2 or higher. The design and threat model are in
+[security-v2.md](./security-v2.md).
+
 ## Characteristics
 
 | Name | UUID | Direction | Properties |
 | --- | --- | --- | --- |
-| `control` | `6f9f0a01-9b1d-4d1f-9f53-5b6b8b3d0f10` | client to reader | write with response |
-| `data-in` | `6f9f0a02-9b1d-4d1f-9f53-5b6b8b3d0f10` | client to reader | write, write without response |
-| `status` | `6f9f0a03-9b1d-4d1f-9f53-5b6b8b3d0f10` | reader to client | read, notify (the read and the notification carry *different* documents — see [The Store](#the-store-requests-over-the-notify-channel)) |
+| `control` | `6f9f0a01-9b1d-4d1f-9f53-5b6b8b3d0f10` | client to reader | write with response; encrypted, authenticated link required |
+| `data-in` | `6f9f0a02-9b1d-4d1f-9f53-5b6b8b3d0f10` | client to reader | write, write without response; encrypted, authenticated link required |
+| `status` | `6f9f0a03-9b1d-4d1f-9f53-5b6b8b3d0f10` | reader to client | read (encrypted, authenticated link required), notify (the read and the notification carry *different* documents — see [The Store](#the-store-requests-over-the-notify-channel)) |
 | `data-out` | `6f9f0a04-9b1d-4d1f-9f53-5b6b8b3d0f10` | reader to client | notify |
+
+## Link security
+
+- **LE Secure Connections only**, with bonding and MITM protection. Legacy pairing is refused by the stack.
+- The reader's IO capability is display only, so pairing is **passkey entry**: the reader shows a six-digit passkey on
+  its Settings page and the phone's system pairing dialog asks the user to type it. Every attempt gets a new passkey.
+- **One connection at a time.** A second central is disconnected.
+- Writes to `control` and `data-in` are ignored, and nothing is notified on `status` or `data-out`, unless the one
+  connection is encrypted, authenticated and bonded.
+- Bonds are kept in NimBLE's NVS store. When a new pairing succeeds, the reader deletes every other bond and the stored
+  host record, so it is bonded to one phone.
+
+### Pairing window
+
+A new bond is accepted only while the pairing window is open:
+
+- It is open while the Settings page is on screen and no phone is paired, or after the user taps **Pair new phone** on
+  that page.
+- It closes when the user leaves the Settings page, and when a `pair` succeeds.
+- With the window closed, a pairing attempt is disconnected and any new bond it produced is deleted. A phone that is
+  already bonded reconnects whether or not the window is open.
+- Three failed attempts (wrong passkey, unauthenticated pairing, or disconnecting while the passkey is shown) lock
+  pairing for 60 s. The Settings page shows the countdown.
+
+### Timeouts and limits
+
+| Condition | Result |
+| --- | --- |
+| Link not encrypted, authenticated and bonded within 90 s of connecting | Disconnected |
+| No accepted `hello` or `pair` within 20 s of the link being secured | Disconnected |
+| Three refused `hello`s on one connection | Disconnected |
+| Three failed pairing attempts | Pairing locked for 60 s |
+
+### Status before authentication
+
+Until a `hello` or `pair` is accepted on the connection, `status` carries only:
+
+| Field | Type | Meaning |
+| --- | --- | --- |
+| `state` | string | Link state |
+| `protocol_version` | number | `2` |
+| `device_id` | string | Reader identity used in the `hello` HMAC. GATT read only. |
+| `device_nonce` | string | Reader nonce for the next `hello`. GATT read only. |
+| `has_trusted_host` | bool | A host record is stored |
+| `pairing_window` | bool | The pairing window is open and not locked |
+| `auth_error` | string | Why the last `hello` or `pair` was refused. Absent when none. |
+
+A notification that does not fit drops `protocol_version` first, then `has_trusted_host` and `pairing_window`, then
+`auth_error`. Book, progress, library, heartbeat and error fields are sent only after authentication.
 
 ## Authentication
 
-First use requires the six-digit code. It is shown in the **Bluetooth** section of the device Settings page (on the
-X4 Pro: Control Centre > Settings; the same page is also **Settings > System > Bluetooth**). The code is shown only
-while no phone is paired: a paired phone reconnects with its saved credential and never needs it. Forgetting the
-phone brings the code back.
+The bond authenticates the phone's Bluetooth stack. On top of it the app and the reader share a 32-byte secret, which
+authenticates the app to the reader and the reader to the app.
+
+The reader stores one host record in NVS (Preferences namespace `bleauth`): `host_id`, `host_name` and the secret. The
+v1 file `/.crosspoint/ble_trusted_hosts.json` is deleted from the SD card; v1 pairings do not carry over.
+
+Field rules used below:
+
+- `host_id`: 1-64 characters, letters, digits, `-` and `_`.
+- `host_name`: cut to 48 bytes; any character outside printable ASCII becomes `?`; empty or missing is stored as
+  `Trusted host`.
+- HMAC key: the **32 raw secret bytes**, not their hex text.
+
+### `pair`
+
+Sent once, on a freshly bonded link, while the pairing window is open:
 
 ```json
-{"op":"hello","version":1,"code":"123456"}
+{"op":"pair","version":2,"host_id":"H","host_name":"Pixel 9","secret":"<64 lowercase hex>"}
 ```
 
-The code is regenerated once per wake, not once per screen, so it is stable for as long as the device stays awake.
-A `hello` with the code and no pairing fields gives a code-only session that is not remembered.
+`secret` is 32 random bytes as 64 lowercase hex characters. On success the reader replaces any stored host, closes the
+pairing window, marks the session authenticated and publishes `status` with `"paired":true` and `trusted_host`.
 
-### Pairing is saved immediately
+`pair` carries no `reader_proof`. The app must follow it with a `hello` on the same connection and check the
+`reader_proof` that hello produces before it trusts the reader.
 
-A client that wants to be remembered includes `pair_host_id`, `pair_host_name` and `pair_secret` in the same `hello`.
-**The reader writes the credential to flash the moment that hello is accepted.** There is no prompt and no later step.
+Refusals, reported as `auth_error`: `pairing window closed`, `invalid pair request`, `could not save the pairing`.
 
-This is a behaviour change, and it is the whole reason this document was revised. The reader used to save a trusted
-host only through an on-device prompt that appeared *after a completed authenticated upload*. Every real client saves
-its half of the pairing as soon as it sends `pair_secret`, so a session that paired but never finished an upload left
-the two sides disagreeing: the client held a credential the reader had never kept, its next reconnect authenticated by
-HMAC against nothing, and the refusal used to be shown on an error screen that replaced the six-digit code — the one
-thing needed to recover. Both halves are now committed at the same instant.
-
-The user's consent is the six digits themselves. They were read off the reader's own pairing page and typed into the
-client; there is no second question worth asking.
-
-`save_host` still exists and is still accepted, but it now does nothing except republish `status`: by the time a client
-could send it, the credential is already saved.
-
-### Trusted auth
-
-A paired client reconnects without the code:
+### `hello`
 
 ```json
-{"op":"hello","version":1,"host_id":"…","response":"<64 hex>","host_name":"X4 Pro Sync"}
+{"op":"hello","version":2,"host_id":"H","host_name":"N","client_nonce":"C","response":"R"}
 ```
 
-`response` is HMAC-SHA256, keyed with the saved secret, over this message:
+- `D`: the reader's `device_nonce`, from a GATT read of `status` just before the hello.
+- `I`: the reader's `device_id`, from the same read.
+- `C`: 16 random bytes from the phone as 32 lowercase hex characters, new for every hello.
+- `H`: the `host_id` sent at pairing.
+- `R`: HMAC-SHA256 as 64 lowercase hex characters over
+
+  ```text
+  X4AUTH2|host|{D}|{C}|{H}|{I}
+  ```
+
+The reader compares `R` in constant time. On success it marks the session authenticated, rotates `device_nonce`, and
+publishes `status` with `trusted_host` and `reader_proof`, the HMAC-SHA256 as lowercase hex over
 
 ```text
-{device_nonce}|{host_id}|1
+X4AUTH2|reader|{D}|{C}|{H}|{I}
 ```
 
-`device_nonce` comes from a GATT read of `status` and changes after every accepted trusted hello.
+using the same `D` the hello was computed over. The app must verify `reader_proof` in constant time; no other status
+field makes a reader trusted.
 
-`host_name` is optional. When it is present and differs from the name stored at pairing, the reader renames the
-stored host, so its Settings page shows the client's current name. The name is cut to the stored maximum and any
-character outside printable ASCII becomes `?`.
+Send `host_name` on every hello. When it differs from the stored name, the reader stores the new one.
 
-### When a hello is refused
+`device_nonce` also changes on every disconnect, so read it again after reconnecting.
 
-A refused `hello` is **not** a failed session and never enters `state: "error"`. The link stays up, the code stays on
-the pairing page, and the reason is reported in `status` as `auth_error` — a separate field from `error`, cleared by
-the next accepted hello. This matters because the only recovery from a refused trusted-host hello is to read that code.
+### Refusals
 
-Read `auth_error` together with `has_trusted_host` to tell the cases apart:
+A refused `hello` or `pair` is **not** a failed session and never enters `state: "error"`. The link stays up, any
+earlier authentication on the connection is cleared, and the reason is reported in `status` as `auth_error`, cleared by
+the next accepted hello. Three refused hellos on one connection disconnect it. Any other op sent before authentication
+is refused with `auth_error: "hello required"`.
 
-| `auth_error` | `has_trusted_host` | Meaning |
-| --- | --- | --- |
-| `unknown trusted host` | `false` | Nobody is paired here. Forget the saved credential and pair with the code. |
-| `unknown trusted host` | `true` | A different host is paired. Pair with the code to replace it. |
-| `invalid trusted host auth` | `true` | The credential is for this reader but the signature did not verify. |
-
-`has_trusted_host` is carried in notifications as well as in the GATT read, because a client that only listens to the
-doorbell needs it at exactly the moment its trusted hello was refused.
+| `auth_error` | Meaning |
+| --- | --- |
+| `unsupported protocol version` | `version` is not `2` |
+| `invalid hello` | A field is missing or malformed |
+| `unknown trusted host` | With `has_trusted_host: false`, nobody is paired. With `true`, a different host is paired. |
+| `invalid trusted host auth` | `response` did not verify |
+| `pairing window closed` | `pair` sent while the window is closed |
+| `invalid pair request` | A `pair` field is missing or malformed |
 
 ### Forgetting
 
-The user forgets a phone with **Forget** in the Bluetooth section of the Settings page. There is no protocol operation
-for it: a client cannot make the reader forget anybody. The reader stores one host; pairing another replaces it.
+The user forgets the phone with **Forget** on the Settings page. That deletes the host record and every bond. There is
+no protocol operation for it. To pair again, the phone must first remove the reader from its own Bluetooth settings.
 
 ## Supported Operations
 
@@ -119,7 +181,8 @@ Uploads use `start_put`, binary frames on `data-in`, then `commit`.
 | `size` | number | Total bytes. Required. |
 | `sha256` | string | 64 hex characters over the whole payload. Required. |
 | `replace` | bool | `book` only. `true` overwrites an existing `/Books/<name>`; without it an existing file is refused as `exists`. Replacing the book that is open on screen is refused as `book open`. Default `false`. |
-| `version` | string | `firmware` only, optional. A build stamp such as `20260913.1914`, saved beside the image as `firmware.bin.version` and shown on the update screens. Ignored unless it is at most 32 characters of letters, digits, `.`, `-` or `_`. |
+| `version` | string | `firmware` only, required. The image's build stamp, `yyyyMMdd.HHmm` (for example `20260913.1914`). Saved as `firmware.bin.version`. |
+| `signature` | string | `firmware` only, required. The image signature as lowercase hex, even length, at most 256 characters (see [Signatures](#signatures)). Saved as `firmware.bin.sig`. |
 | `req` | number | Only when answering a Store request. |
 | `resume`, `chunk_size`, `ack_bytes` | bool, number, number | Resumable upload and credit flow-control options. |
 
@@ -127,8 +190,9 @@ Supported upload kinds:
 
 - `book`: `.epub` saved under `/Books`
 - `bmp`: `.bmp` saved under `/Pictures`
-- `firmware`: `.bin` **dropped into the watched folder** — see [Firmware updates](#firmware-updates). It is validated
-  on commit and then left there; nothing is flashed during the session
+- `firmware`: `.bin` **dropped into the watched folder** — see [Firmware updates](#firmware-updates). Requires
+  `version` and `signature`; without a well-formed pair `start_put` fails with `signature required`. It is validated on
+  commit and then left there; nothing is flashed during the session
 - `progress`: a batch of reading positions to apply to books already on the card (see below)
 - `settings`: a settings document to apply. Refused as `book open` while a book is open
 - `book_meta`: book metadata for the app's library, capped at a small size
@@ -148,7 +212,7 @@ Supported download kinds:
 
 The other control ops are `set_time` (see [Device clock](#device-clock)), `delete_book` (see
 [`delete_book`](#delete_book)), `catalog_error` (the app declining a Store request it cannot answer) and `cancel`.
-`save_host` is accepted and does nothing (see [Pairing is saved immediately](#pairing-is-saved-immediately)).
+`hello` and `pair` are described under [Authentication](#authentication).
 
 ## `delete_book`
 
@@ -188,64 +252,84 @@ wildcards. Like every other op it requires `hello` first.
 
 ## Firmware updates
 
-A firmware push is now a **file drop**, not an interactive flow. The reader watches one folder:
+A firmware push is a **file drop**, not an interactive flow. The reader watches one folder:
 
 | Path | What it is |
 | --- | --- |
 | `/firmware/firmware.bin` | the ESP32 application image |
 | `/firmware/firmware.bin.sha256` | its SHA-256, as text |
-| `/firmware/firmware.bin.version` | optional: the `version` sent with `start_put`, as text; shown on the update screens |
+| `/firmware/firmware.bin.version` | its build stamp, `yyyyMMdd.HHmm`, as text. Required. |
+| `/firmware/firmware.bin.sig` | its signature, hex text. Required. |
 | `/firmware/.firmware.bin.part` | scratch: where a BLE upload accumulates before the rename |
 
-The companion file's **first whitespace-delimited token** is a 64-character hex SHA-256 of the image. That is exactly
-the first field of `sha256sum firmware.bin`, so the file a person writes by hand and the file the app writes are the
-same file. Case is not significant; a trailing newline is fine.
+The `.sha256` file's **first whitespace-delimited token** is a 64-character hex SHA-256 of the image, which is the first
+field of `sha256sum firmware.bin`. Case is not significant in `.sha256` or `.sig`; a trailing newline is fine.
 
-Two routes put files there, and they are the same route:
+### Signatures
 
-- **Over BLE.** `start_put` with `kind: "firmware"`, frames, `commit` — unchanged wire protocol. On commit the reader
-  validates the image (`firmware_flash::validateImageFile`: header magic, segment table, XOR checksum, SHA-256
-  trailer, chip id, board tag) and, if it passes, writes `/firmware/firmware.bin.sha256` itself from the digest it
-  just verified, plus `/firmware/firmware.bin.version` when `start_put` carried a usable `version`. The client does not
-  send the hash file. `status` reports `state: "saved"`; a bad image reports `state: "error"` with
-  `error: "invalid firmware: <REASON>"` while the client is still connected to hear it. Starting a `firmware` upload
-  first removes any previously staged image.
-- **Over USB.** Plug the reader into a computer, copy `firmware.bin` and `firmware.bin.sha256` onto the card, eject.
-  The `.version` file is optional.
+- Algorithm: ECDSA P-256 with SHA-256. The signature is DER, carried as lowercase hex.
+- Signed message, ASCII, no newline:
 
-The reader then checks the folder every 30 seconds (not during the first 20 seconds after boot), re-hashes the image
-off the card a few KB per main-loop tick, and only if the digest matches the companion file does it act:
+  ```text
+  X4FW1|{version}|{sha256 of the image, lowercase hex}
+  ```
+
+- Public key: `FIRMWARE_SIGNING_PUBKEY_DER` in `src/network/FirmwareSigningKey.h`.
+- `scripts/make_firmware_json.sh` produces the `.sig` and a `firmware.json` with a `signature` field.
+
+### Staging
+
+Two routes put files there:
+
+- **Over BLE.** `start_put` with `kind: "firmware"`, `version` and `signature`, then frames and `commit`. Starting a
+  `firmware` upload first removes any staged image and its companion files. On commit the reader validates the image
+  (`firmware_flash::validateImageFile`: header magic, segment table, XOR checksum, SHA-256 trailer, chip id, board tag)
+  and, if it passes, writes `.sha256` from the digest it just verified, plus `.version` and `.sig`. `status` reports
+  `state: "saved"`; a bad image reports `state: "error"` with `error: "invalid firmware: <REASON>"`. The signature is
+  checked by the watcher, not at commit.
+- **Over USB.** Plug the reader into a computer and copy `firmware.bin`, `firmware.bin.sha256`,
+  `firmware.bin.version` and `firmware.bin.sig` into `/firmware`, then eject.
+
+### Checks
+
+The reader checks the folder every 30 seconds (not during the first 20 seconds after boot) and re-hashes the image off
+the card a few KB per main-loop tick. The update is offered only when all of these hold, checked in this order:
+
+| Check | Settings shows when it fails |
+| --- | --- |
+| `.sha256` is usable and the image is at least 64 KB | *Invalid image* |
+| The image hashes to `.sha256` | *Hash mismatch* |
+| `.sig` is present | *Unsigned image* |
+| `.version` is `yyyyMMdd.HHmm` | *No version* |
+| The signature verifies over the message above | *Bad signature* |
+| `.version` is newer than the running build stamp | *Not newer* |
+
+A refused image is left on the card. With `.bin` or `.sha256` missing nothing is staged and Settings shows *Up to
+date*.
+
+### Install
 
 - **Default:** it shows **Firmware update found** over whatever screen is up, a book included, with **Update Now**,
-  **Later** and **Cancel**. The question does not dismiss; it stays until one is chosen, or until the user goes Home
-  from the Control Centre (the update then remains available from Settings).
-  - **Update Now** leaves the current screen (an open book saves its position), validates and flashes, then reboots.
+  **Later** and **Cancel**. The question stays until one is chosen, or until the user goes Home from the Control
+  Centre (the update then remains available from Settings).
+  - **Update Now** leaves the current screen (an open book saves its position), installs, then reboots.
   - **Later** installs at the next sleep: on the way into sleep the reader flashes, reboots, and goes straight back to
-    sleep, so the next wake is on the new firmware. The deferral is held in RAM; a restart forgets it and the prompt
-    comes back.
-  - **Cancel** does not delete anything. The image is not offered again until the file changes size or the device
-    restarts.
+    sleep. The deferral is bound to the approved image; restaging on the reader cancels it, and a restart forgets it.
+  - **Cancel** deletes nothing. The image is not offered again until the staged files change or the device restarts.
 - **Auto-install** (setting `autoInstallFirmware` on): no prompt. The image installs at the next sleep, as for Later.
+  A `settings` upload cannot change `autoInstallFirmware`; it is set on the device only.
 
-Both files (and `.version`) are deleted after a successful flash so the new firmware does not come up and offer to
-install itself again. An image whose digest does not match is ignored and left on the card.
+Immediately before writing flash the reader hashes the image again, requires the digest the user approved, and repeats
+every check above. It hashes the bytes as it writes them and switches the boot partition only if they match; otherwise
+the install fails with *Image changed*. All four files are deleted after a successful install.
 
 `install_at_sleep` and `update_staged` in the [`about`](#about) download report this state to the client.
 
-### The hash file verifies integrity, not authenticity
+### What is not covered
 
-**This is not a signature and it is not a security boundary.** Anyone who can write `firmware.bin` can write
-`firmware.bin.sha256` in the same breath. The digest proves the bytes on the card are the bytes whoever wrote the hash
-intended to put there — it catches a truncated copy, an interrupted BLE upload, a failing SD card — and it proves
-nothing whatsoever about who wrote them.
-
-That is an accepted trade for a personal device: the SD card is already writable by anyone holding it, and USB access
-to the reader is already total control, so a signature here would be guarding a door in an open field. It is written
-down because it should be a decision on the record rather than a guarantee somebody infers from the word "hash".
-
-What actually protects the device from a bad image is unchanged and was never the hash: `validateImageFile()` runs
-when a BLE upload is committed and again at flash time, because the SD card is removable and that gap is real. Unless
-auto-install is on, the user also chooses on the device itself.
+**Settings > System > SD Card Firmware Update** and firmware recovery mode (Down + Power held at boot on the X4 Pro)
+flash any valid image the user picks on the device, signed or not. Flashing over USB with `esptool` always works; there
+is no secure boot.
 
 The Store also runs **the other way round** — the device asks, the app answers — over the `status` notify
 channel. See [The Store](#the-store-requests-over-the-notify-channel).
@@ -534,7 +618,7 @@ So the `status` characteristic — already `notify`, already subscribed to by th
 channel**. When the reader wants something it puts a `pending` object in the status document and notifies:
 
 ```json
-{"state":"connected","protocol_version":1,"store_supported":true,
+{"state":"connected","protocol_version":2,"store_supported":true,
  "pending":{"req":7,"op":"catalog_page","offset":12,"limit":6,
             "thumb_w":72,"thumb_h":108,"desc_max":160,"timeout_ms":20000}}
 ```
@@ -558,7 +642,7 @@ fits. It never truncates: a client always receives parseable JSON.
 | Dropped | Fields |
 | --- | --- |
 | first | `protocol_version`, `store_supported`, `clock_supported`, `device_time` |
-| then | `has_trusted_host`, `trusted_host`, `paired`, `name`, `path`, `book` |
+| then | `has_trusted_host`, `trusted_host`, `reader_proof`, `paired`, `name`, `path`, `book` |
 | then | `pending` keeps only `req`, `op` and the `id`/`offset` an answer must quote back |
 | then | the transfer counters (`kind`, `received`, `sent`, `size`, `ack_bytes`, `resumable`, `entries`, `applied`) and the `error` / `auth_error` text |
 | never | `state`, the heartbeat fields `lib_n`, `lib_h`, `pct`, `open`, `sleeping`, and `pending` |
@@ -573,9 +657,8 @@ The GATT read is bounded too, at 512 bytes. To fit it drops, in order, `firmware
 `resume_supported`, then `upload_kinds` / `download_kinds`, then `clock_supported` / `device_time`. It never drops
 identity, `device_nonce` or `auth_error`.
 
-`has_trusted_host` was promoted out of that read-only set on purpose. It is the field that separates "you were never
-saved here, pair with the code" from "your credential is wrong", and a client that only listens to the doorbell needs
-it at exactly the moment its trusted hello was refused.
+These rules apply after authentication. Before it, `status` carries only the fields in
+[Status before authentication](#status-before-authentication).
 
 In practice, at 180 bytes, a `pending` request is notified with its geometry intact and a transfer is
 notified with its byte counters intact — the two things a live session cannot work without, since
@@ -632,7 +715,7 @@ currently on screen, and those are deleted when the screen closes or the link dr
 
 | Situation | Screen |
 | --- | --- |
-| No app connected, or connected but not yet through `hello` | *The Store needs your phone*, with one action that leads to pairing (no code or QR on this screen) |
+| No app connected, or connected but not yet through `hello` | *The Store needs your phone*, with one action that leads to pairing |
 | Request outstanding | *Asking your phone* / *Fetching from Calibre*, Back cancels |
 | Deadline passed, or `catalog_error` | *The phone did not answer* + reason, Select retries, Back leaves |
 | Link dropped mid-browse | Everything on screen is discarded and it returns to *The Store needs your phone* |
@@ -813,7 +896,7 @@ Status JSON includes capability fields so clients can hide unsupported controls:
 
 ```json
 {
-  "protocol_version": 1,
+  "protocol_version": 2,
   "firmware_name": "CrossPoint Reader",
   "firmware_ota_supported": true,
   "resume_supported": true,
@@ -840,8 +923,8 @@ subscribing and merge notifications over what it gave you; see
 
 ## Heartbeat fields
 
-These fields are in both the GATT read and every notification, and are never dropped to fit (except `book`, which is
-dropped with the identity fields):
+After authentication these fields are in both the GATT read and every notification, and are never dropped to fit
+(except `book`, which is dropped with the identity fields):
 
 | Field | Type | Meaning |
 | --- | --- | --- |

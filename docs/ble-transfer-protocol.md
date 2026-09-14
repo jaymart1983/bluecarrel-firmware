@@ -8,7 +8,7 @@ longer any screen a user has to find and keep open before a phone can reach the 
 Advertising runs at a deliberately slow interval — 1000-1285 ms — because this link is for occasional sync, not
 low latency. A scanning phone still finds the reader within a second or two.
 
-The main client is the **X4 Pro Sync** Android app. `scripts/ble_transfer.py` is a command-line test client for
+The main client is the **Bluecarrel** Android app. `scripts/ble_transfer.py` is a command-line test client for
 protocol 1 readers only.
 The X4 Pro build has no Wi-Fi, so this link is its only wireless path: books, reading positions, settings and
 firmware updates all travel over it.
@@ -19,7 +19,7 @@ book opens or closes and just before the device goes to sleep. See [Heartbeat fi
 ## Compatibility
 
 - Protocol version: `2`
-- Device name: `CrossPoint Transfer`
+- Device name: `Bluecarrel` (protocol 1 readers advertised `CrossPoint Transfer`)
 - Service UUID: `6f9f0a00-9b1d-4d1f-9f53-5b6b8b3d0f10`
 
 Clients should discover the service by UUID. The user-visible name is not part of the compatibility contract.

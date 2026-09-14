@@ -28,6 +28,7 @@ CONTROL_UUID = "6f9f0a01-9b1d-4d1f-9f53-5b6b8b3d0f10"
 DATA_IN_UUID = "6f9f0a02-9b1d-4d1f-9f53-5b6b8b3d0f10"
 STATUS_UUID = "6f9f0a03-9b1d-4d1f-9f53-5b6b8b3d0f10"
 DATA_OUT_UUID = "6f9f0a04-9b1d-4d1f-9f53-5b6b8b3d0f10"
+# Protocol 1 readers advertise this name; protocol 2 readers advertise "Bluecarrel".
 DEVICE_NAME = "CrossPoint Transfer"
 LEGACY_DEVICE_NAME = "Marginalia Transfer"
 CONFIG_PATH = Path(os.environ.get("CROSSPOINT_BLE_CONFIG", "~/.config/crosspoint/ble_hosts.json")).expanduser()

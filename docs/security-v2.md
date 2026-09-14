@@ -116,7 +116,7 @@ the phone with Bluetooth permission can use a bonded link) and lets the app veri
 - HTTPS only. `network_security_config` sets `cleartextTrafficPermitted="false"` with no exceptions. Server URL and
   update page URL must begin with `https://` ("Use an https:// address"); a saved `http://` value is treated as not
   configured.
-- Default update page: `https://github.com/jaymart1983/crosspoint-reader/releases/latest/download/` (GitHub redirects
+- Default update page: `https://github.com/jaymart1983/bluecarrel-firmware/releases/latest/download/` (GitHub redirects
   if the repository is renamed).
 - Credentials (HTTP Basic, kosync headers) are attached only to requests whose scheme, host and port equal the
   configured server's.

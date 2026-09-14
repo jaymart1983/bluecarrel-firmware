@@ -32,7 +32,7 @@ Check [our Devices page](https://crosspointreader.com/devices) for the full list
 
 - **Library workflow**: folder browser, hidden-file toggle, long-press delete, recent books, SD-cache management.
 
-- **Wireless workflows** (Wi-Fi builds only; not in the X4 Pro build, which uses Bluetooth and the X4 Pro Sync app instead):
+- **Wireless workflows** (Wi-Fi builds only; not in the X4 Pro build, which uses Bluetooth and the Bluecarrel app instead):
   
   - File transfer web UI
   - EPUB Optimizer
@@ -150,7 +150,7 @@ Conversion runs the firmware repo's `lib/EpdFont/scripts/fontconvert_sdcard.py` 
 ## Documentation
 
 - [User Guide](../USER_GUIDE.md)
-- [BLE transfer protocol](./ble-transfer-protocol.md) (the X4 Pro Sync app link)
+- [BLE transfer protocol](./ble-transfer-protocol.md) (the Bluecarrel app link)
 - [Web server usage](./webserver.md) (Wi-Fi builds only)
 - [Web server endpoints](./webserver-endpoints.md) (Wi-Fi builds only)
 - [Project scope](../SCOPE.md)

@@ -46,7 +46,7 @@
 
 namespace {
 
-constexpr const char* BLE_DEVICE_NAME = "CrossPoint Transfer";
+constexpr const char* BLE_DEVICE_NAME = "Bluecarrel";
 constexpr const char* BLE_SERVICE_UUID = "6f9f0a00-9b1d-4d1f-9f53-5b6b8b3d0f10";
 constexpr const char* BLE_CONTROL_UUID = "6f9f0a01-9b1d-4d1f-9f53-5b6b8b3d0f10";
 constexpr const char* BLE_DATA_IN_UUID = "6f9f0a02-9b1d-4d1f-9f53-5b6b8b3d0f10";
@@ -2954,7 +2954,7 @@ std::string BleLink::buildStatusJson(const StatusScope scope, const unsigned det
   if (wantSession) doc["protocol_version"] = BLE_PROTOCOL_VERSION;
   if (full) {
     if (wantDecoration) {
-      doc["firmware_name"] = "CrossPoint Reader";
+      doc["firmware_name"] = "Bluecarrel";
       doc["firmware_ota_supported"] = true;
       doc["resume_supported"] = true;
     }

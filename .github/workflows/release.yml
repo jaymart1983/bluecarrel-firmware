@@ -3,9 +3,9 @@ name: Release X4 Pro firmware
 # Push a tag named x4pro-<yyyyMMdd.HHmm> (the build stamp the reader will show and
 # report to the app) to build the X4 Pro release image and publish a GitHub release:
 #
-#   crosspoint-x4pro-<stamp>.bin       app image: Bluetooth updates, or USB at 0x10000
-#   crosspoint-x4pro-<stamp>.bin.sig   its signature (hex), for copying to /firmware/firmware.bin.sig
-#   crosspoint-x4pro-<stamp>-full.bin  bootloader + partition table + app from 0x0,
+#   bluecarrel-x4pro-<stamp>.bin       app image: Bluetooth updates, or USB at 0x10000
+#   bluecarrel-x4pro-<stamp>.bin.sig   its signature (hex), for copying to /firmware/firmware.bin.sig
+#   bluecarrel-x4pro-<stamp>-full.bin  bootloader + partition table + app from 0x0,
 #                                      for a first install over USB
 #   firmware.json                      {version, file, size, sha256, signature} for an update page
 #
@@ -104,10 +104,10 @@ jobs:
           build=".pio/build/$PIO_ENV"
           grep -q "\"$X4_BUILD_STAMP\"" src/network/BuildStamp.h
           scripts/make_firmware_json.sh dist "$build/firmware.bin"
-          test -s "dist/crosspoint-x4pro-$X4_BUILD_STAMP.bin.sig"
+          test -s "dist/bluecarrel-x4pro-$X4_BUILD_STAMP.bin.sig"
           grep -q '"signature":"' dist/firmware.json
           # merge_bin fills the gap over otadata (0xe000) with 0xFF, so the reader boots app0.
-          python -m esptool --chip esp32s3 merge_bin -o "dist/crosspoint-x4pro-$X4_BUILD_STAMP-full.bin" \
+          python -m esptool --chip esp32s3 merge_bin -o "dist/bluecarrel-x4pro-$X4_BUILD_STAMP-full.bin" \
             0x0 "$build/bootloader.bin" 0x8000 "$build/partitions.bin" 0x10000 "$build/firmware.bin"
           (cd dist && sha256sum *.bin *.sig > SHA256SUMS)
           ls -l dist
@@ -121,11 +121,11 @@ jobs:
           GH_TOKEN: ${{ github.token }}
         run: |
           flags=()
-          title="X4 Pro firmware $X4_BUILD_STAMP"
+          title="Bluecarrel firmware for X4 Pro $X4_BUILD_STAMP"
           if [ "$X4_PRERELEASE" = "true" ]; then
             flags+=(--prerelease)
             title="$title (test)"
           fi
           gh release create "$GITHUB_REF_NAME" dist/* "${flags[@]}" \
             --title "$title" \
-            --notes "Install over Bluetooth from the companion app, or over USB: see the README (First install over USB). \`firmware.json\` can be served from your own update page."
+            --notes "Install over Bluetooth from the Bluecarrel app (https://github.com/jaymart1983/bluecarrel-app), or over USB: see the README (First install over USB). \`firmware.json\` can be served from your own update page."

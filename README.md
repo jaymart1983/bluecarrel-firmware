@@ -1,7 +1,7 @@
-# X4 Pro Sync firmware
+# Bluecarrel firmware
 
 E-reader firmware for the **Xteink X4 Pro**, built to pair with the
-[X4 Pro Sync](https://github.com/jaymart1983/x4-pro-sync) Android app. The phone keeps the reader's library,
+[Bluecarrel](https://github.com/jaymart1983/bluecarrel-app) Android app. The phone keeps the reader's library,
 reading positions and firmware in sync with your own Calibre-Web Automated server, over Bluetooth.
 
 It started as a fork of [CrossPoint Reader](https://github.com/crosspoint-reader/crosspoint-reader) and keeps its EPUB
@@ -9,14 +9,14 @@ engine and reading experience; see [Credits](#credits).
 
 ## Download
 
-Prebuilt images are on the [Releases page](https://github.com/jaymart1983/crosspoint-reader/releases). Tags ending in
+Prebuilt images are on the [Releases page](https://github.com/jaymart1983/bluecarrel-firmware/releases). Tags ending in
 `-test` are pre-releases. Each release has:
 
 | File | Use |
 |---|---|
-| `crosspoint-x4pro-<version>-full.bin` | First install over USB (bootloader, partition table and firmware) |
-| `crosspoint-x4pro-<version>.bin` | Firmware only: USB reinstall, or hosting your own update page |
-| `crosspoint-x4pro-<version>.bin.sig` | Signature for the firmware image; copy to `/firmware/firmware.bin.sig` for a hand-copied update |
+| `bluecarrel-x4pro-<version>-full.bin` | First install over USB (bootloader, partition table and firmware) |
+| `bluecarrel-x4pro-<version>.bin` | Firmware only: USB reinstall, or hosting your own update page |
+| `bluecarrel-x4pro-<version>.bin.sig` | Signature for the firmware image; copy to `/firmware/firmware.bin.sig` for a hand-copied update |
 | `firmware.json` | Update-page manifest for the app, including the signature |
 | `SHA256SUMS` | Checksums |
 
@@ -68,7 +68,7 @@ Keep that file private: it is a copy of your device's flash.
 Then flash the full image from a release:
 
 ```bash
-esptool.py --chip esp32s3 --port <port> --baud 921600 write_flash 0x0 crosspoint-x4pro-<version>-full.bin
+esptool.py --chip esp32s3 --port <port> --baud 921600 write_flash 0x0 bluecarrel-x4pro-<version>-full.bin
 ```
 
 `<port>` is `/dev/ttyACM0` on Linux or `/dev/cu.usbmodem*` on macOS. The reader only appears on USB while it is awake.
@@ -78,7 +78,7 @@ booting the other app slot after a Bluetooth update:
 
 ```bash
 esptool.py --chip esp32s3 --port <port> --baud 921600 erase_region 0xe000 0x2000
-esptool.py --chip esp32s3 --port <port> --baud 921600 write_flash 0x10000 crosspoint-x4pro-<version>.bin
+esptool.py --chip esp32s3 --port <port> --baud 921600 write_flash 0x10000 bluecarrel-x4pro-<version>.bin
 ```
 
 To return to stock, write your backup back with `write_flash 0x0 x4pro-stock-full-16MB.bin`.
@@ -94,8 +94,8 @@ manifest must carry a signature, and the reader installs only images signed with
 Needs [PlatformIO](https://platformio.org/). Clone with submodules:
 
 ```bash
-git clone --recursive https://github.com/jaymart1983/crosspoint-reader.git
-cd crosspoint-reader
+git clone --recursive https://github.com/jaymart1983/bluecarrel-firmware.git
+cd bluecarrel-firmware
 pio run -e x4pro
 ```
 

@@ -80,7 +80,7 @@ The X4 Pro has a built-in frontlight with adjustable brightness and warmth. It i
 
 * **Open the Control Centre:** Tap the **top centre** of the screen (the status-bar strip) on Home, Browse Files, Settings or while reading, or **tap the Power button** from any screen. Tap Power again to close it. Drag the brightness and warmth sliders to adjust the light, or tap the sun icon to turn it on or off. The panel also has tiles for **Night Mode**, **Refresh Screen**, **Touch**, **Sleep**, **Settings** and **Home** (plus **USB Drive** while a cable is attached). Boards other than the X4 Pro also get a Reading Orientation tile.
 * **Refresh Screen tile:** clears ghosting with one full-screen refresh. Holding the **Home** tile does the same thing instead of going Home.
-* **Settings tile (X4 Pro):** opens the device Settings page, which has two sections: **Bluetooth** (pairing) and **Firmware** (running version and any waiting update). Other settings are changed from the X4 Pro Sync app, or from **Home > More > Settings**.
+* **Settings tile (X4 Pro):** opens the device Settings page, which has two sections: **Bluetooth** (pairing) and **Firmware** (running version and any waiting update). Other settings are changed from the Bluecarrel app, or from **Home > More > Settings**.
 * **Quick toggle:** The **sun button** beside the brightness slider turns the light on or off in one tap, and so does a **double tap of the Power button** from anywhere. (There is no separate Frontlight tile — it was the same switch twice.)
 
 > [!NOTE]
@@ -278,7 +278,7 @@ Bluetooth is **always on while the reader is awake**. It stops when the device s
 There is nothing to start and no screen to keep open — the companion app can reach the reader while you are reading a
 book, sitting on the home screen, or anywhere else.
 
-The X4 Pro build needs the **X4 Pro Sync** Android app for books, reading-position sync, settings and firmware
+The X4 Pro build needs the **Bluecarrel** Android app for books, reading-position sync, settings and firmware
 updates.
 
 Pairing happens on the Bluetooth section of the Settings page. On the X4 Pro, open the Control Centre and tap
@@ -287,7 +287,7 @@ Pairing happens on the Bluetooth section of the Settings page. On the X4 Pro, op
 To pair:
 
 1. Open the Settings page on the reader. While no phone is paired it reads **Pair your phone**.
-2. In the X4 Pro Sync app, start pairing and choose the reader.
+2. In the Bluecarrel app, start pairing and choose the reader.
 3. The reader shows a six-digit passkey under **Type this passkey on your phone**. Type it into the pairing dialog on
    your phone.
 
@@ -337,10 +337,10 @@ Firmware updates are files in a folder called `firmware` at the root of the SD c
 **Only signed firmware installs this way.** The reader checks the signature against the project's key, and only
 offers an image that is newer than the running version.
 
-**From the app.** The X4 Pro Sync app sends the image over Bluetooth and the reader writes all four files itself.
+**From the app.** The Bluecarrel app sends the image over Bluetooth and the reader writes all four files itself.
 
 **By hand.** Plug the reader into a computer (USB Drive) and copy all four files into `/firmware`. A release has
-`crosspoint-x4pro-<version>.bin` and `crosspoint-x4pro-<version>.bin.sig`: copy them as `firmware.bin` and
+`bluecarrel-x4pro-<version>.bin` and `bluecarrel-x4pro-<version>.bin.sig`: copy them as `firmware.bin` and
 `firmware.bin.sig`. Write the version into `firmware.bin.version`, and the checksum into `firmware.bin.sha256`. The
 output of `sha256sum firmware.bin` works as-is:
 
@@ -539,7 +539,7 @@ The Settings screen allows you to configure the device's behavior. There are a f
 - **Bluetooth**: Opens the Settings page with the Bluetooth and Firmware sections: pair a phone, see which phone is paired, pair a new phone, or forget it. On the X4 Pro the Control Centre's Settings tile opens the same page — see [3.5.2](#352-bluetooth). *(Only on builds with the Bluetooth link, such as the X4 Pro.)*
 - **Firmware Update** *(Bluetooth builds)*: Shows whether an update is waiting on the SD card; tap it when one is ready. See [3.5.4](#354-firmware-updates-from-the-sd-card).
 - **Auto-install Firmware Updates**: Off (default) asks with Update Now / Later / Cancel when an update is found. On installs it at the next sleep without asking.
-- **Check for updates** *(not on the X4 Pro build)*: Check for Crosspoint firmware updates over Wi-Fi. On the X4 Pro, updates come from the X4 Pro Sync app or a file copied to `/firmware` — see [3.5.4](#354-firmware-updates-from-the-sd-card).
+- **Check for updates** *(not on the X4 Pro build)*: Check for Crosspoint firmware updates over Wi-Fi. On the X4 Pro, updates come from the Bluecarrel app or a file copied to `/firmware` — see [3.5.4](#354-firmware-updates-from-the-sd-card).
 
 - **Language**: Set the UI language. CrossPoint supports 32 languages: English, Spanish, French, German, Czech, Brazilian Portuguese, European Portuguese, Russian, Swedish, Romanian, Catalan, Ukrainian, Belarusian, Italian, Polish, Finnish, Danish, Dutch, Turkish, Kazakh, Hungarian, Lithuanian, Slovenian, Valencian, Hebrew, Arabic, Slovak, Bosnian, Vietnamese, Norwegian Bokmål, Indonesian, and Orangutan.
 
@@ -885,7 +885,7 @@ Available options include:
 - **Take screenshot** – Save a screenshot of the current page to the `screenshots/` folder.
 - **Show page as QR** – Display a QR code encoding the current reading position.
 - **Go Home** – Close the book and return to the Home screen.
-- **Sync Progress** – Push or pull reading progress with a KOReader sync server (see [KOReader Sync Quick Setup](#367-koreader-sync-quick-setup)). *(Not on the X4 Pro build, where the X4 Pro Sync app syncs positions over Bluetooth.)*
+- **Sync Progress** – Push or pull reading progress with a KOReader sync server (see [KOReader Sync Quick Setup](#367-koreader-sync-quick-setup)). *(Not on the X4 Pro build, where the Bluecarrel app syncs positions over Bluetooth.)*
 - **Delete Book Cache** – Clear the cached layout data for the current book, forcing a re-index on next open.
 
 Press **Back** at any time to close the menu and return to your current page.

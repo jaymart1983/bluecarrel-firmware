@@ -1,11 +1,11 @@
 #!/usr/bin/env bash
-# Publish a signed firmware build to an update page for the X4 Pro Sync app.
+# Publish a signed firmware build to an update page for the Bluecarrel app.
 #
 #   FIRMWARE_SIGNING_KEY_FILE=key.pem scripts/make_firmware_json.sh <update-page-dir> [firmware.bin]
 #
 # Writes into <dir>:
-#   crosspoint-x4pro-<stamp>.bin       the image
-#   crosspoint-x4pro-<stamp>.bin.sig   its signature as hex text (copy to /firmware/firmware.bin.sig)
+#   bluecarrel-x4pro-<stamp>.bin       the image
+#   bluecarrel-x4pro-<stamp>.bin.sig   its signature as hex text (copy to /firmware/firmware.bin.sig)
 #   firmware.json                      {version, file, size, sha256, signature}
 # Serve <dir> with any static web server and enter its URL as the update page in the app.
 #
@@ -32,7 +32,7 @@ else
 fi
 sha=$(printf '%s' "$sha" | tr 'A-F' 'a-f')
 size=$(wc -c < "$bin" | tr -d ' ')
-file="crosspoint-x4pro-$stamp.bin"
+file="bluecarrel-x4pro-$stamp.bin"
 
 # Lowercase hex of stdin, no separators (od is on both macOS and Linux).
 to_hex() { od -An -v -tx1 | tr -d ' \n'; }

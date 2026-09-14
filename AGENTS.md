@@ -1,7 +1,8 @@
 # CrossPoint Reader Development Guide
 
-Project: Open-source e-reader firmware for Xteink devices. This tree is a fork focused on the **Xteink X4 Pro**
-(ESP32-S3, env `x4pro`); it still builds the upstream boards, including the ESP32-C3 Xteink X4/X3.
+Project: Open-source e-reader firmware for Xteink devices. This tree is the **Bluecarrel firmware**, focused on the
+**Xteink X4 Pro** (ESP32-S3, env `x4pro`) and based on CrossPoint Reader; it still builds the upstream boards, including
+the ESP32-C3 Xteink X4/X3. Its companion is the Bluecarrel Android app (jaymart1983/bluecarrel-app).
 Mission: Provide a lightweight, high-performance reading experience focused on EPUB rendering on constrained hardware.
 
 ### X4 Pro build at a glance

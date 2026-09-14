@@ -622,6 +622,8 @@ class ServerCallbacks final : public NimBLEServerCallbacks {
       server->disconnect(handle);
       return;
     }
+    LOG_INF("BLE", "connected (handle=%u encrypted=%d bonded=%d)", static_cast<unsigned>(handle),
+            connInfo.isEncrypted(), connInfo.isBonded());
     // 7.5-15 ms interval, no slave latency, 4 s supervision timeout.
     //
     // The timeout was 1.2 s (120 units). That is legal but tight: it is the
@@ -666,8 +668,10 @@ class ServerCallbacks final : public NimBLEServerCallbacks {
             rxPhy == BLE_GAP_LE_PHY_2M ? "2M" : "1M");
   }
 
-  void onDisconnect(NimBLEServer*, NimBLEConnInfo& connInfo, int) override {
+  void onDisconnect(NimBLEServer*, NimBLEConnInfo& connInfo, int reason) override {
     const uint16_t handle = connInfo.getConnHandle();
+    LOG_INF("BLE", "disconnected (handle=%u reason=0x%x)", static_cast<unsigned>(handle),
+            static_cast<unsigned>(reason));
     if (!link_.releaseConnection(handle)) return;
     link_.noteBleMtu(0);
     link_.enqueueBleDisconnected(handle);
@@ -739,7 +743,9 @@ class ControlCallbacks final : public NimBLECharacteristicCallbacks {
   void onWrite(NimBLECharacteristic* characteristic, NimBLEConnInfo& connInfo) override {
     const uint16_t handle = connInfo.getConnHandle();
     if (!linkIsSecure(connInfo) || !link_.boundConnectionSecure(handle)) {
-      LOG_DBG("BLE", "control write ignored: link not secure");
+      LOG_INF("BLE", "control write ignored (encrypted=%d authenticated=%d bonded=%d handle=%u bound=%u)",
+              connInfo.isEncrypted(), connInfo.isAuthenticated(), connInfo.isBonded(), static_cast<unsigned>(handle),
+              static_cast<unsigned>(link_.boundConnection()));
       return;
     }
     link_.enqueueControlWrite(handle, characteristic->getValue());
@@ -1428,27 +1434,14 @@ void BleLink::onSecurityResult(const BleEvent& event) {
 }
 
 void BleLink::adoptNewBond(const std::string& peerIdAddress) {
-  // One bond: the phone that just paired. The stored host stays; `pair` replaces
-  // it, and a host whose bond is gone cannot get a secure link anyway.
-  int deleted = 0;
-  if (peerIdAddress.size() == sizeof(ble_addr_t)) {
-    ble_addr_t raw{};
-    memcpy(&raw, peerIdAddress.data(), sizeof(raw));
-    const NimBLEAddress keep(raw);
-    for (int i = NimBLEDevice::getNumBonds() - 1; i >= 0; i--) {
-      const NimBLEAddress bonded = NimBLEDevice::getBondedAddress(i);
-      if (bonded == keep) continue;
-      if (NimBLEDevice::deleteBond(bonded)) {
-        deleted++;
-      } else {
-        LOG_ERR("BLE", "could not delete an old bond");
-      }
-    }
-  } else {
-    LOG_ERR("BLE", "new bond without a peer address; old bonds kept");
-  }
+  // One bond is enforced by the store (MYNEWT_VAL_BLE_STORE_MAX_BONDS=1): saving
+  // this pairing already dropped any older bond. Deleting bonds here by address is
+  // unsafe -- the stored identity address can differ from the connection's in type,
+  // and ble_gap_unpair() on the new bond also terminates the link it just secured.
+  // The stored host stays; `pair` replaces it.
+  (void)peerIdAddress;
   failedPairings_.store(0);
-  LOG_INF("BLE", "new bond adopted (%d old bonds deleted, host stored: %s)", deleted,
+  LOG_INF("BLE", "new bond adopted (bonds stored: %d, host stored: %s)", NimBLEDevice::getNumBonds(),
           BLE_TRUSTED_HOSTS.hasHosts() ? "yes" : "no");
 }
 

@@ -1,15 +1,27 @@
-# X4 Pro Sync firmware
+# Bluecarrel firmware
 
 E-reader firmware for the **Xteink X4 Pro**, built to pair with the
-[X4 Pro Sync](https://github.com/jaymart1983/x4-pro-sync) Android app. The phone keeps the reader's library,
+[Bluecarrel](https://github.com/jaymart1983/bluecarrel-app) Android app. The phone keeps the reader's library,
 reading positions and firmware in sync with your own Calibre-Web Automated server, over Bluetooth.
 
 It started as a fork of [CrossPoint Reader](https://github.com/crosspoint-reader/crosspoint-reader) and keeps its EPUB
 engine and reading experience; see [Credits](#credits).
 
+## Test builds
+
+- **[Firmware test release](https://github.com/jaymart1983/bluecarrel-firmware/releases/tag/x4pro-20260914.1834-test)**
+- **[Bluecarrel app test release](https://github.com/jaymart1983/bluecarrel-app/releases/tag/v1.0.0-test)**
+- [All firmware releases](https://github.com/jaymart1983/bluecarrel-firmware/releases)
+
+Update page for the app's Firmware setting (tap and hold to copy):
+
+```
+https://github.com/jaymart1983/bluecarrel-firmware/releases/download/x4pro-20260914.1834-test/
+```
+
 ## Download
 
-Prebuilt images are on the [Releases page](https://github.com/jaymart1983/crosspoint-reader/releases). Each release has:
+Prebuilt images are on the [Releases page](https://github.com/jaymart1983/bluecarrel-firmware/releases). Each release has:
 
 | File | Use |
 |---|---|
@@ -79,8 +91,8 @@ static web server. `scripts/make_firmware_json.sh` builds that folder from your 
 Needs [PlatformIO](https://platformio.org/). Clone with submodules:
 
 ```bash
-git clone --recursive https://github.com/jaymart1983/crosspoint-reader.git
-cd crosspoint-reader
+git clone --recursive https://github.com/jaymart1983/bluecarrel-firmware.git
+cd bluecarrel-firmware
 pio run -e x4pro
 ```
 

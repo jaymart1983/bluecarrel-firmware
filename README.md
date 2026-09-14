@@ -9,14 +9,14 @@ engine and reading experience; see [Credits](#credits).
 
 ## Test builds
 
-- **[Firmware test release](https://github.com/jaymart1983/bluecarrel-firmware/releases/tag/x4pro-20260914.2052-test)**
+- **[Latest firmware release](https://github.com/jaymart1983/bluecarrel-firmware/releases/latest)** (x4pro-20260914.2329)
 - **[Bluecarrel app test release](https://github.com/jaymart1983/bluecarrel-app/releases/tag/v1.0.2-test)**
 - [All firmware releases](https://github.com/jaymart1983/bluecarrel-firmware/releases)
 
-Update page for the app's Firmware setting (tap and hold to copy):
+Leave the app's update page blank to get the latest release. Update page URL, if you set it by hand (tap and hold to copy):
 
 ```
-https://github.com/jaymart1983/bluecarrel-firmware/releases/download/x4pro-20260914.2052-test/
+https://github.com/jaymart1983/bluecarrel-firmware/releases/latest/download/
 ```
 
 ## Download

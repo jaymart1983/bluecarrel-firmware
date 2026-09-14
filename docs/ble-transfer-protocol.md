@@ -45,8 +45,8 @@ stops when a reader reports `protocol_version` 2 or higher. The design and threa
 - **One connection at a time.** A second central is disconnected.
 - Writes to `control` and `data-in` are ignored, and nothing is notified on `status` or `data-out`, unless the one
   connection is encrypted, authenticated and bonded.
-- Bonds are kept in NimBLE's NVS store. When a new pairing succeeds, the reader deletes every other bond and the stored
-  host record, so it is bonded to one phone.
+- Bonds are kept in NimBLE's NVS store. When a new pairing succeeds, the reader deletes every other bond, so it is
+  bonded to one phone. The stored host record stays until `pair` replaces it; **Forget** clears the host and every bond.
 
 ### Pairing window
 

@@ -30,6 +30,13 @@ bool hitRect(const Rect& r, const int x, const int y) {
 
 uint32_t lockStep(const uint32_t secondsLeft) { return (secondsLeft + LOCK_STEP_SECONDS - 1) / LOCK_STEP_SECONDS; }
 
+// The link's auth_error, in words the owner can act on.
+const char* authErrorText(const std::string& error) {
+  if (error == "unknown trusted host" || error == "invalid trusted host auth") return tr(STR_BLE_PAIRING_OUT_OF_DATE);
+  if (error == "pairing window closed") return tr(STR_BLE_PAIRING_TAP_PAIR_NEW);
+  return tr(STR_BLE_PAIRING_FAILED);
+}
+
 }  // namespace
 
 void BlePairingActivity::onEnter() {
@@ -38,6 +45,8 @@ void BlePairingActivity::onEnter() {
   // start here too -- begin() is idempotent.
   BLE_LINK.begin();
   BLE_LINK.setObserver(this);
+  // A refusal from before this screen opened is not news.
+  BLE_LINK.clearAuthError();
   if (!BLE_LINK.hasTrustedHost()) BLE_LINK.openPairingWindow();
   refreshFirmwareStage();
   selected_ = firmwareReady_ ? Row::FIRMWARE : Row::PAIR_NEW;
@@ -257,7 +266,7 @@ void BlePairingActivity::render(RenderLock&&) {
     line(SMALL_FONT_ID, tr(STR_BLE_PAIR_HINT), EpdFontFamily::REGULAR);
   }
   if (!authError.empty()) {
-    line(SMALL_FONT_ID, std::string(tr(STR_ERROR_MSG)) + " " + authError, EpdFontFamily::REGULAR);
+    line(SMALL_FONT_ID, authErrorText(authError), EpdFontFamily::REGULAR);
   }
   if (paired && !windowOpen && lockSeconds == 0) {
     pairNewRect_ = actionRow(tr(STR_BLE_PAIR_NEW_PHONE), selection == Row::PAIR_NEW);

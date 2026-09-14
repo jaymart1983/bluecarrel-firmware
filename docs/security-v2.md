@@ -34,7 +34,8 @@ able to flash their own builds), and an attacker who dumps internal flash over U
   bonded while the window is closed: delete that bond and disconnect.
 - **Attempt limit.** Three failed pairing attempts within one window close the window for 60 s (the screen says so).
   Every attempt gets a new passkey.
-- **One bond.** When a new pairing succeeds, delete every other bond and the trusted-host record.
+- **One bond.** When a new pairing succeeds, delete every other bond. The trusted-host record stays until `pair`
+  replaces it; **Forget** clears the host record and every bond.
 - **One connection.** At most one central connected (`CONFIG_BT_NIMBLE_MAX_CONNECTIONS=1` or equivalent), and
   authentication state is bound to that connection's handle; events from any other handle are ignored.
 - **Hello timeout.** A connection that has not completed a valid `hello` (or `pair`) within 20 s of encryption is

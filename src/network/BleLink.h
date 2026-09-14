@@ -116,6 +116,8 @@ class BleLink {
   bool forgetTrustedHost();
   // Why the last `hello` or `pair` was refused, if it was. Never an error state.
   const std::string& authError() const { return authErrorMessage_; }
+  // Drops the last refusal, so Settings shows no stale error. Main loop only.
+  void clearAuthError();
   bool isPeerConnected() const;
   // The gate is open: a phone is connected AND authenticated.
   bool isAuthenticated() const { return sessionAuthenticated(); }

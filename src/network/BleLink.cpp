@@ -686,6 +686,7 @@ class ServerCallbacks final : public NimBLEServerCallbacks {
       return passkey;
     }
     link_.notePairingStarted(passkey);
+    LOG_INF("BLE", "pairing started: passkey shown");
     return passkey;
   }
 
@@ -715,6 +716,8 @@ class ServerCallbacks final : public NimBLEServerCallbacks {
       return;
     }
 
+    LOG_INF("BLE", "link accepted (encrypted=%d authenticated=%d bonded=%d new=%d window=%d)",
+            connInfo.isEncrypted(), connInfo.isAuthenticated(), connInfo.isBonded(), newBond, windowOpen);
     link_.markConnectionSecure();
     std::string peerIdAddress;
     if (newBond) {
@@ -1175,14 +1178,23 @@ bool BleLink::forgetTrustedHost() {
   hostPaired_ = false;
   authErrorMessage_.clear();
   deviceNonce_ = makeNonceHex();
+  LOG_INF("BLE", "forgot the trusted host and every bond");
   setState(isPeerConnected() ? State::CONNECTED : State::ADVERTISING);
   publishStatus();
   return true;
 }
 
+void BleLink::clearAuthError() {
+  if (authErrorMessage_.empty()) return;
+  authErrorMessage_.clear();
+  statusDirty_ = true;
+  notifyObserver();
+}
+
 void BleLink::openPairingWindow() {
   // A fresh window starts with a clean attempt count; a running lockout stays.
   if (!pairingWindowRequested_.exchange(true)) failedPairings_.store(0);
+  authErrorMessage_.clear();
   LOG_INF("BLE", "pairing window open");
   statusDirty_ = true;
   notifyObserver();
@@ -1416,7 +1428,9 @@ void BleLink::onSecurityResult(const BleEvent& event) {
 }
 
 void BleLink::adoptNewBond(const std::string& peerIdAddress) {
-  // One bond: the phone that just paired.
+  // One bond: the phone that just paired. The stored host stays; `pair` replaces
+  // it, and a host whose bond is gone cannot get a secure link anyway.
+  int deleted = 0;
   if (peerIdAddress.size() == sizeof(ble_addr_t)) {
     ble_addr_t raw{};
     memcpy(&raw, peerIdAddress.data(), sizeof(raw));
@@ -1424,17 +1438,18 @@ void BleLink::adoptNewBond(const std::string& peerIdAddress) {
     for (int i = NimBLEDevice::getNumBonds() - 1; i >= 0; i--) {
       const NimBLEAddress bonded = NimBLEDevice::getBondedAddress(i);
       if (bonded == keep) continue;
-      if (!NimBLEDevice::deleteBond(bonded)) LOG_ERR("BLE", "could not delete an old bond");
+      if (NimBLEDevice::deleteBond(bonded)) {
+        deleted++;
+      } else {
+        LOG_ERR("BLE", "could not delete an old bond");
+      }
     }
   } else {
     LOG_ERR("BLE", "new bond without a peer address; old bonds kept");
   }
-  // The old phone's secret goes with its bond; the new phone sends `pair`.
-  if (BLE_TRUSTED_HOSTS.hasHosts() && !BLE_TRUSTED_HOSTS.clearAll()) {
-    LOG_ERR("BLE", "could not clear the previous trusted host");
-  }
   failedPairings_.store(0);
-  LOG_INF("BLE", "new bond accepted");
+  LOG_INF("BLE", "new bond adopted (%d old bonds deleted, host stored: %s)", deleted,
+          BLE_TRUSTED_HOSTS.hasHosts() ? "yes" : "no");
 }
 
 void BleLink::onBleDisconnected(const uint16_t) {
@@ -1496,31 +1511,44 @@ void BleLink::onControlWrite(const std::string& value) {
     const std::string hostId = doc["host_id"] | "";
     const std::string clientNonce = doc["client_nonce"] | "";
     const std::string response = doc["response"] | "";
+    // Host ids are identifiers, not secrets; the first 8 characters are enough to
+    // tell whether the phone and the reader agree on who is paired.
+    const auto logHello = [&](const char* outcome) {
+      const BleTrustedHost* stored = BLE_TRUSTED_HOSTS.host();
+      LOG_INF("BLE", "hello %s (offered host %.8s, host stored: %s %.8s)", outcome,
+              isSafeHostId(hostId) ? hostId.c_str() : "?", stored ? "yes" : "no",
+              stored ? stored->hostId.c_str() : "");
+    };
+    const auto refuse = [&](const char* reason) {
+      logHello(reason);
+      refuseHello(reason);
+    };
     if (version != BLE_PROTOCOL_VERSION) {
-      refuseHello("unsupported protocol version");
+      refuse("unsupported protocol version");
       return;
     }
     if (!isSafeHostId(hostId) || !isLowerHex(clientNonce, BLE_CLIENT_NONCE_HEX_CHARS) ||
         !isLowerHex(response, BLE_HMAC_HEX_CHARS)) {
-      refuseHello("invalid hello");
+      refuse("invalid hello");
       return;
     }
     const BleTrustedHost* host = BLE_TRUSTED_HOSTS.findHost(hostId);
     if (!host) {
-      refuseHello("unknown trusted host");
+      refuse("unknown trusted host");
       return;
     }
     const std::string fields = deviceNonce_ + "|" + clientNonce + "|" + hostId + "|" + deviceId_;
     const std::string expected = hmacSha256Hex(host->secret, HOST_PROOF_PREFIX + fields);
     if (expected.empty() || !constantTimeEquals(expected, response)) {
-      refuseHello("invalid trusted host auth");
+      refuse("invalid trusted host auth");
       return;
     }
     const std::string proof = hmacSha256Hex(host->secret, READER_PROOF_PREFIX + fields);
     if (proof.empty()) {
-      refuseHello("invalid trusted host auth");
+      refuse("invalid trusted host auth");
       return;
     }
+    logHello("accepted");
 
     readerProof_ = proof;
     helloAccepted_ = true;
@@ -1547,8 +1575,12 @@ void BleLink::onControlWrite(const std::string& value) {
   if (op == "pair") {
     // The link is already bonded (onControlWrite only runs on a secure link);
     // the window is the user's consent to store this phone's secret.
+    const auto refusePair = [&](const char* reason) {
+      LOG_INF("BLE", "pair refused: %s", reason);
+      setAuthError(reason);
+    };
     if (!pairingWindowOpen()) {
-      setAuthError("pairing window closed");
+      refusePair("pairing window closed");
       return;
     }
     const int version = doc["version"] | 0;
@@ -1557,13 +1589,13 @@ void BleLink::onControlWrite(const std::string& value) {
     BleTrustedHost host;
     if (version != BLE_PROTOCOL_VERSION || !isSafeHostId(hostId) ||
         !isLowerHex(secretHex, BleTrustedHostStore::SECRET_BYTES * 2) || !hexToBytes(secretHex, host.secret)) {
-      setAuthError("invalid pair request");
+      refusePair("invalid pair request");
       return;
     }
     host.hostId = hostId;
     host.name = sanitizeHostName(doc["host_name"] | "");
     if (!BLE_TRUSTED_HOSTS.addOrReplaceHost(host)) {
-      setAuthError("could not save the pairing");
+      refusePair("could not save the pairing");
       return;
     }
     closePairingWindow();
@@ -1574,7 +1606,7 @@ void BleLink::onControlWrite(const std::string& value) {
     trustedHostName_ = host.name;
     readerProof_.clear();
     authErrorMessage_.clear();
-    LOG_INF("BLE", "paired with '%s' and saved", host.name.c_str());
+    LOG_INF("BLE", "pair accepted: '%s' (host %.8s) saved", host.name.c_str(), host.hostId.c_str());
     setState(State::CONNECTED);
     if (store_) store_->onAppReady();
     return;

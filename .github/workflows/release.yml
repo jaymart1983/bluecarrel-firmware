@@ -1,37 +1,43 @@
-name: Compile Release
+name: Release X4 Pro firmware
 
-# Builds every board's release firmware on tag push, with the .bin named
-# exactly as OtaUpdater requests it from the GitHub release: plain
-# firmware.bin for the C3 X4/X3 binary, firmware-<board>.bin for every other
-# board. Attach the artifacts' .bin files to the release as-is.
+# Push a tag named x4pro-<yyyyMMdd.HHmm> (the build stamp the reader will show and
+# report to the app) to build the X4 Pro release image and publish a GitHub release:
+#
+#   crosspoint-x4pro-<stamp>.bin       app image: Bluetooth updates, or USB at 0x10000
+#   crosspoint-x4pro-<stamp>-full.bin  bootloader + partition table + app from 0x0,
+#                                      for a first install over USB
+#   firmware.json                      {version, file, size, sha256} for an update page
+#
+#   git tag x4pro-$(date -u +%Y%m%d.%H%M) && git push origin --tags
 
 on:
   push:
     tags:
-      - '*'
+      - 'x4pro-*'
 
 permissions:
   contents: read
 
 jobs:
-  build-release:
+  release:
     runs-on: ubuntu-latest
-    strategy:
-      fail-fast: false
-      matrix:
-        include:
-          - pio_env: gh_release
-            asset: firmware.bin
-          - pio_env: sticky-gh_release
-            asset: firmware-sticky.bin
-          - pio_env: x4pro-gh_release
-            asset: firmware-x4pro.bin
-          - pio_env: papermono-gh_release
-            asset: firmware-papermono.bin
+    permissions:
+      contents: write
+    env:
+      PIO_ENV: x4pro-gh_release
     steps:
       - uses: actions/checkout@v6
         with:
           submodules: recursive
+
+      - name: Build stamp from tag
+        run: |
+          stamp="${GITHUB_REF_NAME#x4pro-}"
+          if ! [[ "$stamp" =~ ^[0-9]{8}\.[0-9]{4}$ ]]; then
+            echo "Tag must be x4pro-yyyyMMdd.HHmm, got $GITHUB_REF_NAME" >&2
+            exit 1
+          fi
+          echo "X4_BUILD_STAMP=$stamp" >> "$GITHUB_ENV"
 
       - uses: actions/setup-python@v6
         with:
@@ -43,16 +49,15 @@ jobs:
           version: "latest"
           enable-cache: false
 
-      - name: Install PlatformIO Core
+      - name: Install PlatformIO Core and esptool
         run: |
           uv pip install --system -U https://github.com/pioarduino/platformio-core/archive/refs/tags/v6.1.19.zip
-          # platform-espressif32's builder/main.py imports these unconditionally; its own
-          # penv bootstrap (builder/penv_setup.py) is supposed to install them automatically
-          # but isn't picking them up reliably in this runner image, so pin them explicitly.
+          # platform-espressif32's builder imports these unconditionally and its own
+          # penv bootstrap does not install them reliably on this runner image.
           uv pip install --system -U "littlefs-python>=0.16.0" "fatfs-ng>=0.1.14" "pyyaml>=6.0.2" \
             "rich-click>=1.8.6" "zopfli>=0.2.2" "intelhex>=2.3.0" "rich>=14.0.0" "urllib3<2" \
             "cryptography>=45.0.3" "certifi>=2025.8.3" "ecdsa>=0.19.1" "bitstring>=4.3.1" \
-            "reedsolo>=1.5.3,<1.8" "esp-idf-size>=2.0.0" "esp-coredump>=1.14.0"
+            "reedsolo>=1.5.3,<1.8" "esp-idf-size>=2.0.0" "esp-coredump>=1.14.0" "esptool>=4.8"
 
       - name: Cache PlatformIO packages
         uses: actions/cache@v4
@@ -61,23 +66,24 @@ jobs:
           key: pio-${{ runner.os }}-${{ hashFiles('platformio.ini') }}
           restore-keys: pio-${{ runner.os }}-
 
-      - name: Build CrossPoint
-        run: pio run -e ${{ matrix.pio_env }} -j1
+      - name: Build
+        run: pio run -e "$PIO_ENV" -j1
 
-      - name: Name release asset
+      - name: Package
         run: |
-          if [ "${{ matrix.asset }}" != "firmware.bin" ]; then
-            cp ".pio/build/${{ matrix.pio_env }}/firmware.bin" \
-              ".pio/build/${{ matrix.pio_env }}/${{ matrix.asset }}"
-          fi
+          build=".pio/build/$PIO_ENV"
+          grep -q "\"$X4_BUILD_STAMP\"" src/network/BuildStamp.h
+          scripts/make_firmware_json.sh dist "$build/firmware.bin"
+          # merge_bin fills the gap over otadata (0xe000) with 0xFF, so the reader boots app0.
+          python -m esptool --chip esp32s3 merge_bin -o "dist/crosspoint-x4pro-$X4_BUILD_STAMP-full.bin" \
+            0x0 "$build/bootloader.bin" 0x8000 "$build/partitions.bin" 0x10000 "$build/firmware.bin"
+          (cd dist && sha256sum *.bin > SHA256SUMS)
+          ls -l dist
 
-      - name: Upload Artifacts
-        uses: actions/upload-artifact@v4
-        with:
-          name: ${{ matrix.asset }}
-          path: |
-            .pio/build/${{ matrix.pio_env }}/bootloader.bin
-            .pio/build/${{ matrix.pio_env }}/${{ matrix.asset }}
-            .pio/build/${{ matrix.pio_env }}/firmware.elf
-            .pio/build/${{ matrix.pio_env }}/firmware.map
-            .pio/build/${{ matrix.pio_env }}/partitions.bin
+      - name: Publish release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh release create "$GITHUB_REF_NAME" dist/* \
+            --title "X4 Pro firmware $X4_BUILD_STAMP" \
+            --notes "Install over Bluetooth from the X4 Pro Sync app, or over USB: see the README (First install over USB). \`firmware.json\` can be served from your own update page."

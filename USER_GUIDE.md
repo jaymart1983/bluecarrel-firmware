@@ -1,8 +1,10 @@
-# CrossPoint User Guide
+# Bluecarrel Firmware User Guide
 
-Welcome to the **CrossPoint** firmware. This guide outlines the hardware controls, navigation, and reading features of the device.
+Welcome to the **Bluecarrel** firmware. This guide outlines the hardware controls, navigation, and reading features of the device.
 
-- [CrossPoint User Guide](#crosspoint-user-guide)
+Bluecarrel is based on [CrossPoint Reader](https://github.com/crosspoint-reader/crosspoint-reader), and much of this guide comes from the CrossPoint User Guide. Where it says "CrossPoint", it describes the reader software Bluecarrel is built on.
+
+- [Bluecarrel Firmware User Guide](#bluecarrel-firmware-user-guide)
   - [1. Hardware Overview](#1-hardware-overview)
     - [Button Layout](#button-layout)
     - [Taking a Screenshot](#taking-a-screenshot)

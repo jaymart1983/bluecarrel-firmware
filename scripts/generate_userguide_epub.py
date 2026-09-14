@@ -12,8 +12,8 @@ from PIL import Image, ImageDraw, ImageFont
 
 ROOT = Path(__file__).parent.parent
 SOURCE_MD = ROOT / "USER_GUIDE.md"
-OUTPUT_EPUB = ROOT / "CrossPoint_User_Guide.epub"
-LOGO_PNG = ROOT / "src/images/Logo120.png"
+OUTPUT_EPUB = ROOT / "Bluecarrel_User_Guide.epub"
+LOGO_PNG = ROOT / "src/images/BluecarrelLogo120.png"
 
 # Portrait cover dimensions matching the X4 display (480×800)
 COVER_W, COVER_H = 480, 800
@@ -145,7 +145,7 @@ def make_cover_png() -> bytes:
         font_title = ImageFont.load_default()
         font_sub = font_title
 
-    title = 'CrossPoint'
+    title = 'Bluecarrel'
     subtitle = 'User Guide'
 
     # Draw title text
@@ -204,7 +204,7 @@ def preprocess_callouts(text: str) -> str:
 def strip_toc(text: str) -> str:
     """Remove the inline TOC list that follows the H1 heading."""
     return re.sub(
-        r'(\n# CrossPoint User Guide\n)(.*?)(\n## 1\.)',
+        r'(\n# Bluecarrel Firmware User Guide\n)(.*?)(\n## 1\.)',
         lambda m: m.group(1) + m.group(3),
         text,
         flags=re.DOTALL,
@@ -218,7 +218,7 @@ def split_chapters(html: str):
     positions = [(m.start(), m.group(0), m.group(2)) for m in pattern.finditer(html)]
 
     if not positions:
-        return [('intro', 'CrossPoint User Guide', html)]
+        return [('intro', 'Bluecarrel Firmware User Guide', html)]
 
     intro_html = html[:positions[0][0]].strip()
     if intro_html:
@@ -262,10 +262,10 @@ def build_epub():
     body_html = md.convert(source)
 
     book = epub.EpubBook()
-    book.set_identifier('crosspoint-user-guide-v1')
-    book.set_title('CrossPoint User Guide')
+    book.set_identifier('bluecarrel-user-guide-v1')
+    book.set_title('Bluecarrel Firmware User Guide')
     book.set_language('en')
-    book.add_author('CrossPoint Reader Project')
+    book.add_author('Bluecarrel (based on CrossPoint Reader)')
 
     style = epub.EpubItem(
         uid='style',
@@ -290,11 +290,11 @@ def build_epub():
     book.add_metadata('OPF', 'meta', '', {'name': 'cover', 'content': 'cover-image'})
 
     # Cover page XHTML — first readable page in the spine
-    cover_page = epub.EpubHtml(title='CrossPoint User Guide', file_name='cover.xhtml', lang='en')
+    cover_page = epub.EpubHtml(title='Bluecarrel Firmware User Guide', file_name='cover.xhtml', lang='en')
     cover_page.content = make_xhtml(
-        'CrossPoint User Guide',
+        'Bluecarrel Firmware User Guide',
         '<div class="cover-page">'
-        '<img src="images/cover.png" alt="CrossPoint User Guide cover"/>'
+        '<img src="images/cover.png" alt="Bluecarrel Firmware User Guide cover"/>'
         '</div>',
     )
     cover_page.add_item(style)

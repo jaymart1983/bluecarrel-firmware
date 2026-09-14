@@ -1748,6 +1748,7 @@ void GfxRenderer::setChangeBudgetPercent(const uint16_t percentOfScreen) {
   changeBudgetPercent_ = percentOfScreen;
   if (percentOfScreen == 0) {
     changeBudgetPixels_ = 0;
+    singleFrameScrubPixels_ = 0;
     freeChangeSnapshot();
     return;
   }
@@ -1756,7 +1757,7 @@ void GfxRenderer::setChangeBudgetPercent(const uint16_t percentOfScreen) {
     changePrevValid_ = false;
     changeAccumPixels_ = 0;
     if (changePrevFrame_ == nullptr) {
-      LOG_DBG("GFX", "No PSRAM for the refresh change snapshot; page cadence only");
+      LOG_DBG("GFX", "No PSRAM for the refresh change snapshot; change budget disabled");
       changeBudgetPixels_ = 0;
       return;
     }
@@ -1764,6 +1765,9 @@ void GfxRenderer::setChangeBudgetPercent(const uint16_t percentOfScreen) {
   const uint32_t pixels = static_cast<uint32_t>(panelWidth) * panelHeight;
   changeBudgetPixels_ = static_cast<uint32_t>((static_cast<uint64_t>(pixels) * percentOfScreen) / 100u);
   if (changeBudgetPixels_ == 0) changeBudgetPixels_ = 1;
+  singleFrameScrubPixels_ =
+      static_cast<uint32_t>((static_cast<uint64_t>(pixels) * kSingleFrameScrubPercent) / 100u);
+  if (singleFrameScrubPixels_ == 0) singleFrameScrubPixels_ = 1;
 }
 
 uint16_t GfxRenderer::changeAccumulatedPercent() const {
@@ -1803,14 +1807,17 @@ uint32_t GfxRenderer::diffAndSnapshotFrame() const {
   return changed;
 }
 
-HalDisplay::RefreshMode GfxRenderer::applyChangeBudget(const HalDisplay::RefreshMode refreshMode) const {
+// --- Ghost accounting -------------------------------------------------------
+//
+// Kept apart from choosing a refresh mode: "does the panel need scrubbing" and
+// "which waveform does this update use" are separate decisions, and the scrub
+// runs after the frame is pushed. This function only measures and decides. displayBuffer pushes the frame,
+// then asks runPendingGhostClear() to act on the decision.
+void GfxRenderer::noteFrameForGhosting(const HalDisplay::RefreshMode refreshMode) const {
   // A clean waveform re-drives every pixel, so it wipes the residue whatever
   // asked for it -- the accumulator restarts from the frame about to be pushed.
   const bool clean = refreshMode != HalDisplay::FAST_REFRESH;
-  lastRefreshWasClean_ = clean;
-  if (changePrevFrame_ == nullptr || changeBudgetPixels_ == 0 || frameBuffer == nullptr) {
-    return refreshMode;
-  }
+  if (changePrevFrame_ == nullptr || changeBudgetPixels_ == 0 || frameBuffer == nullptr) return;
 
   if (!changePrevValid_) {
     // No baseline yet (first update after boot, or after a framebuffer loan
@@ -1819,45 +1826,112 @@ HalDisplay::RefreshMode GfxRenderer::applyChangeBudget(const HalDisplay::Refresh
     memcpy(changePrevFrame_, frameBuffer, frameBufferSize);
     changePrevValid_ = true;
     if (clean) changeAccumPixels_ = 0;
-    return refreshMode;
+    return;
   }
 
   // The diff is instrumented rather than estimated: raise LOG_LEVEL to 2 and
   // the per-update cost shows up next to every refresh in the serial log.
   const uint32_t t0 = micros();
-  changeAccumPixels_ += diffAndSnapshotFrame();
+  const uint32_t changedThisFrame = diffAndSnapshotFrame();
+  changeAccumPixels_ += changedThisFrame;
   const unsigned long diffUs = micros() - t0;
   (void)diffUs;
-  LOG_DBG("GFX", "change budget: %u%% of screen accumulated (diff %lu us)", changeAccumulatedPercent(), diffUs);
 
   if (clean) {
+    // Someone else already asked for a full re-drive; nothing left to scrub.
     changeAccumPixels_ = 0;
-    return refreshMode;
+    return;
   }
-  if (changeAccumPixels_ >= changeBudgetPixels_) {
-    changeAccumPixels_ = 0;
-    lastRefreshWasClean_ = true;
-    LOG_DBG("GFX", "change budget spent; promoting this update to a clean refresh");
-    return HalDisplay::HALF_REFRESH;
+
+  const uint32_t panelPixels = static_cast<uint32_t>(panelWidth) * panelHeight;
+  const unsigned framePercent =
+      panelPixels ? static_cast<unsigned>((static_cast<uint64_t>(changedThisFrame) * 100u) / panelPixels) : 0;
+
+  // Two independent triggers, because ghosting arrives two different ways.
+  //
+  //  - A screen CHANGE deposits its whole residue in one frame and then sits
+  //    still (leaving a book for the library). Waiting for a running total that
+  //    the next screen may never spend leaves that residue on display.
+  //  - READING deposits a little at a time and never trips the single-frame
+  //    test, so the running total is what eventually catches it.
+  const bool wholeScreen = changedThisFrame >= singleFrameScrubPixels_;
+  const bool budgetSpent = changeAccumPixels_ >= changeBudgetPixels_;
+  if (!wholeScreen && !budgetSpent) {
+    LOG_DBG("GFX", "ghosting: +%u%% this frame, %u%% accumulated (diff %lu us)", framePercent,
+            changeAccumulatedPercent(), diffUs);
+    return;
   }
-  return refreshMode;
+
+  changeAccumPixels_ = 0;
+
+  if (wholeScreen) {
+    // The frame in hand already replaces the panel, so it can BE the clean
+    // update rather than being pushed fast and then flashed afterwards.
+    //
+    // Pushing fast first and scrubbing after showed the new screen correctly and
+    // then re-drove every pixel to its opposite tone underneath it, which lifts
+    // the OUTGOING image back out of the panel -- the USB Drive notice appeared
+    // perfectly and then the library page behind it started to come back. One
+    // clean waveform carrying the new frame has no such second pass.
+    cleanThisFrame_ = true;
+    LOG_DBG("GFX", "ghosting: whole-screen change goes out clean (+%u%% this frame)", framePercent);
+    return;
+  }
+
+  // Accumulated residue from many small updates: the current frame is the right
+  // thing to hold on screen, so scrub after it lands.
+  ghostClearPending_ = true;
+  LOG_DBG("GFX", "ghosting: scrubbing (budget spent; +%u%% this frame)", framePercent);
+}
+
+void GfxRenderer::runPendingGhostClear() const {
+  if (!ghostClearPending_) return;
+  ghostClearPending_ = false;
+  // A CLEAN waveform. This drives every pixel to the opposite tone and back,
+  // which is the visible negative flash -- and, measured on this panel, the
+  // only thing that actually clears accumulated residue; re-driving the same
+  // frame with the fast waveform does not.
+  //
+  // It fires on accumulated change rather than a page count, and immediately on
+  // a whole-screen change, where a flash is expected anyway because the screen
+  // is changing. With ghost cleanup Off (a zero change budget) it never fires.
+  display.displayBuffer(HalDisplay::HALF_REFRESH, fadingFix);
 }
 
 void GfxRenderer::displayBuffer(HalDisplay::RefreshMode refreshMode) const {
   auto elapsed = millis() - start_ms;
   LOG_DBG("GFX", "Time = %lu ms from clearScreen to displayBuffer", elapsed);
   reportClippedPixels();
-  refreshMode = applyChangeBudget(applyPromotedRefresh(refreshMode));
+  refreshMode = applyPromotedRefresh(refreshMode);
+  noteFrameForGhosting(refreshMode);
+  if (cleanThisFrame_) {
+    cleanThisFrame_ = false;
+    refreshMode = HalDisplay::HALF_REFRESH;
+  }
   display.displayBuffer(refreshMode, fadingFix);
+  runPendingGhostClear();
 }
 
 void GfxRenderer::displayBufferAsync(HalDisplay::RefreshMode refreshMode) const {
   reportClippedPixels();
-  refreshMode = applyChangeBudget(applyPromotedRefresh(refreshMode));
+  refreshMode = applyPromotedRefresh(refreshMode);
+  noteFrameForGhosting(refreshMode);
+  if (cleanThisFrame_) {
+    // A whole-screen change goes out clean, and a clean waveform blocks.
+    cleanThisFrame_ = false;
+    display.displayBuffer(HalDisplay::HALF_REFRESH, fadingFix);
+    return;
+  }
   // The async path has no turn-off-screen hook, which the sunlight fading fix
   // relies on; keep those users on the blocking path.
-  if (fadingFix) {
+  //
+  // A scheduled scrub also has to go out synchronously: the repeats must land
+  // after this frame, and driving the panel again underneath an in-flight async
+  // update is not something the driver promises to survive. So the one update
+  // in ten that clears ghosting blocks, and the other nine do not.
+  if (fadingFix || ghostClearPending_) {
     display.displayBuffer(refreshMode, fadingFix);
+    runPendingGhostClear();
     return;
   }
   display.displayBufferAsync(refreshMode);
@@ -2402,10 +2476,11 @@ size_t GfxRenderer::getBufferSize() const { return frameBufferSize; }
 
 void GfxRenderer::displayGrayscaleBase(HalDisplay::RefreshMode fallback) const {
   // The B/W base of a grayscale page is a full-frame push like any other, so it
-  // feeds (and can be promoted by) the change budget. A promoted Half here is
-  // what the UC8279 driver turns into a true GC on an AA page -- the only thing
-  // that clears gray edge charge; a Half scrub cannot.
-  fallback = applyChangeBudget(fallback);
+  // is measured like one. No scrub runs here though: the gray planes are about
+  // to be written over this base and displayGrayBuffer() will drive the panel
+  // again anyway, so repeating the base now would be work the very next call
+  // undoes. Any scrub this frame earns is left pending for that push.
+  noteFrameForGhosting(fallback);
   display.displayGrayscaleBase(fallback, fadingFix);
 }
 
@@ -2433,7 +2508,19 @@ void GfxRenderer::copyGrayscaleLsbBuffers() const { display.copyGrayscaleLsbBuff
 
 void GfxRenderer::copyGrayscaleMsbBuffers() const { display.copyGrayscaleMsbBuffers(frameBuffer); }
 
-void GfxRenderer::displayGrayBuffer() const { display.displayGrayBuffer(fadingFix); }
+void GfxRenderer::displayGrayBuffer() const {
+  display.displayGrayBuffer(fadingFix);
+  // NOT a scrub -- the opposite. This push drives every pixel on the panel, so
+  // by the time it returns there is nothing left to clear. Running a pending
+  // scrub here would flash a panel that is already clean: the change budget
+  // counts pixels that CHANGED, not pixels that were re-driven.
+  notePanelFullyDriven();
+}
+
+void GfxRenderer::notePanelFullyDriven() const {
+  changeAccumPixels_ = 0;
+  ghostClearPending_ = false;
+}
 
 void GfxRenderer::writeGrayscalePlaneStrip(bool lsbPlane, const uint8_t* scratch, int yStart, int numRows) const {
   // Guard the uint16_t casts below: a negative would wrap to a huge length.

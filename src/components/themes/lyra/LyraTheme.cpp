@@ -13,6 +13,7 @@
 
 #include "RecentBooksStore.h"
 #include "components/UITheme.h"
+#include "util/BleCatalog.h"
 #include "components/icons/book.h"
 #include "components/icons/bookmark.h"
 #include "components/icons/cover.h"
@@ -306,12 +307,17 @@ void LyraTheme::drawEmptyRecents(const GfxRenderer& renderer, const Rect rect) c
 void LyraTheme::drawButtonMenu(GfxRenderer& renderer, Rect rect, int buttonCount, int selectedIndex,
                                const std::function<std::string(int index)>& buttonLabel,
                                const std::function<UIIcon(int index)>& rowIcon,
-                               const std::function<std::string(int index)>& rowCover) const {
+                               const std::function<std::string(int index)>& rowCover, const int rowHeightOverride,
+                               const std::function<bool(int index)>& rowMarked,
+                               const std::function<float(int index)>& rowPercent) const {
+  // The Library asks for taller rows so a cover is legible on e-ink; every other
+  // menu keeps the theme's own height. Passed in rather than changed globally,
+  // because the same row height drives the touch grid and the settings lists.
+  const int rowHeight = rowHeightOverride > 0 ? rowHeightOverride : LyraMetrics::values.menuRowHeight;
   for (int i = 0; i < buttonCount; ++i) {
     int tileWidth = rect.width - LyraMetrics::values.contentSidePadding * 2;
     Rect tileRect = Rect{rect.x + LyraMetrics::values.contentSidePadding,
-                         rect.y + i * (LyraMetrics::values.menuRowHeight + LyraMetrics::values.menuSpacing), tileWidth,
-                         LyraMetrics::values.menuRowHeight};
+                         rect.y + i * (rowHeight + LyraMetrics::values.menuSpacing), tileWidth, rowHeight};
 
     const bool selected = selectedIndex == i;
 
@@ -323,7 +329,7 @@ void LyraTheme::drawButtonMenu(GfxRenderer& renderer, Rect rect, int buttonCount
     const char* label = labelStr.c_str();
     int textX = tileRect.x + 16;
     const int lineHeight = renderer.getLineHeight(UI_12_FONT_ID);
-    const int textY = tileRect.y + (LyraMetrics::values.menuRowHeight - lineHeight) / 2;
+    int textY = tileRect.y + (rowHeight - lineHeight) / 2;
 
     // A cover if the phone sent one, the generic icon otherwise. The cover is
     // drawn at the row's own height so a taller theme simply gets a bigger
@@ -331,10 +337,22 @@ void LyraTheme::drawButtonMenu(GfxRenderer& renderer, Rect rect, int buttonCount
     // ragged left edge where the art would have been.
     std::string coverPath = rowCover != nullptr ? rowCover(i) : std::string();
     if (!coverPath.empty()) {
-      const int coverH = LyraMetrics::values.menuRowHeight - 8;
-      // 2:3 is the usual book aspect; the bitmap is fitted inside either way.
-      const int coverW = (coverH * 2) / 3;
-      drawRowCover(renderer, coverPath, textX, tileRect.y + 4, coverW, coverH);
+      // Drawn at the exact size the phone rendered it, so the 1-bit dither is
+      // blitted rather than resampled. Centred in the row rather than stretched
+      // to it, because a row taller than the art must not scale the art.
+      const int coverW = BleCatalog::ROW_COVER_WIDTH;
+      const int coverH = BleCatalog::ROW_COVER_HEIGHT;
+      const int coverY = tileRect.y + (rowHeight - coverH) / 2;
+      drawRowCover(renderer, coverPath, textX, coverY, coverW, coverH);
+
+      // Progress rides on the cover's top-left corner, in a filled disc.
+      //
+      // It used to be appended to the title string ("Moby Dick  42%"), which
+      // put it wherever the title happened to end -- a different place on every
+      // row, and the first thing to be eaten when a long title wrapped or was
+      // ellipsised. On the corner it is in the same place on every row, and the
+      // disc gives it a white ground so it stays readable over dark cover art
+      // instead of disappearing into it.
       textX += coverW + hPaddingInSelection + 2;
     } else if (rowIcon != nullptr) {
       UIIcon icon = rowIcon(i);
@@ -345,6 +363,66 @@ void LyraTheme::drawButtonMenu(GfxRenderer& renderer, Rect rect, int buttonCount
       }
     }
 
-    renderer.drawText(UI_12_FONT_ID, textX, textY, label, true);
+    // Book titles are long and the row is wide, not infinite. Left as one line
+    // they simply ran off the right of the panel -- no wrap, no ellipsis, the
+    // end of the title just gone. The row is tall enough for three lines beside
+    // the cover, so wrap to three and let wrappedText ellipsise past that.
+    const int textRight = tileRect.x + tileRect.width - 16;
+    const int textWidth = textRight - textX;
+    if (textWidth <= 0) continue;
+    // The Last Read badge sits on the text's right edge, on its own line above
+    // the title, and the title wraps in what is left. Drawn as a word rather
+    // than a glyph: on a 1-bit panel at this size a small symbol is a smudge,
+    // and "LAST READ" cannot be mistaken for the cover art beside it.
+    // One status line above the title, sharing its width: what this book IS on
+    // the left, how far in you are on the right.
+    //
+    // The percentage used to be a disc floating over the cover's corner, which
+    // put it outside the text column and cost a white plate and an outline to
+    // stay readable over the art. On the row's own top line it needs neither,
+    // it lines up down the whole list, and it has room for the decimal the
+    // reader and the app both show.
+    int titleTop = tileRect.y;
+    int titleHeight = rowHeight;
+    const bool marked = rowMarked != nullptr && rowMarked(i);
+    const float percent = rowPercent != nullptr ? rowPercent(i) : -1.0f;
+    if (marked || percent >= 0.0f) {
+      const int lineH = renderer.getLineHeight(SMALL_FONT_ID);
+      const int statusY = tileRect.y + 8;
+
+      if (marked) {
+        // A word, not a glyph: at this size on a 1-bit panel a small symbol is
+        // a smudge, and "LAST READ" cannot be mistaken for the cover beside it.
+        const char* badge = "LAST READ";
+        const int badgeW = renderer.getTextWidth(SMALL_FONT_ID, badge, EpdFontFamily::BOLD);
+        renderer.drawText(SMALL_FONT_ID, textX, statusY, badge, true, EpdFontFamily::BOLD);
+        renderer.drawLine(textX, statusY + lineH + 1, textX + badgeW, statusY + lineH + 1, true);
+      }
+
+      if (percent >= 0.0f) {
+        // Same rule as the reader's top bar and the app: one decimal, but a
+        // bare "0%" for nothing, because a decimal on zero is noise.
+        char pct[12];
+        if (percent <= 0.0f) {
+          snprintf(pct, sizeof(pct), "0%%");
+        } else {
+          snprintf(pct, sizeof(pct), "%.1f%%", static_cast<double>(percent));
+        }
+        const int pctW = renderer.getTextWidth(SMALL_FONT_ID, pct, EpdFontFamily::BOLD);
+        renderer.drawText(SMALL_FONT_ID, textRight - pctW, statusY, pct, true, EpdFontFamily::BOLD);
+      }
+
+      titleTop += lineH + 10;
+      titleHeight -= lineH + 10;
+    }
+    const int maxLines = std::max(1, std::min(3, titleHeight / std::max(1, lineHeight)));
+    const auto lines = renderer.wrappedText(UI_12_FONT_ID, label, textWidth, maxLines);
+    // Re-centre on the block, not the single line the row was laid out for, or a
+    // three-line title starts at the vertical centre and runs out of the row.
+    textY = titleTop + (titleHeight - static_cast<int>(lines.size()) * lineHeight) / 2;
+    for (const auto& line : lines) {
+      renderer.drawText(UI_12_FONT_ID, textX, textY, line.c_str(), true);
+      textY += lineHeight;
+    }
   }
 }

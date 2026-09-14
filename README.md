@@ -12,11 +12,75 @@ Check [our Devices page](https://crosspointreader.com/devices) for the full list
 
 ![CrossPoint Reader running on Xteink device](./docs/images/cover.jpg)
 
+## X4 Pro Sync edition
+
+This repository is a fork of [CrossPoint Reader](https://github.com/crosspoint-reader/crosspoint-reader) for the
+**Xteink X4 Pro**. All credit for the reader itself goes to the upstream CrossPoint project and its contributors. The
+rest of this README is upstream's and still applies to the other boards this tree builds; where a statement does not
+hold for the X4 Pro build it is marked.
+
+### What is different on the X4 Pro build (`x4pro` env)
+
+- **Bluetooth only.** The build has no Wi-Fi stack, web server, WebDAV, OPDS browser, KOReader sync client, OTA over
+  HTTP or font downloads. They are left out at compile time (`build_flags_nonet` in `platformio.ini`), not hidden.
+- **Needs the X4 Pro Sync Android app.** The app sends books, syncs reading positions and settings, browses its
+  Calibre library in the on-device Store, and delivers firmware updates. It talks to the reader over the BLE protocol
+  in [docs/ble-transfer-protocol.md](./docs/ble-transfer-protocol.md).
+- **Pairing** is done once, with a six-digit code shown on the reader's Settings page (Control Centre > Settings).
+- **Firmware updates** arrive over Bluetooth and are staged in `/firmware` on the SD card. The reader verifies the
+  image, then offers **Update Now / Later / Cancel**; Later installs the next time the reader sleeps. A setting installs
+  at sleep without asking.
+- **USB Drive:** plugging into a computer while the reader is awake mounts the SD card.
+- **Controls:** Power tap opens and closes the Control Centre, hold sleeps, double tap toggles the frontlight. There is
+  no on-screen Back button; hold a side key for Back or Select outside a book.
+- **Refresh:** no automatic full-screen refreshes while reading. Use the Control Centre's Refresh Screen tile (or hold
+  its Home tile) when you want one.
+
+See the [User Guide](./USER_GUIDE.md) for details.
+
+### Build
+
+Install PlatformIO (see [Development quick start](#development-quick-start)), then:
+
+```bash
+pio run -e x4pro
+```
+
+The image is written to `.pio/build/x4pro/firmware.bin`. The version the reader shows and reports to the app is a
+build stamp (`yyyyMMdd.HHmm`, UTC) in `src/network/BuildStamp.h`, which is generated automatically at build time.
+
+### First install over USB
+
+1. Connect the X4 Pro with a USB-C data cable.
+2. Flash the app image and clear the OTA boot selection:
+
+```bash
+esptool.py --chip esp32s3 --port /dev/ttyACM0 --baud 921600 erase_region 0xe000 0x2000
+esptool.py --chip esp32s3 --port /dev/ttyACM0 --baud 921600 write_flash 0x10000 .pio/build/x4pro/firmware.bin
+```
+
+Erasing `otadata` (0xe000, 0x2000 bytes; see `partitions.csv`) matters on any reader that has already taken a
+Bluetooth update: those install into the other app slot, and without the erase the reader keeps booting that slot and
+ignores the image you just wrote to 0x10000. On a reader that has never been updated over Bluetooth it does no harm.
+
+### Later updates over Bluetooth
+
+After the first install, updates come from the X4 Pro Sync app. The app checks an update page you host: any static web
+server directory containing the image and a `firmware.json` of the form
+
+```json
+{"version":"20260913.1914","file":"crosspoint-x4pro-20260913.1914.bin","size":6123456,"sha256":"<64 hex digits>"}
+```
+
+`scripts/make_firmware_json.sh <dir>` copies the last `x4pro` build into `<dir>` and writes that file. Enter the
+page's URL in the app. When the app sees a newer `version` than the reader reports, it sends the image; the reader
+then prompts as described above.
+
 > If you're planning to buy an Xteink device, consider purchasing an **X3/X4 Developer Edition** through https://crosspointreader.com. CrossPoint receives a small share of each sale, helping fund development costs.
 
 ## What can CrossPoint do?
 
-- **Reader engine**: EPUB 2/3 rendering with embedded-style option, image handling, hyphenation, kerning, adaptive table layouts, native CJK ruby annotations, chapter navigation, footnotes, bookmarks, dictionary lookups ([StarDict](docs/dictionary.md)), go-to-percent, auto page turn, orientation control, focus reading, KOReader progress sync and more.
+- **Reader engine**: EPUB 2/3 rendering with embedded-style option, image handling, hyphenation, kerning, adaptive table layouts, native CJK ruby annotations, chapter navigation, footnotes, bookmarks, dictionary lookups ([StarDict](docs/dictionary.md)), go-to-percent, auto page turn, orientation control, focus reading, KOReader progress sync (Wi-Fi builds; on the X4 Pro positions sync through the app) and more.
 
 - **Various formats**: native handling for `.epub`, `.xtc/.xtch`, `.txt`, and `.bmp`.
 
@@ -32,7 +96,7 @@ Check [our Devices page](https://crosspointreader.com/devices) for the full list
 
 - **Library workflow**: folder browser, hidden-file toggle, long-press delete, recent books, SD-cache management.
 
-- **Wireless workflows**:
+- **Wireless workflows** (Wi-Fi builds only; not in the X4 Pro build, which uses Bluetooth and the X4 Pro Sync app instead):
   
   - File transfer web UI
   - EPUB Optimizer
@@ -44,7 +108,7 @@ Check [our Devices page](https://crosspointreader.com/devices) for the full list
   - OPDS browser with saved servers (up to 8), search, pagination, and direct download
   - OTA update checks and installs from GitHub releases
 
-- **Customization**: night mode, multiple themes (Classic, Lyra, Lyra Extended, RoundedRaff), sleep screen modes including transparent overlays, front/side button remapping, status bar controls, power-button behavior, refresh cadence, and more.
+- **Customization**: night mode, multiple themes (Classic, Lyra, Lyra Extended, RoundedRaff), sleep screen modes including transparent overlays, front/side button remapping, status bar controls, power-button behavior, ghost-cleanup level, and more. (Page-count refresh cadence has been removed in this fork: no reader does scheduled full-screen refreshes.)
 
 - **Localization**: 34 UI languages and counting, including CJK font fallback and RTL support.
 
@@ -125,6 +189,8 @@ esptool.py --chip esp32c3 --port /dev/ttyACM0 --baud 921600 write_flash 0x10000 
 esptool.py --chip esp32s3 --port /dev/ttyACM0 --baud 921600 write_flash 0x10000 /path/to/firmware.bin
 ```
 
+   For this fork's X4 Pro build, also erase `otadata` first; see [First install over USB](#first-install-over-usb).
+
 ### Manual
 
 See [Development quick start](#development-quick-start) below.
@@ -148,8 +214,9 @@ Conversion runs the firmware repo's `lib/EpdFont/scripts/fontconvert_sdcard.py` 
 ## Documentation
 
 - [User Guide](./USER_GUIDE.md)
-- [Web server usage](./docs/webserver.md)
-- [Web server endpoints](./docs/webserver-endpoints.md)
+- [BLE transfer protocol](./docs/ble-transfer-protocol.md) (the X4 Pro Sync app link)
+- [Web server usage](./docs/webserver.md) (Wi-Fi builds only)
+- [Web server endpoints](./docs/webserver-endpoints.md) (Wi-Fi builds only)
 - [Project scope](./SCOPE.md)
 - [Contributing docs](./docs/contributing/README.md)
 - [Touch and UI development](./docs/contributing/touch-and-ui.md) - how to build new screens on the FreeInkUI activity bases (UiListActivity and friends), plus build envs for the non-Xteink touch devices
@@ -234,7 +301,7 @@ Minor adjustments may be required for Windows.
 
 ## Internals
 
-CrossPoint Reader is pretty aggressive about caching data down to the SD card to minimise RAM usage. The ESP32-C3 only has ~380KB of usable RAM, so we have to be careful. A lot of the decisions made in the design of the firmware were based on this constraint.
+CrossPoint Reader is pretty aggressive about caching data down to the SD card to minimise RAM usage. The ESP32-C3 only has ~380KB of usable RAM, so we have to be careful. (The ESP32-S3 boards, including the X4 Pro with 8MB PSRAM, have more room, but shared code is still written to the C3 budget.) A lot of the decisions made in the design of the firmware were based on this constraint.
 
 ### Data caching
 

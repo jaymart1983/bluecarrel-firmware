@@ -115,7 +115,7 @@ bool isValidLocationLength(const std::string& fileName, const size_t len) {
 }
 
 ApplyResult applyProgress(const char* booksRoot, const std::string& relativePath, const std::string& locationHex,
-                          const uint32_t timestamp) {
+                          const uint32_t timestamp, const SpineJump& jump, const uint16_t percentBp) {
   if (!booksRoot || relativePath.empty()) return ApplyResult::INVALID;
   // Checked before anything else so a file the reader cannot open is reported as
   // exactly that, rather than as a malformed position.
@@ -124,10 +124,18 @@ ApplyResult applyProgress(const char* booksRoot, const std::string& relativePath
   // for overwriting a position; there is no "just apply it anyway" path.
   if (!HalClock::isPlausibleEpoch(timestamp)) return ApplyResult::INVALID;
 
+  // A spine jump may arrive with NO location, and that is legitimate: the sender
+  // is another reading system whose own position encoding means nothing here, so
+  // it sent a spine item and a fraction instead. Everything else -- the
+  // timestamp rule, the file check, the cache directory -- applies unchanged.
+  const bool jumpOnly = locationHex.empty() && jump.present;
+
   uint8_t location[MAX_PROGRESS_BYTES] = {};
   size_t locationLen = 0;
-  if (!decodeLocation(locationHex, location, locationLen)) return ApplyResult::INVALID;
-  if (!isValidLocationLength(relativePath, locationLen)) return ApplyResult::INVALID;
+  if (!jumpOnly) {
+    if (!decodeLocation(locationHex, location, locationLen)) return ApplyResult::INVALID;
+    if (!isValidLocationLength(relativePath, locationLen)) return ApplyResult::INVALID;
+  }
 
   const std::string fullPath = std::string(booksRoot) + "/" + relativePath;
   if (!Storage.exists(fullPath.c_str())) return ApplyResult::NOT_FOUND;
@@ -162,7 +170,32 @@ ApplyResult applyProgress(const char* booksRoot, const std::string& relativePath
     LOG_ERR(TAG, "Could not create cache dir for %s", relativePath.c_str());
     return ApplyResult::WRITE_FAILED;
   }
-  if (!ProgressFile::writeAtomicAt(cachePath, location, locationLen, timestamp)) {
+  // The jump first. If the position write below fails the book still lands in
+  // the right place on open, which is a better failure than a stamped position
+  // pointing nowhere.
+  if (jump.present) {
+    if (!ProgressFile::writeSyncJump(cachePath, jump.spineIndex, jump.fraction, jump.spineCount)) {
+      LOG_ERR(TAG, "Could not write sync jump for %s", relativePath.c_str());
+      if (jumpOnly) return ApplyResult::WRITE_FAILED;
+    } else {
+      LOG_DBG(TAG, "Sync jump for %s: spine %u/%u frac %.4f", relativePath.c_str(),
+              static_cast<unsigned>(jump.spineIndex), static_cast<unsigned>(jump.spineCount),
+              static_cast<double>(jump.fraction));
+    }
+  }
+
+  if (jumpOnly) {
+    // No native position to store, so stamp the time alone. The reader resolves
+    // the jump into a real position the next time it opens this book, and that
+    // is when progress.bin gets written.
+    if (!ProgressFile::writeSavedTime(cachePath, timestamp, percentBp)) {
+      return ApplyResult::WRITE_FAILED;
+    }
+    LOG_DBG(TAG, "Applied spine jump for %s @ %lu", relativePath.c_str(), static_cast<unsigned long>(timestamp));
+    return ApplyResult::APPLIED;
+  }
+
+  if (!ProgressFile::writeAtomicAt(cachePath, location, locationLen, timestamp, percentBp)) {
     return ApplyResult::WRITE_FAILED;
   }
   LOG_DBG(TAG, "Applied progress for %s (%u bytes @ %lu)", relativePath.c_str(), static_cast<unsigned>(locationLen),

@@ -11,6 +11,7 @@
 #include <cstring>
 
 #include "BlePairingActivity.h"
+#include "network/BuildStamp.h"
 #include "ButtonRemapActivity.h"
 #include "ClearCacheActivity.h"
 #include "CrossPointSettings.h"
@@ -19,6 +20,8 @@
 #include "MappedInputManager.h"
 #include "SdCardFontSystem.h"
 #include "SdFirmwareUpdateActivity.h"
+#include "FirmwareReadyActivity.h"
+#include "network/FirmwareWatcher.h"
 #include "SettingsList.h"
 #include "StatusBarSettingsActivity.h"
 #include "TextSettingsActivity.h"
@@ -87,9 +90,8 @@ void SettingsActivity::rebuildSettingsLists() {
                             SettingInfo::Action(StrId::STR_REMAP_FRONT_BUTTONS, SettingAction::RemapFrontButtons));
   }
 #if FREEINK_CAP_BLE_TRANSFER
-  // The only pairing UI on the device. Deliberately in System settings and
-  // nowhere else: a second entry point is how the old arrangement ended up with
-  // a screen that could hide the pairing code.
+  // Bluetooth pairing and firmware status (BlePairingActivity). The Action
+  // Centre's Settings tile opens the same screen directly.
   systemSettings.push_back(SettingInfo::Action(StrId::STR_BLUETOOTH, SettingAction::BluetoothPairing));
 #endif
 #if FREEINK_CAP_NETWORK
@@ -106,6 +108,10 @@ void SettingsActivity::rebuildSettingsLists() {
   // SD firmware update stays on every board: it is offline, and on a
   // FREEINK_CAP_NETWORK=0 board it is the only route that does not need the
   // companion app (BLE `firmware` push is the other).
+#if FREEINK_CAP_BLE_TRANSFER
+  // The update the phone sent, and the way back to it after the prompt is gone.
+  systemSettings.push_back(SettingInfo::Action(StrId::STR_FIRMWARE_UPDATE_ROW, SettingAction::FirmwareUpdate));
+#endif
   systemSettings.push_back(SettingInfo::Action(StrId::STR_SD_FIRMWARE_UPDATE, SettingAction::SdFirmwareUpdate));
   systemSettings.push_back(SettingInfo::Action(StrId::STR_LANGUAGE, SettingAction::Language));
   systemSettings.push_back(SettingInfo::Action(StrId::STR_KEYBOARD_LAYOUTS, SettingAction::KeyboardLayouts));
@@ -380,6 +386,14 @@ void SettingsActivity::toggleCurrentSetting() {
       case SettingAction::SdFirmwareUpdate:
         startActivityForResult(std::make_unique<SdFirmwareUpdateActivity>(renderer, mappedInput), resultHandler);
         break;
+#if FREEINK_CAP_BLE_TRANSFER
+      case SettingAction::FirmwareUpdate:
+        // Only a verified image has anything to confirm; "Up to date" is inert.
+        if (FIRMWARE_WATCHER.stageState() == FirmwareWatcher::StageState::READY) {
+          startActivityForResult(std::make_unique<FirmwareReadyActivity>(renderer, mappedInput), nullptr);
+        }
+        break;
+#endif
 #if FREEINK_CAP_NETWORK
       case SettingAction::DownloadFonts:
         startActivityForResult(std::make_unique<FontDownloadActivity>(renderer, mappedInput),
@@ -482,6 +496,11 @@ void SettingsActivity::openSleepTimeoutPicker() {
 }
 
 std::string SettingsActivity::settingValueText(const SettingInfo& setting) {
+#if FREEINK_CAP_BLE_TRANSFER
+  if (setting.type == SettingType::ACTION && setting.action == SettingAction::FirmwareUpdate) {
+    return firmwareStageStatusText();
+  }
+#endif
   if (setting.type == SettingType::TOGGLE && setting.valuePtr != nullptr) {
     return SETTINGS.*(setting.valuePtr) ? tr(STR_STATE_ON) : tr(STR_STATE_OFF);
   }
@@ -565,10 +584,27 @@ void SettingsActivity::render(RenderLock&&) {
   // indicator; the rest of the screen renders through the app.
   // Version rides in the header's trailing label slot: the footer position
   // conflicts with button hints on non-touch devices.
+  // No on-screen Back, in the header or as a touch chip in the button hints: the
+  // Action Centre carries Home from anywhere, even with the touchscreen off. The
+  // Back button still works.
   GUI.drawHeader(renderer, Rect{0, metrics.topPadding, pageWidth, metrics.headerHeight}, tr(STR_SETTINGS_TITLE),
-                 CROSSPOINT_VERSION, /*withBack=*/true);
+                 // CROSSPOINT_VERSION is empty on builds that do not set CP_VERSION; the
+                 // build stamp is what the app and the update page call this build.
+                 (CROSSPOINT_VERSION[0] != '\0' ? CROSSPOINT_VERSION : X4_BUILD_STAMP), /*withBack=*/false);
 
   renderUi();
+
+  // The installed build, spelled out. The header's trailing label cannot carry it
+  // on this layout -- the clock, Bluetooth and battery cluster claims that corner
+  // -- but on a touch board the button-hint strip at the bottom is empty, since
+  // hints are not drawn there.
+  if (mappedInput.hasTouch()) {
+    const std::string versionText = std::string(tr(STR_FIRMWARE_VERSION)) + " " + X4_BUILD_STAMP;
+    const int pageHeight = renderer.getScreenHeight();
+    const int textY =
+        pageHeight - metrics.buttonHintsHeight + (metrics.buttonHintsHeight - renderer.getLineHeight(SMALL_FONT_ID)) / 2;
+    renderer.drawCenteredText(SMALL_FONT_ID, textY, versionText.c_str());
+  }
 
   const int ring = ringPos();
   const auto confirmLabel =
@@ -577,7 +613,7 @@ void SettingsActivity::render(RenderLock&&) {
                                                                                                  : tr(STR_TOGGLE));
 
   const auto labels = mappedInput.mapLabels(tr(STR_BACK), confirmLabel, tr(STR_DIR_UP), tr(STR_DIR_DOWN));
-  GUI.drawButtonHints(renderer, labels.btn1, labels.btn2, labels.btn3, labels.btn4);
+  GUI.drawButtonHints(renderer, labels.btn1, labels.btn2, labels.btn3, labels.btn4, /*touchBack=*/false);
 
   // Always use standard refresh for settings screen
   renderer.displayBuffer();

@@ -129,8 +129,14 @@ void ActivityManager::loop() {
         return;
       }
     }
-    if (panelRoutable && mappedInput.consumeControlCenterOpen() && !panelUp) {
-      pushActivity(std::make_unique<FrontlightPanelActivity>(renderer, mappedInput));
+    // A power tap toggles: it opens the panel, or closes the one that is up. The
+    // hold that used to close it is Sleep now (main.cpp's decoder).
+    if (panelRoutable && mappedInput.consumeControlCenterOpen()) {
+      if (panelUp) {
+        popActivity();
+      } else {
+        pushActivity(std::make_unique<FrontlightPanelActivity>(renderer, mappedInput));
+      }
       return;
     }
 
@@ -139,17 +145,25 @@ void ActivityManager::loop() {
     // the top-edge down-swipe that used to open it as well is gone (it fought
     // the etched glass, and a swipe that opens a menu is undiscoverable), and
     // the left/right thirds of the band stay free for a screen's own chrome.
-    // The reader keeps its clean page (no status bar there to tap).
+    //
+    // The reader is on this list now. It used to be excluded because it had no
+    // status bar to tap -- its chrome was at the foot of the page. The band is
+    // at the head of the page now (BaseTheme::drawReaderTopBar), so the gesture
+    // has the same target here as everywhere else, and the one screen the user
+    // spends all their time on was the one screen it did not work on.
     bool controlCenterTap = false;
     if (mappedInput.hasTouch() &&
         (currentActivity->name == "Home" || currentActivity->name == "FileBrowser" ||
          currentActivity->name == "Settings" || currentActivity->name == "BlePairing" ||
-         currentActivity->name == "NetworkModeSelection")) {
+         currentActivity->name == "NetworkModeSelection" || currentActivity->name == "EpubReader" ||
+         currentActivity->name == "FirmwareReady")) {
       int tx = 0;
       int ty = 0;
       const int width = renderer.getScreenWidth();
-      controlCenterTap =
-          mappedInput.wasScreenTapped(tx, ty) && ty < 44 && tx >= width / 3 && tx < (width * 2) / 3;
+      // The band's own height rather than a hard-coded 44, so the target is
+      // exactly the strip the user can see.
+      controlCenterTap = mappedInput.wasScreenTapped(tx, ty) && ty < BaseTheme::readerTopBarHeight() &&
+                         tx >= width / 3 && tx < (width * 2) / 3;
     }
     if (currentActivity->name != "FrontlightPanel" && controlCenterTap) {
       pushActivity(std::make_unique<FrontlightPanelActivity>(renderer, mappedInput));
@@ -303,8 +317,10 @@ void ActivityManager::goToStore() {
 }
 #endif
 
-void ActivityManager::goToFirmwareUpdate(std::string path, const bool stagedDrop) {
-  auto activity = makeUniqueNoThrow<SdFirmwareUpdateActivity>(renderer, mappedInput, std::move(path), stagedDrop);
+void ActivityManager::goToFirmwareUpdate(std::string path, const bool stagedDrop, const bool autoConfirm,
+                                         const bool sleepAfter) {
+  auto activity = makeUniqueNoThrow<SdFirmwareUpdateActivity>(renderer, mappedInput, std::move(path), stagedDrop,
+                                                              autoConfirm, sleepAfter);
   if (!activity) {
     LOG_ERR("ACT", "OOM: firmware update activity");
     return;
@@ -346,7 +362,7 @@ void ActivityManager::goToBrowser() {
 }
 #endif
 
-void ActivityManager::goToReader(std::string path, const bool allowFastInitialRefresh) {
+void ActivityManager::goToReader(std::string path) {
   if (path.empty()) {
     goToFileBrowser("/");
     return;
@@ -362,7 +378,7 @@ void ActivityManager::goToReader(std::string path, const bool allowFastInitialRe
     return;
   }
 
-  auto activity = ReaderActivity::create(renderer, mappedInput, std::move(path), allowFastInitialRefresh);
+  auto activity = ReaderActivity::create(renderer, mappedInput, std::move(path));
   if (activity) {
     replaceActivity(std::move(activity));
   }

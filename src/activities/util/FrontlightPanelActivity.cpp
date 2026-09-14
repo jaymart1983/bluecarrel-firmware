@@ -116,6 +116,11 @@ void FrontlightPanelActivity::buildTileOrder() {
   add(TILE_SLEEP);
   add(TILE_SETTINGS);
   add(TILE_HOME);
+  // LAST, and only while a cable is attached. A tile that comes and goes has to
+  // come and go at the END of the grid: inserted anywhere else it shifts every
+  // tile after it, so plugging in a cable would silently move Sleep and Home
+  // out from under a finger that already knows where they are.
+  if (usbDriveAvailable()) add(TILE_USB_DRIVE);
 }
 
 // The sheet lays out in whatever frame it opened over, so its bands are sized
@@ -240,7 +245,15 @@ void FrontlightPanelActivity::onWarmthStepEvent(const fui::ActionEvent& event, v
 }
 
 void FrontlightPanelActivity::onTileEvent(const fui::ActionEvent& event, void* user) {
-  static_cast<FrontlightPanelActivity*>(user)->runTile(event.value);
+  auto* self = static_cast<FrontlightPanelActivity*>(user);
+  // Held on Home: refresh the screen instead of going home. With no scheduled
+  // ghost scrubs on this device, a clean full refresh is on demand -- this tile, or
+  // the Refresh tile beside it. Any other tile treats a long press as a tap.
+  if (event.longPress && event.value == TILE_HOME) {
+    self->runTile(TILE_REFRESH);
+    return;
+  }
+  self->runTile(event.value);
 }
 
 void FrontlightPanelActivity::runTile(const int id) {
@@ -281,14 +294,21 @@ void FrontlightPanelActivity::runTile(const int id) {
       // leaving — otherwise Settings or Home draws in the reader's frame.
       ReaderUtils::applyUiOrientation(renderer);
       if (id == TILE_SETTINGS) {
-        // Bluetooth pairing IS the device's settings now. Everything else is
-        // read and written from the app over the link, so a settings tree here
-        // would be a second, staler copy of it -- and the one thing the app
-        // cannot do for you is pair in the first place.
+        // On BLE builds this is the pairing and firmware page: other settings
+        // are edited from the phone app, and pairing is the one thing the app
+        // cannot do for you. Builds without BLE open the full Settings screen
+        // (see ActivityManager::goToBlePairing).
         activityManager.goToBlePairing();
       } else {
         activityManager.goHome();
       }
+      break;
+    case TILE_USB_DRIVE:
+      // Close first, then hand over from main.cpp's loop: the handover paints a
+      // full-screen notice and detaches the card, and this panel must be gone
+      // (and its own onExit run) before either happens.
+      close();
+      requestUsbDriveMode();
       break;
     case TILE_SLEEP:
       // Close first, then ask main.cpp to sleep at the top of its next loop:
@@ -299,12 +319,11 @@ void FrontlightPanelActivity::runTile(const int id) {
       requestDeviceSleep();
       break;
     case TILE_TOUCH:
-      // The MASTER touchscreen gate in MappedInputManager, which is what every
-      // tap, swipe and long-press in the firmware is read through — NOT
-      // SETTINGS.touchReaderControls, which only governs the reader's page-turn
-      // tap zones and is what this tile used to toggle (hence "toggling it did
-      // nothing"). Runtime-only and never persisted, so a reboot or a wake
-      // always brings the glass back; a power tap is the way back sooner.
+      // The master touchscreen gate in MappedInputManager, which every tap,
+      // swipe and long-press in the firmware is read through, reader page turns
+      // and link taps included (SETTINGS.touchReaderControls only picks the
+      // reader's gesture style). Runtime-only and never persisted, so a reboot or
+      // a wake always brings the glass back; a power tap is the way back sooner.
       // Switching it off from here hands the panel straight to the button
       // cursor, so the screen that owns the switch stays usable.
       MappedInputManager::setTouchInputEnabled(!MappedInputManager::isTouchInputEnabled());
@@ -362,7 +381,7 @@ bool FrontlightPanelActivity::handleHomeGesture() {
 }
 
 void FrontlightPanelActivity::loop() {
-  const auto touch = routeTouch(mappedInput, false, /*routeHeld=*/true);
+  const auto touch = routeTouch(mappedInput, /*withLongPress=*/true, /*routeHeld=*/true);
   if (touch.routed) {
     if (app.invalidated()) requestUpdate();
     if (touch) {
@@ -580,6 +599,9 @@ void FrontlightPanelActivity::buildPanelScreen(UiScreen& screen) {
         case TILE_SLEEP:
           label = tr(STR_SLEEP);
           break;
+        case TILE_USB_DRIVE:
+          label = tr(STR_USB_DRIVE_TILE);
+          break;
         case TILE_SETTINGS:
           label = tr(STR_SETTINGS_TITLE);
           break;
@@ -608,6 +630,8 @@ void FrontlightPanelActivity::buildPanelScreen(UiScreen& screen) {
     gridProps.items = gridItems;
     gridProps.count = static_cast<uint16_t>(tileCount);
     gridProps.action = ACTION_TILE;
+    // Long presses too: held on Home, the tile refreshes the screen (onTileEvent).
+    gridProps.inputMask = static_cast<uint16_t>(fui::InputTouch | fui::InputLongPress);
     gridProps.columns = tileCols;
     gridProps.tileHeight = tileHeight;
     gridProps.gap = kTileGap;

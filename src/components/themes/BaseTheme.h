@@ -274,11 +274,32 @@ class BaseTheme {
   virtual void drawButtonMenu(GfxRenderer& renderer, Rect rect, int buttonCount, int selectedIndex,
                               const std::function<std::string(int index)>& buttonLabel,
                               const std::function<UIIcon(int index)>& rowIcon,
-                              const std::function<std::string(int index)>& rowCover = nullptr) const;
+                              const std::function<std::string(int index)>& rowCover = nullptr,
+                              int rowHeightOverride = 0,
+                              const std::function<bool(int index)>& rowMarked = nullptr,
+                              const std::function<float(int index)>& rowPercent = nullptr) const;
   /// Draws a cover BMP into the box, or an empty frame when it cannot be read.
   static void drawRowCover(const GfxRenderer& renderer, const std::string& path, int x, int y, int w, int h);
   virtual Rect drawPopup(const GfxRenderer& renderer, const char* message) const;
   virtual void fillPopupProgress(const GfxRenderer& renderer, const Rect& layout, const int progress) const;
+  // --- Reader top status band -------------------------------------------------
+  // The reader's chrome, moved from the foot of the page to the head of it:
+  // time at the left, chapter and percent-of-book centred, battery at the
+  // right, and a full-width rule separating the band from the text.
+  //
+  // Deliberately NOT drawStatusBar with a flag. That function is driven by
+  // CrossPointSettings::statusBarSpec() -- clock side, progress bar mode,
+  // page-count lane, bookmark pip -- all of which are bottom-bar concepts, and
+  // threading a top mode through them would leave every combination to be
+  // reasoned about on a screen that only ever wants this one. The page count
+  // ("12/37") is gone with them: it measures the chapter, not the book, and it
+  // moves when the font size does.
+  // Gap between the status strip and the rule under it.
+  static constexpr int kReaderTopBarRuleGap = 6;
+  // Total height the reader must keep clear at the top. Metrics-derived rather
+  // than a fixed number, so the band matches the header on any theme.
+  static int readerTopBarHeight();
+  static void drawReaderTopBar(const GfxRenderer& renderer, const std::string& chapter, float bookProgressPercent);
   static void drawStatusBar(GfxRenderer& renderer, const float bookProgress, const int currentPage, const int pageCount,
                             std::string title, const int paddingBottom = 0, const int textYOffset = 0,
                             const bool fillMargin = true, const bool isPageBookmarked = false,

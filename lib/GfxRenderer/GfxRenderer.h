@@ -30,6 +30,7 @@ class GfxRenderer {
  public:
   enum RenderMode { BW, GRAYSCALE_LSB, GRAYSCALE_MSB };
 
+
   // Logical screen orientation from the perspective of callers
   enum Orientation {
     Portrait,                  // 480x800 logical coordinates (current default)
@@ -87,26 +88,61 @@ class GfxRenderer {
 
   // --- Change budget (anti-ghosting) ---------------------------------------
   // Ghosting tracks how much ink the panel has moved through DIFFERENTIAL
-  // (FAST) waveforms since the last clean one, not how many pages were turned.
-  // The reader's page cadence only counts page turns, so menus, popups and
-  // toolbars -- which push large partial updates and never touch that counter
-  // -- accumulate residue indefinitely. Every full-frame update therefore XORs
+  // (FAST) waveforms since the last clean one, not how many pages were turned,
+  // so menus, popups and toolbars count as well as page turns. Every full-frame
+  // update XORs
   // the outgoing frame against the incoming one, counts the flipped pixels and
   // adds them to changeAccumPixels_; when the running total crosses
   // changeBudgetPixels_ the update is promoted to a clean HALF waveform and the
   // total resets. Any clean waveform (however triggered) resets it too.
   // changePrevFrame_ is a snapshot of the last frame handed to the panel, one
-  // framebuffer wide (~48 KB) and PSRAM-only: boards without PSRAM keep the old
-  // page-count-only behaviour rather than spend internal DRAM on it.
+  // framebuffer wide (~48 KB) and PSRAM-only: boards without PSRAM run without a
+  // change budget rather than spend internal DRAM on it.
   mutable uint8_t* changePrevFrame_ = nullptr;
   mutable uint32_t changeAccumPixels_ = 0;
   mutable bool changePrevValid_ = false;
-  mutable bool lastRefreshWasClean_ = false;
+  // Set when the change budget decides the panel needs scrubbing. The update
+  // still goes out FAST; displayBuffer then re-drives the identical frame a few
+  // clean waveform to run once the frame is on the panel.
+  mutable bool ghostClearPending_ = false;
+  // Set when the frame ABOUT to be pushed already replaces the whole panel, so
+  // it should go out on the clean waveform itself instead of being pushed fast
+  // and then scrubbed. See noteFrameForGhosting().
+  mutable bool cleanThisFrame_ = false;
   uint32_t changeBudgetPixels_ = 0;   // 0 = mechanism off
+  // A single update this large scrubs on its own, without waiting for the
+  // running total. See kSingleFrameScrubPercent.
+  uint32_t singleFrameScrubPixels_ = 0;
   uint16_t changeBudgetPercent_ = 0;  // as configured, for the getter
   // Fold the outgoing->incoming diff into the accumulator, refresh the
   // snapshot, and return the mode the update should actually use.
-  HalDisplay::RefreshMode applyChangeBudget(HalDisplay::RefreshMode refreshMode) const;
+  // Measures how much of the panel this frame moves and decides whether a scrub
+  // is due. Decision only -- it changes no waveform and pushes nothing.
+  void noteFrameForGhosting(HalDisplay::RefreshMode refreshMode) const;
+  // Acts on that decision: scrubs the panel with a clean waveform.
+  void runPendingGhostClear() const;
+  // Records that something has just re-driven every pixel by other means, so
+  // there is no residue left to scrub and any scheduled scrub is moot.
+  void notePanelFullyDriven() const;
+
+ public:
+  // NOTE: the scrub is a clean (HALF) waveform, not a repeat of the frame.
+  // Re-driving the same frame with the fast waveform was tried and does not
+  // clear residue on this panel -- see runPendingGhostClear().
+
+  // Share of the panel that, changed in ONE update, earns an immediate scrub.
+  //
+  // The running total is the right measure for reading, where each page turn
+  // deposits a little residue and it is the sum that matters. It is the wrong
+  // measure for a screen change: leaving a book for the library repaints
+  // essentially everything at once, deposits all of that ghosting in a single
+  // frame, and then the library sits still -- so nothing further accumulates
+  // and the residue stays on screen until the user happens to do enough
+  // elsewhere to spend the budget. Which is exactly what "no anti-ghosting
+  // going home from a book, but paging down and up cleared it" describes.
+  static constexpr uint16_t kSingleFrameScrubPercent = 25;
+
+ private:
   // Word-wise XOR + popcount of frameBuffer against changePrevFrame_, updating
   // the snapshot in the same pass. Returns the number of flipped pixels.
   uint32_t diffAndSnapshotFrame() const;
@@ -259,11 +295,6 @@ class GfxRenderer {
   uint16_t getChangeBudgetPercent() const { return changeBudgetPercent_; }
   // Change accumulated since the last clean refresh, in percent of the panel.
   uint16_t changeAccumulatedPercent() const;
-  // True when the update just pushed used a clean (non-FAST) waveform -- either
-  // because the caller asked for one or because the change budget promoted it.
-  // Lets a page-cadence counter restart instead of scheduling a second scrub
-  // right behind the one that already happened.
-  bool lastRefreshWasClean() const { return lastRefreshWasClean_; }
   // Forget the accumulated change (the panel was cleaned behind our back).
   void resetChangeBudget() const {
     changeAccumPixels_ = 0;

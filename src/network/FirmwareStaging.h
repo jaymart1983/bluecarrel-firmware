@@ -19,13 +19,11 @@
 // copy, a half-finished BLE upload, a card that went bad. It proves NOTHING
 // about who wrote it. Anyone who can write firmware.bin can write
 // firmware.bin.sha256 in the same breath, so this is an INTEGRITY check, not an
-// authenticity check, and it is not a signature. That is an accepted trade for a
-// personal device whose SD card is already writable by anyone holding it and
-// whose USB port is already total control; it is written down here so it is a
-// decision on the record rather than a guarantee anyone inferred. The checks
-// that actually stop a bad image bricking the reader are
-// firmware_flash::validateImageFile() and the on-device confirmation prompt,
-// and neither of those is weakened by any of this.
+// authenticity check, and it is not a signature. That is an accepted trade on a
+// device whose SD card is already writable by anyone holding it and whose USB
+// port already gives full control. The checks that actually stop a bad image
+// bricking the reader are firmware_flash::validateImageFile() and the on-device
+// confirmation prompt, and neither of those is weakened by any of this.
 namespace firmware_staging {
 
 constexpr const char* DIR = "/firmware";
@@ -36,6 +34,9 @@ constexpr const char* HASH_PATH = "/firmware/firmware.bin.sha256";
 // so a half-finished push is not mistaken for a staged image by anything that
 // merely lists the folder.
 constexpr const char* PART_PATH = "/firmware/.firmware.bin.part";
+// The build stamp the app sent with the image, for the update screens. Optional:
+// an image dropped by hand has none, and nothing depends on it being there.
+constexpr const char* VERSION_PATH = "/firmware/firmware.bin.version";
 
 // True when both the image and its companion hash file are present.
 bool imageStaged();
@@ -50,9 +51,17 @@ bool readExpectedHash(std::string& outHex);
 // companion file itself rather than making the app send a second one.
 bool writeExpectedHash(const std::string& hex);
 
-// Remove the staged image and its companion after a flash (or a rejection), so
-// the next boot does not offer the same update again forever. Missing files are
-// not an error.
+// Reads the build stamp at VERSION_PATH into `out`, trailing whitespace trimmed.
+// Returns false (leaving `out` empty) when there is none.
+bool readVersion(std::string& out);
+
+// Writes `version` to VERSION_PATH. Returns false for an empty stamp or a failed
+// write.
+bool writeVersion(const std::string& version);
+
+// Remove the staged image, its companion hash, any partial upload and the build
+// stamp after a flash (or a rejection), so the next boot does not offer the same
+// update again forever. Missing files are not an error.
 void clearStaged();
 
 }  // namespace firmware_staging

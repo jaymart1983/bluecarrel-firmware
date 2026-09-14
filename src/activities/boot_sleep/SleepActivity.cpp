@@ -14,6 +14,8 @@
 #include <Txt.h>
 #include <Xtc.h>
 
+#include "HomeShelfStore.h"
+
 #include <algorithm>
 #include <cmath>
 #include <cstdint>
@@ -622,16 +624,46 @@ void SleepActivity::renderBitmapSleepScreen(const Bitmap& bitmap, const bool pre
   LOG_DBG("SLP", "drawing to %d x %d", x, y);
   if (!preserveBackground) renderer.clearScreen();
 
+  // The grayscale pass stays. Measured the alternatives on the panel and both
+  // were worse:
+  //
+  //   4 grey levels (this)      the two-stage draw is visible -- the base frame
+  //                             appears, then the gray nudge lands on top and
+  //                             the picture shifts and loses contrast
+  //   1-bit, crushed            drawBitmap's BW reduction is `val < 3 -> black`,
+  //                             so three of a 2-bit cover's four levels go solid
+  //                             and it becomes a muddy silhouette
+  //   1-bit, dithered           the period-2 dither patterns read as screen-door
+  //                             texture over the large flat areas of a
+  //                             full-screen cover
+  //
+  // The visible two-stage draw is inherent: this panel cannot fold the B/W base
+  // into the grayscale waveform (combinesGrayscaleBase() is false for every
+  // driver but Paper Mono), so the base MUST be shown before the nudge. Given
+  // that, four real levels beat one bit at full-screen size -- the opposite of
+  // the small library thumbnails, where there are too few pixels per tone for
+  // grey to survive and dither wins.
+  //
+  // `sleepScreenCoverFilter` chooses: NO_FILTER keeps the grey, and the
+  // black-and-white settings take the 1-bit path deliberately.
   const bool hasGreyscale =
       bitmap.hasGreyscale() && (preserveBackground || SETTINGS.sleepScreenCoverFilter ==
                                                           CrossPointSettings::SLEEP_SCREEN_COVER_FILTER::NO_FILTER);
 
   renderer.drawBitmap(bitmap, x, y, pageWidth, pageHeight, cropX, cropY);
 
-  if (!preserveBackground &&
-      SETTINGS.sleepScreenCoverFilter == CrossPointSettings::SLEEP_SCREEN_COVER_FILTER::INVERTED_BLACK_AND_WHITE) {
-    renderer.invertScreen();
-  }
+  // A COVER is never inverted, whatever the filter says.
+  //
+  // Cover art is authored for a white page: light ground, dark ink, and a
+  // tonal range chosen against that. Flipping it turns the paper black and the
+  // artwork into a negative, and on a 1-bit panel the result is not "the same
+  // picture, darker" -- it is an image whose every relationship has been
+  // reversed, which reads as damage rather than as a style.
+  //
+  // The inverted option stays available for the LOGO sleep screens below,
+  // which are chrome this firmware draws and can therefore be drawn either way
+  // round deliberately.
+  (void)preserveBackground;
 
   if (hasGreyscale) {
     // OEM grayscale pipeline base. Must stay HALF: the gray nudge LUT is
@@ -747,6 +779,75 @@ void SleepActivity::renderTransparentCustomSleepScreen() const {
   renderDefaultSleepScreen();
 }
 
+// A wall of covers, for a device whose books have all gone unopened.
+//
+// Draws the LIBRARY LIST's thumbnails (/.crosspoint/bookmeta/<file>.bmp, 1-bit,
+// already on the card because the Library drew them), not the full cover
+// pipeline: no JPEG decode, no dither, no cover cache -- a dozen small blits.
+// That matters on the way into sleep, where the work is paid for out of the
+// user's patience.
+//
+// Returns false if it cannot fill the grid, so the caller can fall back rather
+// than sleep on a half-drawn screen.
+bool SleepActivity::renderThumbnailGridSleepScreen(const std::vector<HomeShelfBook>& books) const {
+  const int screenW = renderer.getScreenWidth();
+  const int screenH = renderer.getScreenHeight();
+
+  // Fixed 3 columns. The thumbnails are 88x132, so three across with gutters
+  // sits comfortably inside 480 and leaves each one drawn near native size --
+  // scaling a 1-bit dithered thumbnail up is what makes it look like a fax.
+  constexpr int COLS = 3;
+  constexpr int GAP = 12;
+  const int cellW = (screenW - GAP * (COLS + 1)) / COLS;
+  const int cellH = (cellW * 3) / 2;  // covers are ~2:3
+  const int rows = (screenH - GAP) / (cellH + GAP);
+  if (rows < 1) return false;
+
+  const size_t capacity = static_cast<size_t>(rows) * COLS;
+  const size_t count = books.size() < capacity ? books.size() : capacity;
+  if (count < 2) return false;
+
+  // Centre the block that is actually filled, so four books do not sit in the
+  // top-left corner of an empty screen.
+  const int usedRows = static_cast<int>((count + COLS - 1) / COLS);
+  const int blockH = usedRows * cellH + (usedRows - 1) * GAP;
+  const int originY = (screenH - blockH) / 2;
+
+  renderer.clearScreen();
+
+  size_t drawn = 0;
+  for (size_t i = 0; i < count; i++) {
+    const std::string& path = books[i].path;
+    const auto slash = path.find_last_of('/');
+    const std::string filename = slash == std::string::npos ? path : path.substr(slash + 1);
+    const std::string thumb = std::string("/.crosspoint/bookmeta/") + filename + ".bmp";
+
+    HalFile file;
+    if (!Storage.openFileForRead("SLP", thumb, file)) continue;
+    Bitmap bitmap(file);
+    if (bitmap.parseHeaders() != BmpReaderError::Ok) {
+      file.close();
+      continue;
+    }
+
+    const int col = static_cast<int>(i % COLS);
+    const int row = static_cast<int>(i / COLS);
+    const int x = GAP + col * (cellW + GAP);
+    const int y = originY + row * (cellH + GAP);
+    renderer.drawBitmap1Bit(bitmap, x, y, cellW, cellH);
+    file.close();
+    drawn++;
+  }
+
+  // Nothing came back: the thumbnails have not been generated yet (the Library
+  // makes them on its first visit). Let the caller draw something else.
+  if (drawn < 2) return false;
+
+  LOG_DBG("SLP", "Sleep grid: %d of %d thumbnails", static_cast<int>(drawn), static_cast<int>(count));
+  renderer.displayBuffer(HalDisplay::HALF_REFRESH);
+  return true;
+}
+
 void SleepActivity::renderCoverSleepScreen() const {
   void (SleepActivity::*renderNoCoverSleepScreen)() const;
   switch (SETTINGS.sleepScreen) {
@@ -758,7 +859,50 @@ void SleepActivity::renderCoverSleepScreen() const {
       break;
   }
 
-  if (APP_STATE.openEpubPath.empty()) {
+  // Nothing open yet? Fall back to the top of the shelf.
+  //
+  // The sleep screen used to give up entirely when no book had been opened, so
+  // a device with a freshly transferred library slept on the generic screen and
+  // looked like it had received nothing. The Library's first row is the right
+  // answer to "which book is this device about": HomeShelfStore orders
+  // in-progress books first (most recently read first) and never-opened books
+  // after them (most recently added first), so the first entry is the book
+  // being read, or -- before anything has been read -- the newest arrival.
+  //
+  // Read from the persisted shelf rather than rebuilt: HomeActivity writes this
+  // file, and walking the card to re-derive it is not work to do on the way
+  // into sleep.
+  // The shelf decides, not the last book opened.
+  //
+  // HomeShelfStore orders in-progress books first (most recently read first),
+  // then never-opened ones (most recently added first), so its first entry is
+  // already the answer to "what is this device about right now". Preferring
+  // APP_STATE.openEpubPath instead meant a book finished weeks ago kept the
+  // sleep screen while newly added books never showed at all.
+  HomeShelfStore& shelf = HomeShelfStore::getInstance();
+  if (!shelf.isValid()) shelf.loadFromFile();
+  // Re-sort before trusting the order. The shelf is only re-sorted on a visit
+  // to Home, so opening the second book and sleeping straight from the reader
+  // left the FIRST book on top and put its cover on the sleep screen. The book
+  // just opened has already written its progress sidecar (saved on first
+  // render), so re-reading the read times moves it to the front. Cheap: one
+  // small sidecar per entry, no book is opened.
+  if (shelf.refreshReadTimes()) shelf.saveToFile();
+  const std::vector<HomeShelfBook>& shelfBooks = shelf.getBooks();
+
+  // Nothing started yet: show the library rather than one arbitrary spine.
+  // Picking a single cover from a pile of books nobody has opened is a guess;
+  // a grid of every book is the honest answer and is a better first impression
+  // of a device that has just been filled.
+  const bool anyInProgress =
+      std::any_of(shelfBooks.begin(), shelfBooks.end(), [](const HomeShelfBook& b) { return b.inProgress; });
+  if (!anyInProgress && shelfBooks.size() > 1 && renderThumbnailGridSleepScreen(shelfBooks)) {
+    return;
+  }
+
+  std::string bookPath = shelfBooks.empty() ? APP_STATE.openEpubPath : shelfBooks.front().path;
+
+  if (bookPath.empty()) {
     return (this->*renderNoCoverSleepScreen)();
   }
 
@@ -766,9 +910,9 @@ void SleepActivity::renderCoverSleepScreen() const {
   bool cropped = SETTINGS.sleepScreenCoverMode == CrossPointSettings::SLEEP_SCREEN_COVER_MODE::CROP;
 
   // Check if the current book is XTC, TXT, or EPUB
-  if (FsHelpers::hasXtcExtension(APP_STATE.openEpubPath)) {
+  if (FsHelpers::hasXtcExtension(bookPath)) {
     // Handle XTC file
-    Xtc lastXtc(APP_STATE.openEpubPath, "/.crosspoint");
+    Xtc lastXtc(bookPath, "/.crosspoint");
     if (!lastXtc.load()) {
       LOG_ERR("SLP", "Failed to load last XTC");
       return (this->*renderNoCoverSleepScreen)();
@@ -780,9 +924,9 @@ void SleepActivity::renderCoverSleepScreen() const {
     }
 
     coverBmpPath = lastXtc.getCoverBmpPath();
-  } else if (FsHelpers::hasTxtExtension(APP_STATE.openEpubPath)) {
+  } else if (FsHelpers::hasTxtExtension(bookPath)) {
     // Handle TXT file - looks for cover image in the same folder
-    Txt lastTxt(APP_STATE.openEpubPath, "/.crosspoint");
+    Txt lastTxt(bookPath, "/.crosspoint");
     if (!lastTxt.load()) {
       LOG_ERR("SLP", "Failed to load last TXT");
       return (this->*renderNoCoverSleepScreen)();
@@ -794,21 +938,39 @@ void SleepActivity::renderCoverSleepScreen() const {
     }
 
     coverBmpPath = lastTxt.getCoverBmpPath();
-  } else if (FsHelpers::hasEpubExtension(APP_STATE.openEpubPath)) {
+  } else if (FsHelpers::hasEpubExtension(bookPath)) {
     // Handle EPUB file
-    Epub lastEpub(APP_STATE.openEpubPath, "/.crosspoint");
+    Epub lastEpub(bookPath, "/.crosspoint");
     // Skip loading css since we only need metadata here
     if (!lastEpub.load(true, true)) {
       LOG_ERR("SLP", "Failed to load last epub");
       return (this->*renderNoCoverSleepScreen)();
     }
 
-    if (!lastEpub.generateCoverBmp(cropped)) {
+    // The cover filter now chooses the BIT DEPTH the cover is built at, not
+    // just how an already-2-bit image is rendered.
+    //
+    //   None (default)        2-bit, four grey levels through the OEM
+    //                         grayscale pipeline. Best for simple, high
+    //                         contrast art.
+    //   Black and white       1-bit, Atkinson-dithered from the ORIGINAL image
+    //                         at final size. Better for a dark, finely detailed
+    //                         cover, where four levels band and muddy: dither
+    //                         spends spatial resolution, which a full-screen
+    //                         cover has to spare, to buy tonal resolution.
+    //
+    // Dithering from the original at final size matters. Rendering an existing
+    // 2-bit BMP down to one bit quantises twice and throws away most of what
+    // little tone survived the first pass.
+    const bool oneBitCover =
+        SETTINGS.sleepScreenCoverFilter != CrossPointSettings::SLEEP_SCREEN_COVER_FILTER::NO_FILTER;
+
+    if (!lastEpub.generateCoverBmp(cropped, oneBitCover)) {
       LOG_ERR("SLP", "Failed to generate cover bmp");
       return (this->*renderNoCoverSleepScreen)();
     }
 
-    coverBmpPath = lastEpub.getCoverBmpPath(cropped);
+    coverBmpPath = lastEpub.getCoverBmpPath(cropped, oneBitCover);
   } else {
     return (this->*renderNoCoverSleepScreen)();
   }

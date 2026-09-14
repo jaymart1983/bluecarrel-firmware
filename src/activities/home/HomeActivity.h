@@ -91,6 +91,12 @@ mutable int rowsPerPage = 1;
   mutable int pagerSplitX = 0;
   int pageCount() const;
   void goToPage(int index);
+  // Index into homeBooks of this page's first row. selectorIndex is relative to
+  // the page, so every conversion to a shelf index goes through here.
+  int firstVisibleBook() const;
+  // Moves the selector one row, spilling onto the next/previous page at the
+  // ends instead of wrapping inside the page.
+  void moveSelection(int delta);
 
   void onSelectBook(const std::string& path);
   void onStoreOpen();

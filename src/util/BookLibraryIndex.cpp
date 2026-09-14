@@ -26,6 +26,17 @@ namespace {
 
 constexpr const char* TAG = "BLIB";
 constexpr const char* CACHE_ROOT = "/.crosspoint";
+// Where the phone drops a book's cover + title when it sends one. Kept in step
+// with BleLink.cpp's BOOK_META_DIR by hand: two constants, one path, and a
+// mismatch would silently report every book as side-loaded.
+constexpr const char* BOOK_META_DIR = "/.crosspoint/bookmeta";
+
+// The sidecars are keyed by bare filename, so a book in a subdirectory has to
+// be reduced to its last path component before it can be looked up.
+std::string fileNameOf(const std::string& relPath) {
+  const auto slash = relPath.find_last_of('/');
+  return slash == std::string::npos ? relPath : relPath.substr(slash + 1);
+}
 // SdFat long names are up to 255 characters, which UTF-8 can widen well past 256
 // bytes; a truncated name would list the wrong file, so keep the same headroom
 // NextBookFinder uses.
@@ -115,6 +126,53 @@ BookInfo describeBook(const std::string& path, const std::string& fileName) {
     info.hasTimestamp = ProgressFile::readSavedTime(cachePath, info.timestamp);
   }
 
+  // FAST PATH: nothing opened but two small files.
+  //
+  // The listing is built on the main loop -- the same pass that reads the
+  // buttons and turns pages -- and the app asks for one on every reconnect.
+  // Epub::load() per book (the whole spine/TOC metadata cache, plus a spine
+  // walk for the percentage) is what froze page turns for tens of seconds when
+  // the phone reconnected in the background. Every book the phone sent has its
+  // title and author in the BOOK_META_DIR sidecar, and every save since
+  // progress.time v2 records the reader's own percentage, so for those books
+  // neither needs the EPUB at all. Missing either, fall through to the full
+  // path below exactly as before.
+  if (FsHelpers::hasEpubExtension(fileName)) {
+    std::string metaTitle;
+    std::string metaAuthor;
+    {
+      const std::string metaPath = std::string(BOOK_META_DIR) + "/" + fileName + ".json";
+      HalFile meta;
+      if (Storage.openFileForRead(TAG, metaPath, meta)) {
+        JsonDocument doc;
+        if (deserializeJson(doc, meta) == DeserializationError::Ok) {
+          metaTitle = doc["title"] | "";
+          metaAuthor = doc["author"] | "";
+        }
+        meta.close();
+      }
+    }
+    // No saved position means 0%, which needs no derivation either.
+    bool haveSavedPercent = !hasLocation;
+    float savedPercent = 0.0f;
+    if (hasLocation) {
+      uint32_t savedEpoch = 0;
+      uint16_t percentBp = 0;
+      bool hasPercent = false;
+      if (ProgressFile::readSidecar(cachePath, savedEpoch, percentBp, hasPercent) && hasPercent) {
+        savedPercent = static_cast<float>(percentBp) / 10000.0f;
+        haveSavedPercent = true;
+      }
+    }
+    if (!metaTitle.empty() && haveSavedPercent) {
+      info.title = metaTitle;
+      info.author = metaAuthor;
+      info.fromMetadataCache = true;
+      info.percent = std::clamp(savedPercent, 0.0f, 1.0f);
+      return info;
+    }
+  }
+
   if (FsHelpers::hasEpubExtension(fileName)) {
     // The per-book metadata cache is the only affordable source of title/author:
     // buildIfMissing = false means an unopened book yields blanks rather than a
@@ -155,6 +213,24 @@ BookInfo describeBook(const std::string& path, const std::string& fileName) {
   // they list with the filename as title and percent 0 -- but `location` and
   // `timestamp` above are still exact, which is precisely why syncing on the
   // stored position rather than a percentage covers these books at all.
+
+  // Fall back to the percentage the reader stored beside the position.
+  //
+  // The percentage above can only be DERIVED from the book's metadata cache,
+  // which is loaded with buildIfMissing = false. A book that has just been
+  // replaced by a Calibre update has no book.bin yet -- the upload clears it,
+  // correctly, since the old one describes the old file -- so derivation fails
+  // and the library showed a blank percentage for a book whose position was
+  // intact. progress.time (v2) records the reader's own figure when it saved,
+  // and it travels with the position across the replacement.
+  if (info.percent <= 0.0f && hasLocation) {
+    uint32_t savedEpoch = 0;
+    uint16_t percentBp = 0;
+    bool hasPercent = false;
+    if (ProgressFile::readSidecar(cachePath, savedEpoch, percentBp, hasPercent) && hasPercent) {
+      info.percent = static_cast<float>(percentBp) / 10000.0f;
+    }
+  }
 
   if (info.title.empty()) {
     // Never omit a book because its metadata is missing: the filename is always
@@ -233,6 +309,21 @@ bool writeEntry(HalFile& out, bool& first, const std::string& relPath, const uin
   // the device had no clock. An absent `timestamp` means "unknown", which the
   // conflict rule treats as older than any real one.
   if (info.hasTimestamp) doc["timestamp"] = info.timestamp;
+  // Did this book arrive from the phone, or was it copied onto the card?
+  //
+  // The phone writes a metadata sidecar (cover + title) beside every book it
+  // sends; a book dropped on over USB Drive has none. So the sidecar's presence
+  // IS the provenance, with no new bookkeeping to keep in step.
+  //
+  // It matters for progress sync. A book from the phone has a Calibre original
+  // behind it, so its reading position belongs on the server where every other
+  // client can see it. A side-loaded book has no counterpart there -- its
+  // position is local, and publishing it would create a row keyed to a file
+  // nothing else will ever hold.
+  {
+    const std::string metaPath = std::string(BOOK_META_DIR) + "/" + fileNameOf(relPath) + ".json";
+    doc["fromApp"] = Storage.exists(metaPath.c_str());
+  }
   // "lastRead" is still deliberately absent. It was specified as optional and
   // vague ("when was this book last read"); `timestamp` answers the precise
   // question the sync path asks -- when the position in `location` was written --

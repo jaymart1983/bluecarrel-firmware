@@ -11,14 +11,13 @@
 class ReaderActivity : public Activity {
  protected:
   std::string bookPath;
-  int pagesUntilFullRefresh = 0;
   bool forcedRefreshPending = false;
 
   std::unique_ptr<EndOfBookOptions> endOfBookOptions;
   std::atomic<bool> endOfBookOptionsReady{false};
 
   explicit ReaderActivity(const char* name, GfxRenderer& renderer, MappedInputManager& mappedInput,
-                          std::string bookPath, bool allowFastInitialRefresh);
+                          std::string bookPath);
 
   virtual bool loadBook() = 0;
   virtual std::string getBookTitle() const = 0;
@@ -41,13 +40,12 @@ class ReaderActivity : public Activity {
   bool handleEndOfBookMenu(bool suppressConfirmRelease = false);
   bool handleEndOfBookPageTurn(bool prevTriggered, bool nextTriggered);
   void clearEndOfBookOptionsIfNeeded();
-  void disableFastInitialRefresh();
 
  public:
   ~ReaderActivity() override = default;
 
   static std::unique_ptr<ReaderActivity> create(GfxRenderer& renderer, MappedInputManager& mappedInput,
-                                                std::string path, bool allowFastInitialRefresh);
+                                                std::string path);
 
   void onEnter() override;
   void onExit() override;

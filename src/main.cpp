@@ -32,6 +32,7 @@
 #include "MappedInputManager.h"
 #include "RecentBooksStore.h"
 #include "SdCardFontSystem.h"
+#include "activities/settings/FirmwareReadyActivity.h"
 #include "activities/Activity.h"
 #include "activities/ActivityManager.h"
 #include "activities/settings/SdFirmwareUpdateActivity.h"
@@ -139,6 +140,7 @@ RTC_NOINIT_ATTR uint32_t silentRebootTarget;
 constexpr uint32_t SILENT_REBOOT_MAGIC = 0xC1EAB007;
 constexpr uint32_t SILENT_REBOOT_TARGET_HOME = 0;
 constexpr uint32_t SILENT_REBOOT_TARGET_READER = 1;
+constexpr uint32_t SILENT_REBOOT_TARGET_SLEEP = 2;
 
 // How the device is coming back to life, resolved once at boot. Both resume
 // flows suppress the splash and leave the panel holding its pre-boot frame; a
@@ -156,6 +158,15 @@ enum class BootResume : uint8_t {
 // device back up against the user's sleep gesture. Never cleared:
 // startDeepSleep() does not return, so a set latch only ends at the wakeup reset.
 static bool deepSleepInProgress = false;
+// setup() came up from an update installed on the way to sleep and must go
+// straight back to sleep (SILENT_REBOOT_TARGET_SLEEP).
+bool sleepAfterUpdateBoot = false;
+// Set when enterDeepSleep() hands over to an install instead of sleeping. Every
+// sleep path runs again on the next loop, before the activity manager has even
+// entered the update screen, so sleep is held off while it gets going. Bounded,
+// so an image that fails validation cannot keep the reader awake for good.
+unsigned long installAtSleepStartedMs = 0;
+constexpr unsigned long INSTALL_AT_SLEEP_GRACE_MS = 3UL * 60UL * 1000UL;
 
 #if FREEINK_CAP_NETWORK && FREEINK_CAP_TOUCH
 static bool finishWifiSessionWithoutRestart() {
@@ -203,6 +214,14 @@ void silentRestartToReader() {
   ESP.restart();
 }
 
+void restartToSleepAfterUpdate() {
+  silentRebootTarget = SILENT_REBOOT_TARGET_SLEEP;
+  silentRebootMagic = SILENT_REBOOT_MAGIC;
+  LOG_INF("MAIN", "Restart after update (target=sleep)");
+  delay(50);
+  ESP.restart();
+}
+
 void restartToHomeAfterStorageHandoff() {
   if (deepSleepInProgress) return;  // sleeping supersedes the storage handoff reboot
   silentRebootTarget = SILENT_REBOOT_TARGET_HOME;
@@ -229,9 +248,9 @@ static void toggleFrontlightAndPersist() {
 // (see CrossPointSettings::usesPowerGestures). One button, three gestures, the
 // same everywhere including the reader page:
 //
-//   tap          the configured short-click action, Control Centre by default
+//   tap          the configured short-click action: toggles the Control Centre by default
 //   double tap   frontlight on/off
-//   hold ~600 ms close the control centre, fired WHILE THE BUTTON IS DOWN
+//   hold ~600 ms sleep, fired WHILE THE BUTTON IS DOWN
 //
 // THE PARKED TAP. The double tap is back, so a tap can no longer be dispatched
 // on its own release: it might be the first half of one. It is parked at the
@@ -274,6 +293,8 @@ static void toggleFrontlightAndPersist() {
 // so the band only ever swallows genuinely ambiguous 350-600 ms presses.
 //
 // Returns true when the frame is fully consumed.
+void requestDeviceSleep();  // defined below; the hold asks for sleep
+
 static bool handlePowerGestures() {
   if (!CrossPointSettings::usesPowerGestures()) return false;
 
@@ -314,12 +335,18 @@ static bool handlePowerGestures() {
   // has not opened yet -- the old release-edge decoder could not reach this case
   // because the wake release returns before the decoder ever runs.
   if (!holdFired && !wakePowerReleasePending && gpio.isPressed(HalGPIO::BTN_POWER) &&
+      !gpio.isPressed(HalGPIO::BTN_DOWN) &&  // power + Down is the screenshot combination
       gpio.getPowerButtonHeldTime() >= CrossPointSettings::POWER_MENU_HOLD_MS) {
     holdFired = true;
     // A hold supersedes a tap still parked from the press before it.
     parkedTapAt = 0;
-    mappedInputManager.setPowerCloseFrame(true);
-    return false;  // fall through so the panel sees the close on this frame
+    // The hold is Sleep. It used to close the control centre; a tap toggles the
+    // centre now (ActivityManager), which frees the hold for what a power button
+    // is expected to do when held. Requested rather than slept on the spot so the
+    // sleep runs from its normal place at the top of the next loop.
+    LOG_DBG("MAIN", "Power button held %lums, sleeping", gpio.getPowerButtonHeldTime());
+    requestDeviceSleep();
+    return true;
   }
 
   if (parkedTapAt != 0 && millis() - parkedTapAt > CrossPointSettings::POWER_DOUBLE_TAP_MS) {
@@ -333,6 +360,70 @@ static bool handlePowerGestures() {
 
 // Requested by the control centre's Sleep tile (see DeviceSleep.h).
 void requestDeviceSleep() { deviceSleepRequested = true; }
+
+// The screen the reader wears for as long as the host holds the card.
+//
+// Full screen, not a popup: this is the device's whole state, not a message
+// about it, and there is nothing underneath worth showing through. Drawn while
+// the filesystem is STILL ATTACHED -- see the call site -- because every glyph
+// here comes off the SD card.
+static void drawUsbDriveNotice() {
+  const int screenWidth = renderer.getScreenWidth();
+  const int screenHeight = renderer.getScreenHeight();
+  renderer.clearScreen();
+
+  const int titleLine = renderer.getLineHeight(UI_12_FONT_ID);
+  const int bodyLine = renderer.getLineHeight(UI_10_FONT_ID);
+  const int sideInset = 40;
+  const int maxWidth = screenWidth - sideInset * 2;
+
+  // Measured before anything is drawn so the whole block can be centred as one.
+  const auto bodyLines = renderer.wrappedText(UI_10_FONT_ID, tr(STR_USB_DRIVE_MODE_BODY), maxWidth, 8);
+  const auto exitLines = renderer.wrappedText(SMALL_FONT_ID, tr(STR_USB_DRIVE_MODE_EXIT), maxWidth, 4);
+  const int smallLine = renderer.getLineHeight(SMALL_FONT_ID);
+  const int blockHeight = titleLine + 24 + static_cast<int>(bodyLines.size()) * bodyLine;
+  int y = (screenHeight - blockHeight) / 2 - 40;
+  if (y < 60) y = 60;
+
+  renderer.drawCenteredText(UI_12_FONT_ID, y, tr(STR_USB_DRIVE_MODE_TITLE), true, EpdFontFamily::BOLD);
+  y += titleLine + 10;
+  renderer.drawLine(screenWidth / 2 - 60, y, screenWidth / 2 + 60, y, true);
+  y += 14;
+  for (const auto& line : bodyLines) {
+    renderer.drawCenteredText(UI_10_FONT_ID, y, line.c_str());
+    y += bodyLine;
+  }
+
+  // The way out, pinned to the bottom where a hint band would be. This is the
+  // only instruction that still matters once the card is gone.
+  int exitY = screenHeight - 40 - static_cast<int>(exitLines.size()) * smallLine;
+  for (const auto& line : exitLines) {
+    renderer.drawCenteredText(SMALL_FONT_ID, exitY, line.c_str());
+    exitY += smallLine;
+  }
+
+  // Push it. Drawing only fills the framebuffer -- without this the notice was
+  // composed and then never sent to the panel, and the repaint that followed
+  // put the previous screen back over it.
+  //
+  // FULL_REFRESH, the one place that still asks for the clean waveform: this
+  // frame is going to sit on the glass for minutes with the card detached and
+  // nothing able to redraw it, so it is worth one flash to put it up without
+  // any ghost of the screen underneath.
+  renderer.displayBuffer(HalDisplay::FULL_REFRESH);
+}
+
+// Requested by the control centre's USB Drive tile (see DeviceSleep.h).
+static bool usbDriveRequested = false;
+void requestUsbDriveMode() { usbDriveRequested = true; }
+
+bool usbDriveAvailable() {
+#if FREEINK_CAP_USB_MSC
+  return gpio.isUsbConnected();
+#else
+  return false;
+#endif
+}
 
 constexpr char SLEEP_FRAME_FILE[] = "/.crosspoint/sleep_frame.bin";
 
@@ -359,8 +450,24 @@ static bool loadSleepFrameBuffer() {
 
 // Enter deep sleep mode
 void enterDeepSleep(const bool fromTimeout) {
+  if (installAtSleepStartedMs != 0 && millis() - installAtSleepStartedMs < INSTALL_AT_SLEEP_GRACE_MS) return;
+  // "Later" on the update prompt, or auto-install: the reader is being put down,
+  // the one moment an install interrupts nobody. Install, reboot, and the reboot
+  // comes straight back here (SILENT_REBOOT_TARGET_SLEEP).
+  if (!sleepAfterUpdateBoot && FIRMWARE_WATCHER.installAtSleep()) {
+    FIRMWARE_WATCHER.clearDeferral();
+    APP_STATE.lastSleepFromReader = activityManager.isReaderActivity();
+    APP_STATE.saveToFile();
+    installAtSleepStartedMs = std::max(1UL, millis());
+    LOG_INF("SLP", "Installing the deferred firmware update before sleeping");
+    activityManager.goToFirmwareUpdate(firmware_staging::IMAGE_PATH, /*stagedDrop=*/true, /*autoConfirm=*/true,
+                                       /*sleepAfter=*/true);
+    return;
+  }
   HalPowerManager::Lock powerLock;  // Ensure we are at normal CPU frequency for sleep preparation
-  APP_STATE.lastSleepFromReader = activityManager.isReaderActivity();
+  // Kept from before the install on the post-update boot, or waking would land
+  // on Home instead of the book the reader was put down in.
+  if (!sleepAfterUpdateBoot) APP_STATE.lastSleepFromReader = activityManager.isReaderActivity();
 
   const bool isQuickResumeSleep =
       SETTINGS.sleepScreen == CrossPointSettings::SLEEP_SCREEN_MODE::QUICK_RESUME ||
@@ -394,6 +501,13 @@ void enterDeepSleep(const bool fromTimeout) {
 #endif
 
 #if FREEINK_CAP_BLE_TRANSFER
+  // Say goodnight before the radio goes down. The reader is a peripheral, so a
+  // phone that is not told cannot distinguish "asleep" from "out of range" or
+  // "crashed" -- it only ever sees the link drop. One notification turns that
+  // ambiguity into a fact and makes the app's last-known state trustworthy
+  // rather than merely stale.
+  BLE_LINK.notifySleeping();
+
   // Before the SD card goes: end() writes nothing, but it does close files and it
   // must not be racing a mount teardown. Deep sleep would otherwise hold the
   // modem power domain alive for a device nobody is using.
@@ -484,7 +598,7 @@ void setup() {
   // Bound the target range too — RTC_NOINIT memory is uninitialized on cold boot.
   const bool isSilentReboot = (silentRebootMagic == SILENT_REBOOT_MAGIC);
   const uint32_t snapshotTarget =
-      (isSilentReboot && silentRebootTarget <= SILENT_REBOOT_TARGET_READER) ? silentRebootTarget : 0;
+      (isSilentReboot && silentRebootTarget <= SILENT_REBOOT_TARGET_SLEEP) ? silentRebootTarget : 0;
   silentRebootMagic = 0;
   silentRebootTarget = 0;
 
@@ -602,7 +716,6 @@ void setup() {
   const BootResume resume = isSilentReboot         ? BootResume::Silent
                             : isPersistedSleepWake ? BootResume::SplashlessWake
                                                    : BootResume::Splash;
-  bool allowFastInitialReaderRefresh = false;
   bool needsWakeRefresh = false;
 
   setupDisplayAndFonts(resume != BootResume::Splash);
@@ -630,7 +743,6 @@ void setup() {
         renderer.drawImage(LoadingIcon, 0, pageHeight - LOADINGICON_HEIGHT, LOADINGICON_WIDTH, LOADINGICON_HEIGHT);
         if (useDifferentialRefresh) {
           renderer.displayGrayscaleBase(HalDisplay::FAST_REFRESH);
-          allowFastInitialReaderRefresh = true;
         } else {
           renderer.displayBuffer(HalDisplay::HALF_REFRESH);
         }
@@ -655,6 +767,12 @@ void setup() {
   } else if (rebootedFromPanic) {
     // If we rebooted from a panic, go to crash report screen to show the panic info
     activityManager.goToCrashReport();
+  } else if (resume == BootResume::Silent && snapshotTarget == SILENT_REBOOT_TARGET_SLEEP) {
+    // Came up from an update installed on the way to sleep. Land somewhere
+    // harmless and go back to sleep at the end of setup(); the wake after that
+    // resumes whatever the reader was doing before the install.
+    activityManager.goHome();
+    sleepAfterUpdateBoot = true;
   } else if (resume == BootResume::Silent && snapshotTarget == SILENT_REBOOT_TARGET_READER &&
              !APP_STATE.openEpubPath.empty()) {
     activityManager.goToReader(APP_STATE.openEpubPath);
@@ -674,7 +792,7 @@ void setup() {
     APP_STATE.openEpubPath = "";
     APP_STATE.readerActivityLoadCount++;
     APP_STATE.saveToFile();
-    activityManager.goToReader(path, allowFastInitialReaderRefresh);
+    activityManager.goToReader(path);
   }
 
   if (resume == BootResume::Silent) {
@@ -706,6 +824,11 @@ void setup() {
   // image to flash and nothing should be arriving over the air while it does.
   if (!recoveryFirmwareMode) BLE_LINK.begin();
 #endif
+
+  if (sleepAfterUpdateBoot) {
+    LOG_INF("MAIN", "Firmware installed at sleep; going back to sleep");
+    enterDeepSleep();
+  }
 }
 
 void loop() {
@@ -719,6 +842,18 @@ void loop() {
   // the side keys are page keys and nothing else; outside it they also carry
   // Back and Select on a hold (see MappedInputManager::setInBookContext).
   MappedInputManager::setInBookContext(activityManager.isReaderPageActive());
+#if FREEINK_CAP_BLE_TRANSFER
+  {
+    // Tell the phone the moment a book opens or closes, rather than at the next
+    // 60-second heartbeat: the app marks the open book in its library.
+    static bool lastReaderOpen = false;
+    const bool readerOpen = activityManager.isReaderActivity();
+    if (readerOpen != lastReaderOpen) {
+      lastReaderOpen = readerOpen;
+      BLE_LINK.notePositionChanged();
+    }
+  }
+#endif
   mappedInputManager.update();
 
   if (activityManager.requiresExclusiveStorageLoop()) {
@@ -933,7 +1068,6 @@ void loop() {
   // The latch is unchanged: gpio's edge detector starts from "disconnected", so
   // a device that booted with a cable in reports a plug edge that never happened,
   // and that device is almost always one being flashed.
-  static bool sawUsbUnplugged = false;
   static bool usbDriveActive = false;
   static bool usbDriveHostSeen = false;
   static unsigned long usbDriveStartedAt = 0;
@@ -941,7 +1075,6 @@ void loop() {
   // a real host to enumerate and mount, short enough that a charger cannot
   // strand the device.
   constexpr unsigned long USB_DRIVE_HOST_WAIT_MS = 20UL * 1000UL;
-  if (!gpio.isUsbConnected()) sawUsbUnplugged = true;
 
   if (usbDriveActive) {
     // No activity loop, no repaint, no storage call except the state poll: the
@@ -992,56 +1125,74 @@ void loop() {
     return;
   }
 
-  if (sawUsbUnplugged && gpio.wasUsbStateChanged() && gpio.isUsbConnected()) {
-    LOG_INF("USB", "cable plugged into an awake device; mounting the card");
-    // Declare the handoff BEFORE the repaint: this is what the header's "USB"
-    // reads, and this is the only paint that will happen until the host lets go.
-    Storage.setUsbDriveHandoffPending(true);
-    // Paint the header while the fonts are still readable, and wait for that
-    // paint to finish. Every render after this point would be a read against a
-    // detached filesystem.
-    activityManager.requestUpdateAndWait();
-    // Stop the radio before the card leaves. This protection existed in
-    // UsbDriveActivity and was lost when that screen was removed: its only
-    // caller went with it, so the end() inside it is now dead code while this
-    // path -- the only one that hands the card over -- had none.
-    //
-    // The main loop's early return does stop BleLink::tick(), but that only
-    // silences the pump; the NimBLE host task stays up, still advertising and
-    // still able to take a connection against a filesystem that no longer
-    // exists. The OTA path stops it for the same reason.
-    //
-    // No matching begin(): every exit from here reboots, and setup() starts it.
-#if FREEINK_CAP_BLE_TRANSFER
-    BLE_LINK.end();
-#endif
-    if (Storage.beginUsbDrive()) {
-      usbDriveActive = true;
-      usbDriveHostSeen = false;
-      usbDriveStartedAt = millis();
-    } else {
-      LOG_ERR("USB", "could not hand the card to the host; carrying on normally");
-      // The card was remounted by beginUsbDrive()'s own failure path and this
-      // screenless route does not reboot, so the radio has to come back or the
-      // device is silently unreachable until the next power cycle.
-#if FREEINK_CAP_BLE_TRANSFER
-      BLE_LINK.begin();
-#endif
-      Storage.setUsbDriveHandoffPending(false);
+  // A cable is not an instruction, and it is no longer a question either.
+  //
+  // Mounting on sight meant plugging in for power took the reader out of
+  // service: the card goes to the host, the loop stops drawing and stops
+  // answering input, and the Library cannot refresh while a book arrives over
+  // BLE. Every "it locked up" and "it only refreshes when I unplug" traces back
+  // to that. Prompting on sight was not much better -- an eight-second question
+  // over whatever you were reading, usually gone before it was read.
+  //
+  // So plugging in now does nothing at all, and USB Drive is a tile in the
+  // control centre that only appears while a cable is attached. The user asks
+  // for it, at the moment they mean it, from a screen they opened themselves.
+  if (usbDriveRequested) {
+    usbDriveRequested = false;
+    if (!gpio.isUsbConnected()) {
+      LOG_INF("USB", "drive mode requested but the cable is gone; ignoring");
       activityManager.requestUpdate();
+    } else {
+      LOG_INF("USB", "user asked for USB Drive; mounting the card");
+
+      // PAINT FIRST, DETACH SECOND. The fonts are read from the SD card, so
+      // once beginUsbDrive() hands it to the host there is nothing left to draw
+      // text with -- an earlier version painted after the handover and hung,
+      // which is the original "USB locks it up". E-ink holds an image with no
+      // power and no card, so a frame put up now simply stays up for as long as
+      // the host has the volume.
+      // Settle the render task BEFORE painting, not after. requestUpdateAndWait
+      // repaints whatever activity is current -- so running it after the notice
+      // was drawn simply painted over it. Its job here is to make sure no
+      // render is in flight when the card goes away; once it returns, nothing
+      // further is queued and the framebuffer is ours.
+      Storage.setUsbDriveHandoffPending(true);
+      activityManager.requestUpdateAndWait();
+      drawUsbDriveNotice();
+#if FREEINK_CAP_BLE_TRANSFER
+      BLE_LINK.end();
+#endif
+      if (Storage.beginUsbDrive()) {
+        usbDriveActive = true;
+        usbDriveHostSeen = false;
+        usbDriveStartedAt = millis();
+      } else {
+        LOG_ERR("USB", "could not hand the card to the host; carrying on normally");
+#if FREEINK_CAP_BLE_TRANSFER
+        BLE_LINK.begin();
+#endif
+        Storage.setUsbDriveHandoffPending(false);
+        activityManager.requestUpdate();
+      }
+      return;
     }
-    return;
   }
+
 #endif
 
-  // A verified image is waiting in the drop folder. Not while a book is open --
-  // an update is a reboot, and interrupting someone's reading to offer one is the
-  // kind of thing that makes people turn updates off.
-  if (FIRMWARE_WATCHER.updateReady() && !activityManager.isReaderActivity() &&
-      !activityManager.preventAutoSleep()) {
+  // A verified image is waiting. Offered at once, over whatever is on screen --
+  // a book included, because "Later" makes the offer cost the reader nothing: it
+  // installs when the reader next sleeps. With auto-install on there is no offer
+  // at all, only the install at sleep.
+  if (FIRMWARE_WATCHER.updateReady() && !activityManager.preventAutoSleep()) {
     FIRMWARE_WATCHER.standDown();
-    activityManager.goToFirmwareUpdate(firmware_staging::IMAGE_PATH, /*stagedDrop=*/true);
-    return;
+    if (SETTINGS.autoInstallFirmware) {
+      LOG_INF("FWDROP", "auto-install on: installing at the next sleep");
+      FIRMWARE_WATCHER.deferToSleep();
+    } else {
+      activityManager.pushActivity(std::make_unique<FirmwareReadyActivity>(renderer, mappedInputManager));
+      return;
+    }
   }
 
   const unsigned long activityStartTime = millis();

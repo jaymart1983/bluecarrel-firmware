@@ -25,16 +25,22 @@
 #include <utility>
 
 #include "BleTrustedHostStore.h"
+#include "BuildStamp.h"
 #include "CrossPointSettings.h"
 #include "HomeShelfStore.h"
 #include "components/UITheme.h"
 #include "FirmwareFlasher.h"
 #include "FirmwareStaging.h"
+#include "FirmwareWatcher.h"
 #include "activities/Activity.h"  // pulls ActivityManager.h with Activity complete
 #include "activities/network/BleStoreController.h"
 #include "util/BleCatalog.h"
 #include "util/BookCacheUtils.h"
 #include "util/BookLibraryIndex.h"
+#include <vector>
+
+#include "CrossPointState.h"
+#include "activities/reader/ProgressFile.h"
 #include "util/BookProgressSync.h"
 #include "util/TaskWatchdog.h"
 
@@ -46,8 +52,49 @@ constexpr const char* BLE_CONTROL_UUID = "6f9f0a01-9b1d-4d1f-9f53-5b6b8b3d0f10";
 constexpr const char* BLE_DATA_IN_UUID = "6f9f0a02-9b1d-4d1f-9f53-5b6b8b3d0f10";
 constexpr const char* BLE_STATUS_UUID = "6f9f0a03-9b1d-4d1f-9f53-5b6b8b3d0f10";
 constexpr const char* BLE_DATA_OUT_UUID = "6f9f0a04-9b1d-4d1f-9f53-5b6b8b3d0f10";
-constexpr const char* BLE_TRANSFER_WEB_URL = "https://ble.xteink.lol/";
 constexpr const char* BOOKS_ROOT = "/Books";
+
+// Where the reader IS in a book, as opposed to caches rebuilt from the book.
+//
+// A BOOK upload that replaces an existing file keeps these across the
+// replacement, so when Calibre updates a book (new metadata, a cover swap, a
+// baseline re-encode) and the phone re-sends it, the reader keeps its place
+// without having to be told again by kosync. Safe because progress.bin records spine plus
+// VISIBLE TEXT OFFSET, not a byte position in the file, so it still points at
+// the same words after a rewrite that did not change the text; the reader
+// clamps a spine index that no longer exists (see EpubReaderActivity).
+constexpr const char* kPositionFiles[] = {"/progress.bin", "/progress.time", "/syncjump.bin"};
+
+struct KeptPositionFile {
+  const char* name;
+  uint8_t bytes[64];  // the largest of these is 13 bytes
+  int length;
+};
+
+std::vector<KeptPositionFile> takePositionFiles(const std::string& cachePath) {
+  std::vector<KeptPositionFile> kept;
+  for (const char* name : kPositionFiles) {
+    HalFile f;
+    if (!Storage.openFileForRead("BLE", cachePath + name, f)) continue;
+    KeptPositionFile k{name, {}, 0};
+    k.length = f.read(k.bytes, sizeof(k.bytes));
+    f.close();
+    // A file that filled the buffer is not one of ours; do not truncate it back.
+    if (k.length > 0 && k.length < static_cast<int>(sizeof(k.bytes))) kept.push_back(k);
+  }
+  return kept;
+}
+
+void restorePositionFiles(const std::string& cachePath, const std::vector<KeptPositionFile>& kept) {
+  if (kept.empty()) return;
+  if (!Storage.exists(cachePath.c_str())) Storage.mkdir(cachePath.c_str());
+  for (const auto& k : kept) {
+    HalFile f;
+    if (!Storage.openFileForWrite("BLE", cachePath + k.name, f)) continue;
+    f.write(k.bytes, static_cast<size_t>(k.length));
+    f.close();
+  }
+}
 constexpr const char* PICTURES_ROOT = "/Pictures";
 constexpr const char* CRASH_REPORT_PATH = "/crash_report.txt";
 constexpr const char* CRASH_REPORT_NAME = "crash_report.txt";
@@ -56,6 +103,11 @@ constexpr const char* CRASH_REPORT_NAME = "crash_report.txt";
 // gives it a known size and a resumable offset.
 constexpr const char* LIBRARY_INDEX_PATH = "/.crosspoint/ble-library.json";
 constexpr const char* LIBRARY_INDEX_NAME = "library.json";
+// Build identity, for the app's firmware screen. A download rather than a status
+// field: the status READ already sits at ~503 of its 512 bytes and sheds, and a
+// version string there would push the capability lists out.
+constexpr const char* ABOUT_PATH = "/.crosspoint/ble-about.json";
+constexpr const char* ABOUT_NAME = "about.json";
 constexpr const char* CROSSPOINT_ROOT = "/.crosspoint";
 // Settings move over the link as one JSON document, the same shape
 // CrossPointSettings already persists -- toJson()/fromJson() are the single
@@ -176,8 +228,8 @@ constexpr size_t BLE_ATT_ATTR_MAX_BYTES = 512;
 //   2  - the pending block shrinks to the `req`/`op` an answer must quote back
 //   1  - the transfer counters and the error text
 //   0  - the pending block
-// Below level 0 there is no document at all. An empty object used to be the
-// floor, and it is the one thing worse than sending nothing: it parses, so the
+// Below level 0 there is no document at all. An empty object would be worse
+// than sending nothing: it parses, so the
 // client accepts it as a status, finds no `state` in it, and reports the
 // session unreadable. A notification is a doorbell for a read that always has
 // the whole truth, so when even {"state":"..."} will not fit the link, the
@@ -416,6 +468,8 @@ std::string transferKindName(const BleLink::TransferKind kind) {
       return "crash_report";
     case BleLink::TransferKind::LIBRARY:
       return "library";
+    case BleLink::TransferKind::ABOUT:
+      return "about";
     case BleLink::TransferKind::CATALOG_PAGE:
       return "catalog_page";
     case BleLink::TransferKind::CATALOG_DETAIL:
@@ -531,7 +585,7 @@ class ServerCallbacks final : public NimBLEServerCallbacks {
     // Both masks are offered rather than 2M alone: a peer that cannot do 2M then
     // negotiates 1M instead of failing the procedure. Nothing depends on the
     // outcome -- it is a speed optimisation, and a phone that stays on 1M simply
-    // transfers at the old rate. onPhyUpdate logs what was actually agreed.
+    // transfers at the 1M rate. onPhyUpdate logs what was actually agreed.
     server->updatePhy(connInfo.getConnHandle(), BLE_GAP_LE_PHY_1M_MASK | BLE_GAP_LE_PHY_2M_MASK,
                       BLE_GAP_LE_PHY_1M_MASK | BLE_GAP_LE_PHY_2M_MASK, 0);
     // Still the 23-byte default at this point on most stacks; onMTUChange
@@ -784,8 +838,6 @@ struct BleLinkRuntime {
   }
 };
 
-const char* BleLink::companionUrl() { return BLE_TRANSFER_WEB_URL; }
-
 BleLink& BleLink::getInstance() {
   static BleLink instance;
   return instance;
@@ -793,6 +845,12 @@ BleLink& BleLink::getInstance() {
 
 void BleLink::begin() {
   if (ble_) return;
+
+  // A wake from deep sleep is a chip reset, so this IS the "just woke up" path.
+  // Take the snapshot now so the first status a phone reads or is notified with
+  // already describes the library and the position, rather than being empty
+  // until the first heartbeat sixty seconds later.
+  refreshPingSnapshot(true);
 
   if (!eventMutex_) {
     eventMutex_ = xSemaphoreCreateMutex();
@@ -857,9 +915,35 @@ void BleLink::end() {
 }
 
 void BleLink::tick() {
+  // Heartbeat. Only while a phone is actually listening: notifying into an
+  // empty room costs radio and tells nobody anything.
+  if (isPeerConnected()) {
+    const unsigned long now = millis();
+    if (now - lastHeartbeatMs_ >= HEARTBEAT_INTERVAL_MS) {
+      lastHeartbeatMs_ = now;
+      refreshPingSnapshot(pingLibDirty_);
+      statusDirty_ = true;
+    }
+  }
+
   if (!ble_) return;
 
   processBleEvents();
+
+  // A delete waiting on its book to close (delete_book with close:true).
+  if (!pendingDeletePath_.empty()) {
+    if (!activityManager.isReaderActivity()) {
+      const std::string name = pendingDeleteName_;
+      const std::string path = pendingDeletePath_;
+      pendingDeleteName_.clear();
+      pendingDeletePath_.clear();
+      deleteBookNow(name, path);
+    } else if (millis() - pendingDeleteAt_ > 5000) {
+      pendingDeleteName_.clear();
+      pendingDeletePath_.clear();
+      setError("book open");
+    }
+  }
 
   if (pendingCommit_) {
     pendingCommit_ = false;
@@ -876,6 +960,29 @@ void BleLink::tick() {
     return;
   }
   if (statusDirty_) publishStatus();
+}
+
+void BleLink::deleteBookNow(const std::string& name, const std::string& path) {
+  if (!Storage.exists(path.c_str())) {
+    // Already absent is the requested state, so this is a success: the app must
+    // not have to distinguish "I deleted it" from "it was not there".
+    LOG_INF("BLE", "delete_book: %s already absent", name.c_str());
+    setState(State::SAVED);
+    return;
+  }
+  if (!Storage.remove(path.c_str())) {
+    setError("could not delete the book");
+    return;
+  }
+  clearBookCache(path);
+  HomeShelfStore::markStale();
+  noteLibraryChanged();
+  // ...and ask for a repaint. Marking the shelf stale only sets a flag that is
+  // read while rendering, so a deleted book sat on screen until something else
+  // caused a draw -- tapping the ghost row was what finally removed it.
+  if (!activityManager.isReaderActivity()) activityManager.requestUpdate();
+  LOG_INF("BLE", "deleted %s", name.c_str());
+  setState(State::SAVED);
 }
 
 void BleLink::attachStore(BleStoreController* store) {
@@ -1025,8 +1132,12 @@ void BleLink::onBleDisconnected() {
       if (ble_) ble_->startAdvertising();
       return;
     }
+    // Report it, then fall through to the same cleanup every disconnect gets.
+    // Returning here left the session believing it was still authenticated and,
+    // worse, never restarted advertising -- so the reader went invisible to the
+    // phone while its own header still showed BLE, and only a reboot fixed it.
+    // A disconnect during a transfer is still a disconnect.
     setError("client disconnected");
-    return;
   }
   helloAccepted_ = false;
   trustedHelloAccepted_ = false;
@@ -1034,6 +1145,8 @@ void BleLink::onBleDisconnected() {
   deviceNonce_ = makeNonceHex();
   setState(State::ADVERTISING);
   if (ble_) ble_->startAdvertising();
+  // The header carries the BLE mark; with the peer gone it must stop saying so.
+  if (!activityManager.isReaderActivity()) activityManager.requestUpdate();
 }
 
 void BleLink::onControlWrite(const std::string& value) {
@@ -1073,6 +1186,16 @@ void BleLink::onControlWrite(const std::string& value) {
       helloAccepted_ = true;
       trustedHelloAccepted_ = true;
       trustedHostName_ = host->name.empty() ? hostId : host->name;
+      // A phone that renamed itself says so on every hello; keep the stored
+      // label in step so Settings shows the current name.
+      {
+        const std::string offeredName = sanitizeHostName(doc["host_name"] | "");
+        if (!offeredName.empty() && offeredName != host->name) {
+          BleTrustedHost renamed = *host;  // copied: addOrReplaceHost may move `host`
+          renamed.name = offeredName;
+          if (BLE_TRUSTED_HOSTS.addOrReplaceHost(renamed)) trustedHostName_ = offeredName;
+        }
+      }
       authErrorMessage_.clear();
       deviceNonce_ = makeNonceHex();
       LOG_INF("BLE", "trusted host '%s' accepted", trustedHostName_.c_str());
@@ -1190,28 +1313,24 @@ void BleLink::onControlWrite(const std::string& value) {
       setError("unsafe book filename");
       return;
     }
-    if (activityManager.isReaderActivity()) {
-      // Deleting the file underneath an open reader would leave it paging into
-      // a file that is gone. Refused rather than deferred, as a progress batch is.
-      setError("book open");
-      return;
-    }
     const std::string path = std::string(BOOKS_ROOT) + "/" + name;
-    if (!Storage.exists(path.c_str())) {
-      // Already absent is the requested state, so this is a success: the app
-      // must not have to distinguish "I deleted it" from "it was not there".
-      LOG_INF("BLE", "delete_book: %s already absent", name.c_str());
-      setState(State::SAVED);
+    // Only the book that is OPEN blocks its own deletion; any other book can be
+    // removed while a book is on screen.
+    if (activityManager.isReaderActivity() && APP_STATE.openEpubPath == path) {
+      if (!(doc["close"] | false)) {
+        setError("book open");
+        return;
+      }
+      // The user confirmed in the app: leave the book (its position is saved on
+      // the way out) and delete once the reader has gone -- see tick().
+      pendingDeleteName_ = name;
+      pendingDeletePath_ = path;
+      pendingDeleteAt_ = millis();
+      LOG_INF("BLE", "delete_book: closing %s first", name.c_str());
+      activityManager.goHome();
       return;
     }
-    if (!Storage.remove(path.c_str())) {
-      setError("could not delete the book");
-      return;
-    }
-    clearBookCache(path);
-    HomeShelfStore::markStale();
-    LOG_INF("BLE", "deleted %s", name.c_str());
-    setState(State::SAVED);
+    deleteBookNow(name, path);
     return;
   }
 
@@ -1223,7 +1342,20 @@ void BleLink::onControlWrite(const std::string& value) {
     // which is exactly what an ordinary Bluetooth Transfer upload sends.
     const uint32_t responseReq = doc["req"] | 0u;
     fileName_ = doc["name"] | "";
+    {
+      // A build stamp the app sends with a firmware image ("yyyyMMdd.HHmm"), shown
+      // on the update screens. Dropped unless it looks like one: it is displayed.
+      std::string version = doc["version"] | "";
+      const bool plain = version.size() <= 32 && std::all_of(version.begin(), version.end(), [](const char c) {
+                           return std::isalnum(static_cast<unsigned char>(c)) || c == '.' || c == '-' || c == '_';
+                         });
+      firmwareVersion_ = plain ? version : "";
+    }
     expectedSize_ = doc["size"] | 0;
+    // Asked for explicitly, never inferred. Replacing a book is how a Calibre
+    // update reaches the card; "exists" is still the answer for an ordinary
+    // send, because that is the only cheap way the app learns a book is here.
+    replaceExisting_ = doc["replace"] | false;
     expectedSha256_ = toLowerAscii(doc["sha256"] | "");
     uploadResumable_ = doc["resume"] | false;
     uploadChunkSize_ = doc["chunk_size"] | 0;
@@ -1274,8 +1406,17 @@ void BleLink::onControlWrite(const std::string& value) {
       partPath_ = std::string(BOOKS_ROOT) + "/.ble-" + fileName_ + ".part";
       finalPath_ = std::string(BOOKS_ROOT) + "/" + fileName_;
       if (Storage.exists(finalPath_.c_str())) {
-        setError("exists");
-        return;
+        if (!replaceExisting_) {
+          setError("exists");
+          return;
+        }
+        // Not underneath an open reader: it holds this file and would write its
+        // position back over the replacement on exit. Refused at begin, before
+        // megabytes cross the link, for the same reason progress is.
+        if (activityManager.isReaderActivity() && APP_STATE.openEpubPath == finalPath_) {
+          setError("book open");
+          return;
+        }
       }
     } else if (kind == "bmp") {
       if (!isSafeBleBmpName(fileName_)) {
@@ -1298,10 +1439,7 @@ void BleLink::onControlWrite(const std::string& value) {
         return;
       }
     } else if (kind == "progress") {
-      // NOT while a book is open. This used to be guaranteed by the architecture:
-      // the transfer screen was reached through replaceActivity(), which tore the
-      // reader down -- final position written to disk -- before the radio ever
-      // came up. The radio outliving the screen removes that guarantee, and a
+      // NOT while a book is open. The radio runs whatever is on screen, and a
       // batch applied underneath a live reader would be silently overwritten by
       // that reader's own position when it exits, which is worse than not syncing
       // at all because the phone would have been told it succeeded.
@@ -1509,6 +1647,10 @@ void BleLink::onControlWrite(const std::string& value) {
       startSettingsDownload(static_cast<size_t>(offsetValue), static_cast<size_t>(chunkSizeValue));
       return;
     }
+    if (kind == "about") {
+      startAboutDownload(static_cast<size_t>(offsetValue), static_cast<size_t>(chunkSizeValue));
+      return;
+    }
     setError("unsupported transfer kind");
     return;
   }
@@ -1619,9 +1761,27 @@ void BleLink::processCommit() {
 
   if ((transferKind_ == TransferKind::BOOK || transferKind_ == TransferKind::BMP) &&
       Storage.exists(finalPath_.c_str())) {
-    setError("exists");
-    resetTransfer(true);
-    return;
+    // A BOOK may replace its predecessor only when the sender asked to (a
+    // Calibre update). Anything else that already exists is refused.
+    if (transferKind_ != TransferKind::BOOK || !replaceExisting_) {
+      setError("exists");
+      resetTransfer(true);
+      return;
+    }
+    if (activityManager.isReaderActivity() && APP_STATE.openEpubPath == finalPath_) {
+      setError("book open");
+      resetTransfer(true);
+      return;
+    }
+    // FAT will not rename onto an existing name. The verified .part is already
+    // complete on the card at this point, so the window between this remove and
+    // the rename below is the only moment the book is absent.
+    if (!Storage.remove(finalPath_.c_str())) {
+      setError("could not replace book");
+      resetTransfer(true);
+      return;
+    }
+    LOG_INF("BLE", "Replacing %s with the updated copy", fileName_.c_str());
   }
   if ((transferKind_ == TransferKind::FIRMWARE || transferKind_ == TransferKind::PROGRESS ||
        transferKind_ == TransferKind::SETTINGS_INBOX || transferKind_ == TransferKind::BOOK_META ||
@@ -1654,10 +1814,20 @@ void BleLink::processCommit() {
   if (transferKind_ == TransferKind::BOOK || transferKind_ == TransferKind::BMP) {
     savedPath_ = finalPath_;
     if (transferKind_ == TransferKind::BOOK) {
+      const std::string positionCache = BookProgressSync::cachePathForBook(savedPath_);
+      const auto keptPosition = takePositionFiles(positionCache);
       clearBookCache(savedPath_);
+      restorePositionFiles(positionCache, keptPosition);
+      if (!keptPosition.empty()) LOG_INF("BLE", "Book replaced; kept its reading position");
       // The Library reconciles once per visit, so a book that lands while the
       // shelf is on screen would otherwise not appear until a restart.
+      //
+      // The repaint request is the half that was missing: marking the shelf
+      // stale only sets a flag, and the flag is read while rendering -- so with
+      // nothing asking for a render, an idle Library sat there never noticing.
       HomeShelfStore::markStale();
+    noteLibraryChanged();
+      if (!activityManager.isReaderActivity()) activityManager.requestUpdate();
     }
     if (store_ && transferKind_ == TransferKind::BOOK) {
       storeExpectedBook_.clear();
@@ -1680,6 +1850,8 @@ void BleLink::processCommit() {
       return;
     }
     HomeShelfStore::markStale();
+    noteLibraryChanged();
+    if (!activityManager.isReaderActivity()) activityManager.requestUpdate();
     setState(State::SAVED);
     return;
   }
@@ -1696,7 +1868,7 @@ void BleLink::processCommit() {
     return;
   }
 
-  // Firmware. A BLE push no longer flashes anything: it drops the image into the
+  // Firmware. A BLE push never flashes anything: it drops the image into the
   // watched folder and writes the companion hash beside it, exactly as a person
   // with the card mounted over USB would. FirmwareWatcher finds it, re-hashes it
   // off the card, and asks the user. So the radio's job ends here, and an
@@ -1728,6 +1900,7 @@ void BleLink::processCommit() {
     setError("could not write the firmware hash file");
     return;
   }
+  if (!firmwareVersion_.empty()) firmware_staging::writeVersion(firmwareVersion_);
   LOG_INF("BLE", "firmware staged at %s; the update prompt is the watcher's", firmware_staging::IMAGE_PATH);
   savedPath_ = finalPath_;
   setState(State::SAVED);
@@ -1841,6 +2014,47 @@ void BleLink::startSettingsDownload(const size_t offset, const size_t chunkSize)
   }
   startFileDownload(SETTINGS_SNAPSHOT_PATH, SETTINGS_SNAPSHOT_NAME, TransferKind::SETTINGS_SNAPSHOT, offset,
                     chunkSize);
+}
+
+void BleLink::startAboutDownload(const size_t offset, const size_t chunkSize) {
+  // Which build is running, so the app can say whether the update page has a
+  // newer one. X4_BUILD_STAMP is written by the build host (BuildStamp.h) and the
+  // same stamp names the published image in firmware.json. The running slot is
+  // there for diagnosis: after the first Bluetooth update the reader boots app1,
+  // and a USB flash to 0x10000 then lands in the slot it is NOT booting.
+  if (offset == 0) {
+    if (!Storage.ensureDirectoryExists(CROSSPOINT_ROOT)) {
+      setError("could not create data directory");
+      return;
+    }
+    JsonDocument doc;
+    doc["firmware_version"] = X4_BUILD_STAMP;
+    const esp_partition_t* running = esp_ota_get_running_partition();
+    if (running) doc["running_partition"] = running->label;
+    // Whether an image already waits on the card, and whether the reader means
+    // to install it at its next sleep -- so the app neither re-sends an update
+    // the reader holds nor offers one as if it did not.
+    doc["update_staged"] = firmware_staging::imageStaged();
+    doc["install_at_sleep"] = FIRMWARE_WATCHER.installAtSleep();
+    std::string stagedVersion;
+    if (firmware_staging::readVersion(stagedVersion)) doc["staged_version"] = stagedVersion;
+    if (Storage.exists(ABOUT_PATH)) Storage.remove(ABOUT_PATH);
+    HalFile out;
+    if (!Storage.openFileForWrite("BLE", ABOUT_PATH, out)) {
+      setError("could not stage about");
+      return;
+    }
+    String json;
+    serializeJson(doc, json);
+    const bool ok = json.length() > 0 && out.print(json) == json.length();
+    out.close();
+    if (!ok) {
+      Storage.remove(ABOUT_PATH);
+      setError("could not serialise about");
+      return;
+    }
+  }
+  startFileDownload(ABOUT_PATH, ABOUT_NAME, TransferKind::ABOUT, offset, chunkSize);
 }
 
 bool BleLink::applyBookMetaDocument() {
@@ -2003,12 +2217,41 @@ void BleLink::processProgressBatch() {
       filename = entry["filename"] | "";
       const std::string location = toLowerAscii(entry["location"] | "");
       const int64_t timestamp = entry["timestamp"] | static_cast<int64_t>(0);
+
+      // Optional, and absent means exactly today's behaviour. A position from
+      // another reading system arrives as a spine item plus a fraction through
+      // it, because that system's own position encoding indexes a file this
+      // device will never hold. `spine_n` is the spine item count the sender
+      // measured; the reader checks it against its own copy when it opens the
+      // book, so a re-converted or different edition falls back rather than
+      // jumping somewhere confidently wrong.
+      BookProgressSync::SpineJump jump;
+      if (entry["spine"].is<int>() && entry["spine_n"].is<int>()) {
+        const int spineIndex = entry["spine"].as<int>();
+        const int spineCount = entry["spine_n"].as<int>();
+        const float fraction = entry["spine_frac"] | 0.0f;
+        if (spineIndex >= 0 && spineCount > 0 && spineIndex < spineCount && spineCount <= UINT16_MAX &&
+            fraction >= 0.0f && fraction <= 1.0f) {
+          jump.present = true;
+          jump.spineIndex = static_cast<uint16_t>(spineIndex);
+          jump.fraction = fraction;
+          jump.spineCount = static_cast<uint16_t>(spineCount);
+        }
+      }
+
+      // How far through the book, 0..1, stored beside the position so the
+      // library screen can show it without opening the book. Absent means "not
+      // supplied" and leaves whatever the reader already had.
+      const float pct = entry["pct"] | -1.0f;
+      const uint16_t percentBp =
+          (pct >= 0.0f && pct <= 1.0f) ? static_cast<uint16_t>(pct * 10000.0f + 0.5f) : 0;
+
       // One bad entry costs that entry only. A book the phone knows about but
       // this card does not is the ordinary case, not a failed batch.
       if (isSafeBleBookRelativePath(filename) && timestamp > 0 &&
           timestamp <= static_cast<int64_t>(UINT32_MAX)) {
         result = BookProgressSync::applyProgress(BOOKS_ROOT, filename, location,
-                                                 static_cast<uint32_t>(timestamp));
+                                                 static_cast<uint32_t>(timestamp), jump, percentBp);
       }
     }
     if (result == BookProgressSync::ApplyResult::APPLIED) progressApplied_++;
@@ -2088,19 +2331,15 @@ void BleLink::pumpDownload() {
 
 bool BleLink::saveTrustedHost(const std::string& hostId, const std::string& hostName,
                               const std::string& secret) {
-  // Written the instant a code-authenticated hello offers a credential.
-  //
-  // This used to be a prompt that only appeared AFTER a completed upload, which
-  // meant a phone that had already saved its half of the pairing -- every phone,
-  // because the app has no reason to wait -- was holding a credential this
-  // reader had never kept. Its next reconnect authenticated by HMAC against
-  // nothing, was refused as an unknown trusted host, and the only way out was
-  // the six-digit code the old error screen had just replaced. Saving here makes
-  // both sides commit at the same moment, which is the whole fix.
+  // Written the instant a code-authenticated hello offers a credential, so both
+  // sides commit at the same moment. The phone saves its half of the pairing
+  // immediately; if the reader waited for anything later, the phone could hold a
+  // credential this reader never kept, and its next reconnect would be refused
+  // as an unknown trusted host.
   //
   // The user's consent is the six digits. They read them off the reader's own
   // pairing page and typed them into the phone; there is no second question
-  // worth asking, and asking it is what broke this.
+  // worth asking.
   if (!isSafeHostId(hostId) || !isHexString(secret, BLE_SHARED_SECRET_HEX_BYTES)) return false;
   const std::string name = sanitizeHostName(hostName);
   if (!BLE_TRUSTED_HOSTS.addOrReplaceHost(BleTrustedHost{hostId, name, secret})) {
@@ -2114,6 +2353,7 @@ bool BleLink::saveTrustedHost(const std::string& hostId, const std::string& host
 }
 
 void BleLink::resetTransfer(const bool removePart) {
+  replaceExisting_ = false;
   if (shaActive_) {
     mbedtls_sha256_free(&shaContext_);
     mbedtls_sha256_init(&shaContext_);
@@ -2174,11 +2414,10 @@ void BleLink::setAuthError(const std::string& error) {
   // Deliberately not State::ERROR. A refused hello is not a failed session: the
   // link is up, the code is still valid, and reading that code off the pairing
   // page is the ONLY way a client whose credential this reader does not have can
-  // recover. The old code put the reason on an error screen that replaced the
-  // code, which is why the deadlock had no exit.
+  // recover.
   //
   // Whether a host is stored is half of any diagnosis of one of these, so it
-  // goes on the same line as the reason -- this used to print nothing at all.
+  // goes on the same line as the reason.
   LOG_ERR("BLE", "hello refused: %s (a trusted host is stored: %s)", error.c_str(),
           BLE_TRUSTED_HOSTS.hasHosts() ? "yes" : "no");
   helloAccepted_ = false;
@@ -2194,8 +2433,8 @@ void BleLink::noteBleMtu(const uint16_t mtu) { negotiatedMtu_.store(mtu, std::me
 size_t BleLink::notifyCapBytes() const {
   // The live link is authoritative; the value onMTUChange() cached is the
   // fallback for the moment between connect and the first exchange; the 23-byte
-  // BLE floor is the last resort. Reading the cache first is what used to cap
-  // every notification at 20 bytes on a link that had negotiated far more.
+  // BLE floor is the last resort. Reading the cache first would cap every
+  // notification at 20 bytes on a link that had negotiated far more.
   uint16_t mtu = ble_ ? ble_->peerMtu() : 0;
   if (mtu == 0) mtu = negotiatedMtu_.load(std::memory_order_relaxed);
   // Still 0 means no exchange has happened (or the peer has gone). Assume the
@@ -2243,6 +2482,57 @@ std::string BleLink::buildNotifyJson(const size_t capBytes) const {
   return {};
 }
 
+void BleLink::refreshPingSnapshot(const bool withLibrary) {
+  if (withLibrary) {
+    BookLibraryIndex::Fingerprint fp;
+    if (BookLibraryIndex::fingerprint(BOOKS_ROOT, fp)) {
+      pingLibBooks_ = fp.books;
+      pingLibHash_ = fp.hash;
+      pingLibDirty_ = false;
+    }
+  }
+
+  // One sidecar read, no book opened. See ProgressFile.h: the record is eleven
+  // bytes and carries the percentage precisely so it does not have to be
+  // re-derived by opening the book.
+  pingBook_.clear();
+  pingPct_ = -1.0f;
+  pingOpen_ = false;
+  const std::string& openPath = APP_STATE.openEpubPath;
+  if (openPath.empty()) return;
+  const auto slash = openPath.find_last_of('/');
+  pingBook_ = slash == std::string::npos ? openPath : openPath.substr(slash + 1);
+  // openEpubPath survives closing the book (it is what a wake resumes), so it
+  // cannot say on its own whether the book is open; the activity stack can.
+  pingOpen_ = activityManager.isReaderActivity();
+
+  uint32_t epoch = 0;
+  uint16_t percentBp = 0;
+  bool hasPercent = false;
+  if (ProgressFile::readSidecar(BookProgressSync::cachePathForBook(openPath), epoch, percentBp, hasPercent) && hasPercent) {
+    pingPct_ = static_cast<float>(percentBp) / 10000.0f;
+  }
+}
+
+void BleLink::notePositionChanged() {
+  refreshPingSnapshot(false);
+  statusDirty_ = true;
+}
+
+void BleLink::noteLibraryChanged() {
+  // Flagged, not walked. The caller is usually finishing a transfer and the
+  // heartbeat is a second away; doing the directory walk on this thread would
+  // charge the walk to whatever just wrote to the card.
+  pingLibDirty_ = true;
+  statusDirty_ = true;
+}
+
+void BleLink::notifySleeping() {
+  refreshPingSnapshot(pingLibDirty_);
+  sleeping_ = true;
+  publishStatusNow();
+}
+
 void BleLink::publishStatus() {
   statusDirty_ = false;
   if (!ble_) return;
@@ -2268,8 +2558,7 @@ std::string BleLink::buildStatusJson(const StatusScope scope, const unsigned det
   // still one GATT read away, and the client already has to read to get the
   // capability lists it saw at connect time.
   const bool full = (scope == StatusScope::READ);
-  // READ now sheds too. It used to ignore `detail` entirely and emit everything,
-  // which is how it grew past the 512-byte ATT ceiling and started coming back
+  // READ sheds too, or it grows past the 512-byte ATT ceiling and comes back
   // truncated. What it sheds is only ever re-derivable: the trims below drop
   // decoration and capability lists, never identity, never the nonce, and never
   // the reason a hello was refused -- those are what a client cannot recover
@@ -2294,11 +2583,25 @@ std::string BleLink::buildStatusJson(const StatusScope scope, const unsigned det
   const bool pendingTerse = !full && detail < 3;
 
   doc["state"] = state.c_str();
+  // The heartbeat payload. Small and deliberately never shed: it is the whole
+  // reason a notification is worth sending at all, and everything the shrink
+  // ladder drops below is re-readable while these are what tell the app there
+  // is anything to re-read.
+  //
+  // The fingerprint answers "is your idea of my library still right?" without
+  // sending the library: BookLibraryIndex::Fingerprint is name+size+mtime and
+  // exists to answer exactly that. A mismatch is the app's cue to run a full
+  // mirror; a match means it can skip one entirely.
+  if (pingLibBooks_ > 0 || pingLibHash_ != 0) {
+    doc["lib_n"] = pingLibBooks_;
+    doc["lib_h"] = pingLibHash_;
+  }
+  // Position, so the app can update its row without a kosync round trip.
+  if (pingPct_ >= 0.0f) doc["pct"] = pingPct_;
+  if (pingOpen_) doc["open"] = true;
+  if (sleeping_) doc["sleeping"] = true;
   if (wantSession) doc["protocol_version"] = 1;
   if (full) {
-    // browser_companion_url is gone. The Web Bluetooth companion is no longer
-    // offered anywhere in the UI, and at 49 bytes it was the single largest
-    // avoidable field in a document that has to fit 512.
     if (wantDecoration) {
       doc["firmware_name"] = "CrossPoint Reader";
       doc["firmware_ota_supported"] = true;
@@ -2315,6 +2618,7 @@ std::string BleLink::buildStatusJson(const StatusScope scope, const unsigned det
     uploadKinds.add("settings");
     uploadKinds.add("book_meta");
     JsonArray downloadKinds = doc["download_kinds"].to<JsonArray>();
+    downloadKinds.add("about");
     downloadKinds.add("crash_report");
     downloadKinds.add("library");
     downloadKinds.add("progress_result");
@@ -2370,6 +2674,10 @@ std::string BleLink::buildStatusJson(const StatusScope scope, const unsigned det
     doc["path"] = savedPath_.c_str();
   }
   if (wantIdentity && state_ == State::SENT) doc["name"] = fileName_.c_str();
+  // Which book `pct` is about. Gated with the other identity fields because a
+  // filename is the one variable-length part of the heartbeat; when it is shed
+  // the app still learns THAT the position moved and can read for the rest.
+  if (wantIdentity && !pingBook_.empty()) doc["book"] = pingBook_.c_str();
   // `state` already says ERROR; the message is the part that can be any length,
   // so it is the part that goes when the payload is tight.
   if (wantProgress && state_ == State::ERROR && !errorMessage_.empty()) doc["error"] = errorMessage_.c_str();

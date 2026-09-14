@@ -89,16 +89,48 @@ bool HomeShelfStore::refreshReadTimes() {
     uint32_t readAt = 0;
     const bool hasTime = ProgressFile::readSavedTime(cachePath, readAt);
     if (!hasTime) readAt = 0;
+    // Never older than what the shelf already holds. promote() stamps a book
+    // when it is opened; one opened and closed without a page turn still has
+    // its OLD saved time, and taking that would drop it back down the shelf --
+    // the reshuffle-on-return promote() exists to prevent.
+    readAt = std::max(readAt, book.readAt);
     // A book gains "in progress" the first time it is opened past the start,
     // which is exactly when a progress.bin appears beside it.
     const bool inProgress = book.inProgress || readAt != 0;
-    if (readAt != book.readAt || inProgress != book.inProgress) {
+    // The percentage the reader recorded when it last saved. This used to be
+    // left alone here, so a book indexed before it was ever opened kept
+    // percent = 0 and listed without a percentage no matter how far it was
+    // read -- the only path that recomputed it was the expensive full rebuild,
+    // which a page turn never triggers because the card has not changed.
+    float percent = book.percent;
+    float saved = 0.0f;
+    if (ProgressFile::readSavedPercent(cachePath, saved)) percent = saved;
+    if (readAt != book.readAt || inProgress != book.inProgress || percent != book.percent) {
       book.readAt = readAt;
       book.inProgress = inProgress;
+      book.percent = percent;
       changed = true;
     }
   }
   if (!changed) return false;
+  std::stable_sort(books.begin(), books.end(), orderBefore);
+  return true;
+}
+
+bool HomeShelfStore::promote(const std::string& path) {
+  auto it = std::find_if(books.begin(), books.end(), [&](const HomeShelfBook& b) { return b.path == path; });
+  if (it == books.end()) return false;
+  uint32_t newest = 0;
+  for (auto other = books.begin(); other != books.end(); ++other) {
+    if (other != it && other->inProgress) newest = std::max(newest, other->readAt);
+  }
+  // Already first: no reorder, and no card write on every reopen of the book
+  // being read.
+  if (it == books.begin() && it->inProgress && it->readAt > newest) return false;
+  uint32_t now = 0;
+  if (!halClock.getEpoch(now)) now = 0;
+  it->readAt = std::max(now, newest + 1);
+  it->inProgress = true;
   std::stable_sort(books.begin(), books.end(), orderBefore);
   return true;
 }

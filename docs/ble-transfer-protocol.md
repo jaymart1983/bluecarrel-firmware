@@ -8,8 +8,12 @@ longer any screen a user has to find and keep open before a phone can reach the 
 Advertising runs at a deliberately slow interval — 1000-1285 ms — because this link is for occasional sync, not
 low latency. A scanning phone still finds the reader within a second or two.
 
-The browser companion is available at <https://ble.xteink.lol/>. Source and compatibility notes live at
-<https://github.com/marginalia-os/ble-xteink>.
+The main client is the **X4 Pro Sync** Android app. `scripts/ble_transfer.py` is a command-line client for testing.
+The X4 Pro build has no Wi-Fi, so this link is its only wireless path: books, reading positions, settings and
+firmware updates all travel over it.
+
+While the link is up the reader sends a small status notification every 60 seconds (the heartbeat), and also when a
+book opens or closes and just before the device goes to sleep. See [Heartbeat fields](#heartbeat-fields).
 
 ## Compatibility
 
@@ -30,14 +34,17 @@ Clients should discover the service by UUID. The user-visible name is not part o
 
 ## Authentication
 
-First use requires the six-digit code, which lives on exactly one screen: **Settings > Bluetooth**. That page always
-shows the code — paired or not, connected or not, whatever the last failure was.
+First use requires the six-digit code. It is shown in the **Bluetooth** section of the device Settings page (on the
+X4 Pro: Control Centre > Settings; the same page is also **Settings > System > Bluetooth**). The code is shown only
+while no phone is paired: a paired phone reconnects with its saved credential and never needs it. Forgetting the
+phone brings the code back.
 
 ```json
 {"op":"hello","version":1,"code":"123456"}
 ```
 
 The code is regenerated once per wake, not once per screen, so it is stable for as long as the device stays awake.
+A `hello` with the code and no pairing fields gives a code-only session that is not remembered.
 
 ### Pairing is saved immediately
 
@@ -59,13 +66,23 @@ could send it, the credential is already saved.
 
 ### Trusted auth
 
-Trusted auth signs this message:
+A paired client reconnects without the code:
+
+```json
+{"op":"hello","version":1,"host_id":"…","response":"<64 hex>","host_name":"X4 Pro Sync"}
+```
+
+`response` is HMAC-SHA256, keyed with the saved secret, over this message:
 
 ```text
 {device_nonce}|{host_id}|1
 ```
 
-using HMAC-SHA256 with the saved secret.
+`device_nonce` comes from a GATT read of `status` and changes after every accepted trusted hello.
+
+`host_name` is optional. When it is present and differs from the name stored at pairing, the reader renames the
+stored host, so its Settings page shows the client's current name. The name is cut to the stored maximum and any
+character outside printable ASCII becomes `?`.
 
 ### When a hello is refused
 
@@ -86,12 +103,25 @@ doorbell needs it at exactly the moment its trusted hello was refused.
 
 ### Forgetting
 
-The user forgets a phone from Settings > Bluetooth. There is no protocol operation for it: a client cannot make the
-reader forget anybody.
+The user forgets a phone with **Forget** in the Bluetooth section of the Settings page. There is no protocol operation
+for it: a client cannot make the reader forget anybody. The reader stores one host; pairing another replaces it.
 
 ## Supported Operations
 
 Uploads use `start_put`, binary frames on `data-in`, then `commit`.
+
+`start_put` fields:
+
+| Field | Type | Meaning |
+| --- | --- | --- |
+| `kind` | string | Upload kind, below. Required. |
+| `name` | string | File name for `book` (`.epub`), `bmp` (`.bmp`) and `firmware` (`.bin`). No path separators or traversal. |
+| `size` | number | Total bytes. Required. |
+| `sha256` | string | 64 hex characters over the whole payload. Required. |
+| `replace` | bool | `book` only. `true` overwrites an existing `/Books/<name>`; without it an existing file is refused as `exists`. Replacing the book that is open on screen is refused as `book open`. Default `false`. |
+| `version` | string | `firmware` only, optional. A build stamp such as `20260913.1914`, saved beside the image as `firmware.bin.version` and shown on the update screens. Ignored unless it is at most 32 characters of letters, digits, `.`, `-` or `_`. |
+| `req` | number | Only when answering a Store request. |
+| `resume`, `chunk_size`, `ack_bytes` | bool, number, number | Resumable upload and credit flow-control options. |
 
 Supported upload kinds:
 
@@ -100,6 +130,8 @@ Supported upload kinds:
 - `firmware`: `.bin` **dropped into the watched folder** — see [Firmware updates](#firmware-updates). It is validated
   on commit and then left there; nothing is flashed during the session
 - `progress`: a batch of reading positions to apply to books already on the card (see below)
+- `settings`: a settings document to apply. Refused as `book open` while a book is open
+- `book_meta`: book metadata for the app's library, capped at a small size
 - `catalog_page`: one screen of the app's Calibre library, answering a `catalog_page` request (see
   [The Store](#the-store-requests-over-the-notify-channel))
 - `catalog_detail`: one book in full, answering a `catalog_detail` request
@@ -111,10 +143,48 @@ Supported download kinds:
 - `crash_report`: reads `/crash_report.txt`
 - `library`: the on-device book list with reading progress (see below)
 - `progress_result`: the per-entry outcome of the last `progress` upload (see below)
+- `settings`: the device's current settings, serialised fresh on each request at `offset: 0`
+- `about`: which firmware is running and whether an update is staged (see [`about`](#about))
 
-There are two further control ops that are not transfers: `set_time`, and `catalog_error` (the app declining
-a Store request it cannot answer). `save_host` is accepted and does nothing (see
-[Pairing is saved immediately](#pairing-is-saved-immediately)).
+The other control ops are `set_time` (see [Device clock](#device-clock)), `delete_book` (see
+[`delete_book`](#delete_book)), `catalog_error` (the app declining a Store request it cannot answer) and `cancel`.
+`save_host` is accepted and does nothing (see [Pairing is saved immediately](#pairing-is-saved-immediately)).
+
+## `delete_book`
+
+```json
+{"op":"delete_book","name":"Dune.epub","close":true}
+```
+
+Deletes one book from `/Books`. `name` follows the `book` upload rule: a bare `.epub` file name, no folders, no
+wildcards. Like every other op it requires `hello` first.
+
+- On success `status` reports `state: "saved"`. A book that is already absent also reports `saved`.
+- The book's cache is cleared and the Home shelf is refreshed.
+- Only the book that is **open on screen** blocks its own deletion. Without `close` (default `false`) that case is
+  refused with `error: "book open"`. With `close: true` the reader leaves the book (saving its position) and returns
+  to Home, then deletes the file. If the reader has not closed within about five seconds the request fails with
+  `book open`.
+- Other errors: `unsafe book filename`, `could not delete the book`.
+
+## `about`
+
+`{"op":"start_get","kind":"about"}` returns one small JSON object:
+
+```json
+{"firmware_version":"20260913.1914","running_partition":"app1","update_staged":true,
+ "install_at_sleep":true,"staged_version":"20260914.0800"}
+```
+
+| Field | Type | Meaning |
+| --- | --- | --- |
+| `firmware_version` | string | Build stamp of the running firmware, `yyyyMMdd.HHmm` (UTC). Stamps sort in build order as strings. |
+| `running_partition` | string | OTA slot the reader booted from (`app0` or `app1`). After a Bluetooth update the reader may be running `app1`. |
+| `update_staged` | bool | `/firmware/firmware.bin` and its `.sha256` file are both on the card. |
+| `install_at_sleep` | bool | A staged image will be installed the next time the reader sleeps (the user chose Later, or auto-install is on). |
+| `staged_version` | string | Contents of `/firmware/firmware.bin.version`. Absent when there is no such file. |
+
+`about` is not listed in `download_kinds`.
 
 ## Firmware updates
 
@@ -124,6 +194,7 @@ A firmware push is now a **file drop**, not an interactive flow. The reader watc
 | --- | --- |
 | `/firmware/firmware.bin` | the ESP32 application image |
 | `/firmware/firmware.bin.sha256` | its SHA-256, as text |
+| `/firmware/firmware.bin.version` | optional: the `version` sent with `start_put`, as text; shown on the update screens |
 | `/firmware/.firmware.bin.part` | scratch: where a BLE upload accumulates before the rename |
 
 The companion file's **first whitespace-delimited token** is a 64-character hex SHA-256 of the image. That is exactly
@@ -135,15 +206,31 @@ Two routes put files there, and they are the same route:
 - **Over BLE.** `start_put` with `kind: "firmware"`, frames, `commit` — unchanged wire protocol. On commit the reader
   validates the image (`firmware_flash::validateImageFile`: header magic, segment table, XOR checksum, SHA-256
   trailer, chip id, board tag) and, if it passes, writes `/firmware/firmware.bin.sha256` itself from the digest it
-  just verified. The client does not send the hash file. `status` reports `state: "saved"`; a bad image reports
-  `state: "error"` with `error: "invalid firmware: <REASON>"` while the client is still connected to hear it.
-- **Over USB.** Plug the reader into a computer, copy both files onto the card, eject.
+  just verified, plus `/firmware/firmware.bin.version` when `start_put` carried a usable `version`. The client does not
+  send the hash file. `status` reports `state: "saved"`; a bad image reports `state: "error"` with
+  `error: "invalid firmware: <REASON>"` while the client is still connected to hear it. Starting a `firmware` upload
+  first removes any previously staged image.
+- **Over USB.** Plug the reader into a computer, copy `firmware.bin` and `firmware.bin.sha256` onto the card, eject.
+  The `.version` file is optional.
 
-The reader then checks the folder every 30 seconds, re-hashes the image off the card a few KB per main-loop tick, and
-only if the digest matches the companion file does it show an **on-device confirmation prompt**. Confirming runs the
-same validate-and-flash path the SD firmware update always used, then reboots. Both files are deleted after a
-successful flash so the new firmware does not come up and offer to install itself again. Declining does **not** delete
-anything: the reader simply stops offering that image until the file changes or the device reboots.
+The reader then checks the folder every 30 seconds (not during the first 20 seconds after boot), re-hashes the image
+off the card a few KB per main-loop tick, and only if the digest matches the companion file does it act:
+
+- **Default:** it shows **Firmware update found** over whatever screen is up, a book included, with **Update Now**,
+  **Later** and **Cancel**. The question does not dismiss; it stays until one is chosen, or until the user goes Home
+  from the Control Centre (the update then remains available from Settings).
+  - **Update Now** leaves the current screen (an open book saves its position), validates and flashes, then reboots.
+  - **Later** installs at the next sleep: on the way into sleep the reader flashes, reboots, and goes straight back to
+    sleep, so the next wake is on the new firmware. The deferral is held in RAM; a restart forgets it and the prompt
+    comes back.
+  - **Cancel** does not delete anything. The image is not offered again until the file changes size or the device
+    restarts.
+- **Auto-install** (setting `autoInstallFirmware` on): no prompt. The image installs at the next sleep, as for Later.
+
+Both files (and `.version`) are deleted after a successful flash so the new firmware does not come up and offer to
+install itself again. An image whose digest does not match is ignored and left on the card.
+
+`install_at_sleep` and `update_staged` in the [`about`](#about) download report this state to the client.
 
 ### The hash file verifies integrity, not authenticity
 
@@ -157,8 +244,8 @@ to the reader is already total control, so a signature here would be guarding a 
 down because it should be a decision on the record rather than a guarantee somebody infers from the word "hash".
 
 What actually protects the device from a bad image is unchanged and was never the hash: `validateImageFile()` runs
-twice (once when the file is staged, once at flash time, because the SD card is removable and that gap is real), and
-the user has to confirm on the device itself.
+when a BLE upload is committed and again at flash time, because the SD card is removable and that gap is real. Unless
+auto-install is on, the user also chooses on the device itself.
 
 The Store also runs **the other way round** — the device asks, the app answers — over the `status` notify
 channel. See [The Store](#the-store-requests-over-the-notify-channel).
@@ -254,6 +341,9 @@ A build without the network stack has no NTP, so **the phone sets the device clo
 {"op":"set_time","epoch":1725600000}
 ```
 
+An optional `utc_offset_q` carries the phone's time zone in quarter-hours biased by 48 (`48` = UTC+0, `52` = UTC+1,
+`28` = UTC-5). Values `0`–`96` are saved as the device's clock offset; anything else is ignored.
+
 `epoch` is UTC seconds. It is accepted only in `[1577836800, 4102444800)` — 2020 through 2099 — and refused outside
 that as `invalid epoch`; the lower bound is what distinguishes a real wall clock from an RTC that has never been set,
 and the upper bound stops a garbled value becoming a timestamp no later save can beat. Like every other op it requires
@@ -323,6 +413,8 @@ The payload is a JSON array, one object per book:
 | `filename` | string | Path relative to `/Books`, exactly as `library` reported it. Required. |
 | `location` | string | Hex-encoded saved position (see [Position encoding](#position-encoding)). Required. |
 | `timestamp` | number | UTC epoch seconds at which the app believes that position was reached. Required. |
+| `pct` | number | Optional. Progress through the book, `0`–`1`, stored beside the position so the library screen can show it without opening the book. Absent leaves the stored value alone. |
+| `spine`, `spine_n`, `spine_frac` | number | Optional, all or none. A position from another reading system: spine item index, the spine item count the sender measured, and a fraction `0`–`1` through that item. The reader checks `spine_n` against its own copy when it opens the book and ignores the jump if they differ. |
 
 Nothing is written until the whole batch is on the card and its SHA-256 matches, so a transfer cut short cannot
 half-apply.
@@ -442,7 +534,7 @@ So the `status` characteristic — already `notify`, already subscribed to by th
 channel**. When the reader wants something it puts a `pending` object in the status document and notifies:
 
 ```json
-{"state":"connected","protocol_version":1,"store_supported":true,"mode":"store",
+{"state":"connected","protocol_version":1,"store_supported":true,
  "pending":{"req":7,"op":"catalog_page","offset":12,"limit":6,
             "thumb_w":72,"thumb_h":108,"desc_max":160,"timeout_ms":20000}}
 ```
@@ -455,7 +547,7 @@ new transport.
 
 **A notification is a doorbell; a GATT read of `status` is authoritative.** A notification carries at most
 `ATT_MTU - 3` bytes — 514 at the 517 the reader asks for, 182 on a client that negotiates the iOS default,
-and 20 on one that never exchanges MTUs at all. The full status document is around 570 bytes, so it is
+and 20 on one that never exchanges MTUs at all. The full status document does not fit a notification, so it is
 **never** notified. The reader keeps the notified payload at or under **180 bytes**, which is `ATT_MTU - 3`
 for the ~185-byte MTU that iOS and most Android stacks settle on, so the doorbell survives a small MTU, a
 re-negotiation downwards, and a reconnect that never exchanges.
@@ -466,15 +558,20 @@ fits. It never truncates: a client always receives parseable JSON.
 | Dropped | Fields |
 | --- | --- |
 | first | `protocol_version`, `store_supported`, `clock_supported`, `device_time` |
-| then | `has_trusted_host`, `trusted_host`, `paired`, `name`, `path` |
+| then | `has_trusted_host`, `trusted_host`, `paired`, `name`, `path`, `book` |
 | then | `pending` keeps only `req`, `op` and the `id`/`offset` an answer must quote back |
 | then | the transfer counters (`kind`, `received`, `sent`, `size`, `ack_bytes`, `resumable`, `entries`, `applied`) and the `error` / `auth_error` text |
-| last | `pending` |
-| floor | `{"state":"…"}`, and below that `{}` |
+| never | `state`, the heartbeat fields `lib_n`, `lib_h`, `pct`, `open`, `sleeping`, and `pending` |
 
-`firmware_name`, `browser_companion_url`, `firmware_ota_supported`, `resume_supported`, `upload_kinds`,
-`download_kinds`, `device_id` and `device_nonce` are **read-only**: they are in the document a GATT read returns and
-in no notification at any size. None of them change within a session.
+If even the floor does not fit, no notification is sent; the GATT read still carries the session.
+
+`firmware_name`, `firmware_ota_supported`, `resume_supported`, `upload_kinds`, `download_kinds`, `device_id` and
+`device_nonce` are **read-only**: they are in the document a GATT read returns and in no notification at any size.
+None of them change within a session.
+
+The GATT read is bounded too, at 512 bytes. To fit it drops, in order, `firmware_name` / `firmware_ota_supported` /
+`resume_supported`, then `upload_kinds` / `download_kinds`, then `clock_supported` / `device_time`. It never drops
+identity, `device_nonce` or `auth_error`.
 
 `has_trusted_host` was promoted out of that read-only set on purpose. It is the field that separates "you were never
 saved here, pair with the code" from "your credential is wrong", and a client that only listens to the doorbell needs
@@ -535,7 +632,7 @@ currently on screen, and those are deleted when the screen closes or the link dr
 
 | Situation | Screen |
 | --- | --- |
-| No app connected, or connected but not yet through `hello` | *The Store needs your phone* — pairing code and the companion QR code |
+| No app connected, or connected but not yet through `hello` | *The Store needs your phone*, with one action that leads to pairing (no code or QR on this screen) |
 | Request outstanding | *Asking your phone* / *Fetching from Calibre*, Back cancels |
 | Deadline passed, or `catalog_error` | *The phone did not answer* + reason, Select retries, Back leaves |
 | Link dropped mid-browse | Everything on screen is discarded and it returns to *The Store needs your phone* |
@@ -718,27 +815,44 @@ Status JSON includes capability fields so clients can hide unsupported controls:
 {
   "protocol_version": 1,
   "firmware_name": "CrossPoint Reader",
-  "upload_kinds": ["book", "bmp", "firmware", "progress", "catalog_page", "catalog_detail"],
-  "download_kinds": ["crash_report", "library", "progress_result"],
-  "store_supported": true,
   "firmware_ota_supported": true,
+  "resume_supported": true,
+  "upload_kinds": ["book", "bmp", "firmware", "progress", "catalog_page", "catalog_detail", "settings", "book_meta"],
+  "download_kinds": ["crash_report", "library", "progress_result", "settings"],
+  "store_supported": true,
   "clock_supported": true,
-  "device_time": 1725600000,
-  "browser_companion_url": "https://ble.xteink.lol/"
+  "device_time": 1725600000
 }
 ```
 
 `device_time` is present only when the device knows the time; see [Device clock](#device-clock).
-`store_supported` says this firmware speaks the Store request protocol. There is no longer a `"mode"` field: the link
-is not a screen and has no mode. `firmware_ota_supported` still means "this reader accepts the `firmware` upload
-kind"; what it does with it is now the file drop described above.
+`store_supported` says this firmware speaks the Store request protocol. There is no `"mode"` field: the link is not a
+screen and has no mode. `firmware_ota_supported` means "this reader accepts the `firmware` upload kind"; what it does
+with it is the file drop described above. `download_kinds` does not list `about`, which is still supported. The
+firmware version is in the [`about`](#about) download, not in `status`.
 
-The states `confirming`, `updating`, `restarting`, `save_host_prompt` and `forget_host_prompt` no longer exist —
-nothing the link does needs a prompt on screen any more. `has_trusted_host` and `auth_error` are new in notifications.
+The states `confirming`, `updating`, `restarting`, `save_host_prompt` and `forget_host_prompt` do not exist; the
+firmware prompt is shown by the reader on its own, not by the link.
 
-**Every field above comes from a GATT read of `status`, not from a
-notification** — the whole document is ~570 bytes and no notification is large enough to carry it. Read the
-characteristic after subscribing and merge notifications over what it gave you; see
+**Every field above comes from a GATT read of `status`, not from a notification.** Read the characteristic after
+subscribing and merge notifications over what it gave you; see
 [The Store](#the-store-requests-over-the-notify-channel) for the exact rule.
+
+## Heartbeat fields
+
+These fields are in both the GATT read and every notification, and are never dropped to fit (except `book`, which is
+dropped with the identity fields):
+
+| Field | Type | Meaning |
+| --- | --- | --- |
+| `lib_n` | number | Number of books under `/Books`. `lib_n` and `lib_h` are absent while the library is empty or not yet fingerprinted. |
+| `lib_h` | number | Fingerprint of `/Books` (file names, sizes and modification times). A change means the app's copy of the library is stale and a `library` download is worth doing; no change means it can be skipped. |
+| `book` | string | File name (no folder) of the book last opened on the reader. Stays set after the book is closed. |
+| `pct` | number | Progress through that book, `0`–`1`, from its saved position. Absent when unknown. |
+| `open` | bool | `true` while a book is open on screen. Absent otherwise. |
+| `sleeping` | bool | `true` in the notification sent just before the reader goes into deep sleep. The link then drops. Absent otherwise. |
+
+When they are sent: every 60 seconds while a phone is connected, when a book opens or closes, when an EPUB position is
+saved, and once on the way into sleep.
 
 Clients should still handle `state: "error"` for rejected operations.

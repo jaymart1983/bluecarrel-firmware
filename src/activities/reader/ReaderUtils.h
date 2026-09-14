@@ -85,20 +85,27 @@ struct TouchPageTurn {
 
 inline TouchPageTurn detectTouchPageTurn(const GfxRenderer& renderer, const MappedInputManager& input) {
   TouchPageTurn result{false, false, 0};
-  if (!SETTINGS.touchReaderControls || !input.hasTouch()) {
+  // Page-turn taps are switched off only by the global touchscreen switch
+  // (Action Centre): wasScreenTapped() and wasSwipe() report nothing while it is
+  // off. touchReaderControls does not gate them, because it is not reachable on
+  // every device; it only selects Swipe mode and which side goes back (Inverted
+  // Tap).
+  if (!input.hasTouch()) {
     return result;
   }
 
   if (SETTINGS.touchReaderControls == CrossPointSettings::TOUCH_READER_SWIPE) {
-    // Horizontal swipes turn pages; taps remain free for the centered reader-menu
-    // zone. A slow swipe never becomes a long-press chapter skip.
+    // Horizontal swipes turn pages. A slow swipe never becomes a long-press
+    // chapter skip. Swipe mode takes the page-turn taps below too.
     const auto dir = input.wasSwipe();
     if (dir == MappedInputManager::SwipeDir::Left) {
       result.next = true;
-    } else if (dir == MappedInputManager::SwipeDir::Right) {
-      result.prev = true;
+      return result;
     }
-    return result;
+    if (dir == MappedInputManager::SwipeDir::Right) {
+      result.prev = true;
+      return result;
+    }
   }
 
   int x = 0;
@@ -107,15 +114,22 @@ inline TouchPageTurn detectTouchPageTurn(const GfxRenderer& renderer, const Mapp
     return result;
   }
 
+  // Page-turn taps on a 4x4 grid over the page: the middle two rows of the outer
+  // columns -- two cells on the left turn back, two on the right turn forward.
+  // The top and bottom rows stay free, and the centre columns keep the
+  // reader-menu tap (isTouchMenuTap, the centre third), which these quarter-width
+  // columns do not reach. Logical coordinates, so the grid follows the reading
+  // orientation.
   const int16_t width = static_cast<int16_t>(renderer.getScreenWidth());
   const int16_t height = static_cast<int16_t>(renderer.getScreenHeight());
-  // Outer thirds only: the center column contains the reader-menu tap target
-  // (isTouchMenuTap below), so it must not double as a page turn.
-  const int16_t zoneWidth = width / 3;
+  const int16_t cellWidth = width / 4;
+  const int16_t cellHeight = height / 4;
+  const int16_t bandTop = cellHeight;
+  const int16_t bandHeight = static_cast<int16_t>(height - 2 * cellHeight);
   const bool inverted = SETTINGS.touchReaderControls == CrossPointSettings::TOUCH_READER_INVERTED_TAP;
   const freeink::ui::TapZone zones[] = {
-      {freeink::ui::Rect{0, 0, zoneWidth, height}, inverted ? READER_TOUCH_NEXT : READER_TOUCH_PREV},
-      {freeink::ui::Rect{static_cast<int16_t>(width - zoneWidth), 0, zoneWidth, height},
+      {freeink::ui::Rect{0, bandTop, cellWidth, bandHeight}, inverted ? READER_TOUCH_NEXT : READER_TOUCH_PREV},
+      {freeink::ui::Rect{static_cast<int16_t>(width - cellWidth), bandTop, cellWidth, bandHeight},
        inverted ? READER_TOUCH_PREV : READER_TOUCH_NEXT},
   };
 
@@ -130,8 +144,8 @@ inline TouchPageTurn detectTouchPageTurn(const GfxRenderer& renderer, const Mapp
 }
 
 // Tap in the center third of the screen: the tap path into the reader menu on
-// every touch board. The page-turn tap zones are the outer horizontal thirds,
-// so the centered rectangle remains free in tap mode. The Off/Swipe Up
+// every touch board. The page-turn tap cells are the outer quarter columns of
+// the middle band, so the centered rectangle remains free. The Off/Swipe Up
 // alternatives are only surfaced on home-key boards (SettingsList), where the
 // menu stays reachable through the key's long-press function.
 inline bool isTouchMenuTap(const GfxRenderer& renderer, const MappedInputManager& input) {
@@ -151,7 +165,7 @@ inline bool isTouchMenuTap(const GfxRenderer& renderer, const MappedInputManager
 // boards a long press of the capacitive key runs the user-selected long-press
 // function instead (SETTINGS.longPressMenuFunction), not the menu.
 // Menu gestures honor showReaderMenu independently of touchReaderControls,
-// which only gates page-turn touch zones in detectTouchPageTurn().
+// which only selects the page-turn gesture style in detectTouchPageTurn().
 inline bool isTouchMenuGesture(const GfxRenderer& renderer, const MappedInputManager& input) {
   if (!input.hasTouch()) return false;
   if (input.wasMenuGesture()) return true;
@@ -163,47 +177,37 @@ inline bool isTouchMenuGesture(const GfxRenderer& renderer, const MappedInputMan
   return isTouchMenuTap(renderer, input);
 }
 
-// One helper, blocking or deferred: the async form starts the refresh and
-// returns so the caller can overlap CPU work with the panel's refresh time.
-// Async callers must not touch the framebuffer until
-// renderer.waitRefreshComplete() and must rebuild the differential baseline
-// before the next page turn (the tiled grayscale cleanup does).
-// The page cadence is the CEILING, not the only trigger: the renderer's change
-// budget can promote an update to a clean waveform sooner when a lot of the
-// screen has moved (menus, popups, image-heavy pages). When it does, restart
-// the page count instead of decrementing it -- the panel was just scrubbed, and
-// scheduling a second scrub a page or two later is pure flash for no gain.
-inline void noteRefreshCycle(const GfxRenderer& renderer, int& pagesUntilFullRefresh) {
-  if (pagesUntilFullRefresh <= 1 || renderer.lastRefreshWasClean()) {
-    pagesUntilFullRefresh = SETTINGS.getRefreshFrequency();
-  } else {
-    pagesUntilFullRefresh--;
-  }
-}
-
-inline void displayWithRefreshCycle(const GfxRenderer& renderer, int& pagesUntilFullRefresh, bool async = false) {
-  const auto mode = (pagesUntilFullRefresh <= 1) ? HalDisplay::HALF_REFRESH : HalDisplay::FAST_REFRESH;
+// Display a reader page. Page turns always use the FAST waveform; there is no
+// page-count schedule of clean refreshes. A clean refresh happens only on
+// request -- the Action Centre Refresh tile (GfxRenderer::promoteNextRefresh) or
+// a Force Refresh power-button press (ReaderActivity::handleForcedRefresh) --
+// or, if ghost cleanup is enabled, when GfxRenderer's change budget decides the
+// panel needs it.
+//
+// Blocking or deferred: the async form starts the refresh and returns so the
+// caller can overlap CPU work with the panel's refresh time. Async callers must
+// not touch the framebuffer until renderer.waitRefreshComplete() and must
+// rebuild the differential baseline before the next page turn (the tiled
+// grayscale cleanup does).
+inline void displayReaderPage(const GfxRenderer& renderer, bool async = false) {
   if (async) {
-    renderer.displayBufferAsync(mode);
+    renderer.displayBufferAsync(HalDisplay::FAST_REFRESH);
   } else {
-    renderer.displayBuffer(mode);
+    renderer.displayBuffer(HalDisplay::FAST_REFRESH);
   }
-  noteRefreshCycle(renderer, pagesUntilFullRefresh);
 }
 
 // Display the B/W base of a page whose grayscale pass follows. Panels that
 // combine the base (Paper Mono) defer the activation so base + gray planes go
 // out as one waveform — displaying the base separately makes the gray pass
 // re-drive the whole text body (a visible flash). Other panels display
-// normally. Same refresh-cadence bookkeeping as displayWithRefreshCycle.
-inline void displayBaseWithRefreshCycle(const GfxRenderer& renderer, int& pagesUntilFullRefresh) {
+// normally.
+inline void displayReaderPageBase(const GfxRenderer& renderer) {
   if (!renderer.combinesGrayscaleBase()) {
-    displayWithRefreshCycle(renderer, pagesUntilFullRefresh);
+    displayReaderPage(renderer);
     return;
   }
-  const auto mode = (pagesUntilFullRefresh <= 1) ? HalDisplay::HALF_REFRESH : HalDisplay::FAST_REFRESH;
-  renderer.displayGrayscaleBase(mode);
-  noteRefreshCycle(renderer, pagesUntilFullRefresh);
+  renderer.displayGrayscaleBase(HalDisplay::FAST_REFRESH);
 }
 
 // Grayscale anti-aliasing pass. Renders content twice (LSB + MSB) to build

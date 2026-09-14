@@ -93,6 +93,15 @@ class HomeShelfStore : public PersistableStore<HomeShelfStore> {
   // or any timestamp changed, so the caller knows whether to persist and repaint.
   bool refreshReadTimes();
 
+  // Moves `path` to the front the moment it is OPENED, rather than when a page
+  // turn later writes its saved time. Home used to draw the old order on return
+  // and then re-sort under the user's finger, so the book they were reaching
+  // for had moved by the time they pressed it. Stamps the book newer than every
+  // other in-progress book (the clock may be unset). Returns true when the
+  // shelf changed and should be saved; false when it was already first or is
+  // not on the shelf.
+  bool promote(const std::string& path);
+
   // The shared ordering, exposed so the rebuild and the cheap refresh cannot
   // drift apart: in-progress first (most recently read first), then never-opened
   // (most recently added first), unknown timestamps last within their group.

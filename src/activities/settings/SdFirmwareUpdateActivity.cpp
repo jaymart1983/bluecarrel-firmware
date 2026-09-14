@@ -10,6 +10,7 @@
 #include "MappedInputManager.h"
 #include "activities/home/FileBrowserActivity.h"
 #include "activities/util/ConfirmationActivity.h"
+#include "SilentRestart.h"
 #include "components/UITheme.h"
 #include "fontIds.h"
 #include "network/FirmwareFlasher.h"
@@ -23,6 +24,7 @@ void SdFirmwareUpdateActivity::onEnter() {
   Activity::onEnter();
   // Build-identity marker — confirms which firmware build owns the SD update flow.
   LOG_INF("FW", "SdFirmwareUpdateActivity build=%s %s recovery=%d", __DATE__, __TIME__, recoveryMode ? 1 : 0);
+  if (stagedDrop) firmware_staging::readVersion(stagedVersion);
   if (presetPath) {
     // Validate on the first render rather than here: onEnter() runs before the
     // activity has painted anything, and validateFirmware() is seconds of SD
@@ -33,6 +35,18 @@ void SdFirmwareUpdateActivity::onEnter() {
       RenderLock lock(*this);
       state = State::FAILED;
       requestUpdate();
+      return;
+    }
+    if (autoConfirm) {
+      // Update now, or an install at sleep: asked and answered already.
+      {
+        RenderLock lock(*this);
+        state = State::UPDATING;
+        writtenBytes = 0;
+        lastRenderedPercent = 101;
+      }
+      requestUpdateAndWait();
+      performUpdate();
       return;
     }
     promptConfirmation();
@@ -147,6 +161,7 @@ void SdFirmwareUpdateActivity::promptConfirmation() {
   std::string body = firmwarePath;
   const auto pos = body.find_last_of('/');
   if (pos != std::string::npos) body = body.substr(pos + 1);
+  if (stagedDrop && !stagedVersion.empty()) body = std::string(tr(STR_FIRMWARE_VERSION)) + " " + stagedVersion;
 
   startActivityForResult(std::make_unique<ConfirmationActivity>(renderer, mappedInput, heading, body),
                          [this](const ActivityResult& result) { onConfirmationResult(result); });
@@ -230,6 +245,9 @@ void SdFirmwareUpdateActivity::performUpdate() {
   }
   requestUpdateAndWait();
   delay(1500);
+  // Installed on the way to sleep: come up only to go straight back to sleep
+  // on the new build. restartToSleepAfterUpdate() does not return.
+  if (sleepAfter) restartToSleepAfterUpdate();
   ESP.restart();
 }
 
@@ -264,6 +282,10 @@ void SdFirmwareUpdateActivity::render(RenderLock&&) {
   const auto top = (pageHeight - lineHeight) / 2;
 
   if (state == State::VALIDATING) {
+    if (!stagedVersion.empty()) {
+      renderer.drawCenteredText(UI_10_FONT_ID, top - lineHeight - metrics.verticalSpacing,
+                                (std::string(tr(STR_FIRMWARE_VERSION)) + " " + stagedVersion).c_str());
+    }
     renderer.drawCenteredText(UI_10_FONT_ID, top, tr(STR_VALIDATING_FIRMWARE));
   } else if (state == State::UPDATING) {
     // Throttle redraws to once per percent.
@@ -273,6 +295,10 @@ void SdFirmwareUpdateActivity::render(RenderLock&&) {
     }
     lastRenderedPercent = pct;
 
+    if (!stagedVersion.empty()) {
+      renderer.drawCenteredText(UI_10_FONT_ID, top - lineHeight - metrics.verticalSpacing,
+                                (std::string(tr(STR_FIRMWARE_VERSION)) + " " + stagedVersion).c_str());
+    }
     renderer.drawCenteredText(UI_10_FONT_ID, top, tr(STR_UPDATING), true, EpdFontFamily::BOLD);
 
     int y = top + lineHeight + metrics.verticalSpacing;
@@ -298,7 +324,8 @@ void SdFirmwareUpdateActivity::render(RenderLock&&) {
       renderer.drawCenteredText(UI_10_FONT_ID, top + lineHeight + metrics.verticalSpacing, errorMessage.c_str());
     }
     const auto labels = mappedInput.mapLabels(tr(STR_BACK), "", "", "");
-    GUI.drawButtonHints(renderer, labels.btn1, labels.btn2, labels.btn3, labels.btn4);
+    // A tap anywhere dismisses this screen (loop()), so no Back chip.
+    GUI.drawButtonHints(renderer, labels.btn1, labels.btn2, labels.btn3, labels.btn4, /*touchBack=*/false);
   } else {
     // PICKING / CONFIRMING: a sub-activity is on top, nothing to draw.
     if (recoveryMode) {

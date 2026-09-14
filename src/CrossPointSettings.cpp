@@ -7,7 +7,6 @@
 #include <algorithm>
 #include <cstring>
 #include <iterator>
-#include <limits>
 #include <string>
 
 #include "I18nKeys.h"
@@ -215,6 +214,14 @@ bool CrossPointSettings::fromJson(JsonVariantConst doc) {
     shortPwrBtn = PWR_CONTROL_CENTER;
     LOG_INF("CPS", "Migrated shortPwrBtn Confirm -> Control Centre (settings rev %u -> %u)", storedRev, SETTINGS_REV);
   }
+  // Rev 2: no automatic ghost-cleanup scrubs on the X4 Pro. Every device that ran an
+  // earlier build has ghostCleanup stored (Normal by default, a flash about every five
+  // pages), so the new default alone would change nothing. Applied once; turning it
+  // back on from the app afterwards sticks.
+  if (storedRev < 2 && ghostCleanup != GHOST_CLEANUP_OFF) {
+    ghostCleanup = GHOST_CLEANUP_OFF;
+    LOG_INF("CPS", "Migrated ghostCleanup -> Off (settings rev %u -> %u)", storedRev, SETTINGS_REV);
+  }
   // Reading orientation: persisted by hand here, because the SettingsList entry
   // that would otherwise carry it is compiled out on this board (portrait does
   // not exist, so there is nothing left to pick between in a settings row).
@@ -387,43 +394,34 @@ unsigned long CrossPointSettings::getSleepTimeoutMs() const {
   return static_cast<unsigned long>(minutes) * 60UL * 1000UL;
 }
 
-int CrossPointSettings::getRefreshFrequency() const {
-  switch (refreshFrequency) {
-    case REFRESH_1:
-      return 1;
-    case REFRESH_5:
-      return 5;
-    case REFRESH_10:
-      return 10;
-    case REFRESH_15:
-    default:
-      return 15;
-    case REFRESH_30:
-      return 30;
-    case REFRESH_NEVER:
-      // Effectively disables the periodic full refresh; the page counter
-      // counts down from here and never reaches the threshold in practice.
-      return std::numeric_limits<int>::max();
-  }
-}
-
 uint16_t CrossPointSettings::getGhostCleanupPercent() const {
   // Percent of the panel's pixels that may flip through fast differential
-  // updates before one is promoted to a clean waveform. Calibrated against a
-  // page turn, which flips roughly 10-20% of an 800x480 text page (ink coverage
-  // is ~5-10%, and a turn erases the old glyphs as well as painting the new
-  // ones): Normal lands the cleanup around every 8-12 pages, a little sooner
-  // than the 15-page default cadence, and much sooner in a menu-heavy session.
+  // updates before the panel is scrubbed with a clean waveform.
+  //
+  // Measured on this panel rather than estimated: a text page turn logs +17-18%
+  // per frame (see the GFX "ghosting:" lines at LOG_LEVEL 2), so the budget
+  // divided by 18 is roughly how many page turns pass between flashes.
+  //
+  //   Light       300 -> ~17 pages
+  //   Normal       90 -> ~5 pages
+  //   Aggressive   54 -> ~3 pages
+  //
+  // Normal is sized for anti-aliasing off. With AA on, its grayscale pass
+  // re-drives the panel on every page; with it off nothing does, and much wider
+  // spacing leaves text ghosting badly enough to read through.
+  //
+  // This is a genuine dial, not a defect: closer together means less residue
+  // and more flashes. It is exposed in the phone app as Ghost cleanup.
   switch (ghostCleanup) {
     case GHOST_CLEANUP_OFF:
       return 0;
     case GHOST_CLEANUP_LIGHT:
       return 300;
     case GHOST_CLEANUP_AGGRESSIVE:
-      return 75;
+      return 54;
     case GHOST_CLEANUP_NORMAL:
     default:
-      return 150;
+      return 90;
   }
 }
 

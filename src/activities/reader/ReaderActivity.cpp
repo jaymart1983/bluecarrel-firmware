@@ -9,6 +9,7 @@
 #include "CrossPointSettings.h"
 #include "CrossPointState.h"
 #include "EpubReaderActivity.h"
+#include "HomeShelfStore.h"
 #include "ReaderUtils.h"
 #include "RecentBooksStore.h"
 #include "SdCardFontSystem.h"
@@ -16,24 +17,19 @@
 #include "XtcReaderActivity.h"
 
 ReaderActivity::ReaderActivity(const char* name, GfxRenderer& renderer, MappedInputManager& mappedInput,
-                               std::string bookPath, const bool allowFastInitialRefresh)
-    : Activity(name, renderer, mappedInput), bookPath(std::move(bookPath)) {
-  if (allowFastInitialRefresh) {
-    const int refreshFrequency = SETTINGS.getRefreshFrequency();
-    pagesUntilFullRefresh = refreshFrequency > 1 ? refreshFrequency : 2;
-  }
-}
+                               std::string bookPath)
+    : Activity(name, renderer, mappedInput), bookPath(std::move(bookPath)) {}
 
 std::unique_ptr<ReaderActivity> ReaderActivity::create(GfxRenderer& renderer, MappedInputManager& mappedInput,
-                                                       std::string path, const bool allowFastInitialRefresh) {
+                                                       std::string path) {
   // ActivityManager requires heap ownership; each branch allocates exactly one screen-lifetime object.
   std::unique_ptr<ReaderActivity> activity;
   if (FsHelpers::hasXtcExtension(path)) {
-    activity = makeUniqueNoThrow<XtcReaderActivity>(renderer, mappedInput, std::move(path), allowFastInitialRefresh);
+    activity = makeUniqueNoThrow<XtcReaderActivity>(renderer, mappedInput, std::move(path));
   } else if (FsHelpers::hasTxtExtension(path) || FsHelpers::hasMarkdownExtension(path)) {
-    activity = makeUniqueNoThrow<TxtReaderActivity>(renderer, mappedInput, std::move(path), allowFastInitialRefresh);
+    activity = makeUniqueNoThrow<TxtReaderActivity>(renderer, mappedInput, std::move(path));
   } else {
-    activity = makeUniqueNoThrow<EpubReaderActivity>(renderer, mappedInput, std::move(path), allowFastInitialRefresh);
+    activity = makeUniqueNoThrow<EpubReaderActivity>(renderer, mappedInput, std::move(path));
   }
 
   if (!activity) {
@@ -43,8 +39,6 @@ std::unique_ptr<ReaderActivity> ReaderActivity::create(GfxRenderer& renderer, Ma
 }
 
 void ReaderActivity::applyInitialOrientation() { ReaderUtils::applyOrientation(renderer, SETTINGS.orientation); }
-
-void ReaderActivity::disableFastInitialRefresh() { pagesUntilFullRefresh = 0; }
 
 void ReaderActivity::onEnter() {
   Activity::onEnter();
@@ -58,6 +52,7 @@ void ReaderActivity::onEnter() {
   sdFontSystem.ensureLoaded(renderer);
   applyInitialOrientation();
 
+
   if (!loadBook()) {
     finish();
     return;
@@ -65,6 +60,10 @@ void ReaderActivity::onEnter() {
 
   APP_STATE.openEpubPath = bookPath;
   APP_STATE.saveToFile();
+  // Take the front of the home shelf NOW, while the reader is on screen, so
+  // Home already has its final order when the user returns to it.
+  if (!HOME_SHELF.isValid()) HOME_SHELF.loadFromFile();
+  if (HOME_SHELF.promote(bookPath)) HOME_SHELF.saveToFile();
   RECENT_BOOKS.addBook(bookPath, getBookTitle(), getBookAuthor(), getBookThumbBmpPath());
   requestUpdate();
 }
@@ -197,7 +196,6 @@ void ReaderActivity::render(RenderLock&&) {
 bool ReaderActivity::handleForcedRefresh() {
   {
     RenderLock lock(*this);
-    pagesUntilFullRefresh = 1;
     forcedRefreshPending = true;
   }
   requestUpdate();

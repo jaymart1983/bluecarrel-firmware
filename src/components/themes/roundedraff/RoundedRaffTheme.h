@@ -94,7 +94,10 @@ class RoundedRaffTheme : public BaseTheme {
   void drawButtonMenu(GfxRenderer& renderer, Rect rect, int buttonCount, int selectedIndex,
                       const std::function<std::string(int index)>& buttonLabel,
                       const std::function<UIIcon(int index)>& rowIcon,
-                      const std::function<std::string(int index)>& rowCover = nullptr) const override;
+                      const std::function<std::string(int index)>& rowCover = nullptr,
+                      int rowHeightOverride = 0,
+                      const std::function<bool(int index)>& rowMarked = nullptr,
+                      const std::function<float(int index)>& rowPercent = nullptr) const override;
   void drawTextField(const GfxRenderer& renderer, Rect rect, int textWidth, bool cursorMode = false,
                      int contentStartX = 0, int contentWidth = 0) const override;
   void drawButtonHints(GfxRenderer& renderer, const char* btn1, const char* btn2, const char* btn3,

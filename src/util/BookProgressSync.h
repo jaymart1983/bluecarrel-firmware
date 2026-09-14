@@ -70,7 +70,32 @@ bool isValidLocationLength(const std::string& fileName, size_t len);
 // older than this feature or saved while the device had no clock -- counts as
 // the oldest possible, so any real incoming timestamp wins. Equal timestamps do
 // not apply: an echo of what the device already sent must be a no-op.
+/// A position that arrived as "spine item + fraction" rather than as one of this
+/// reader's own locations.
+///
+/// This is how a position from a DIFFERENT reading system arrives. Its native
+/// position is meaningless here -- another system's offsets index a file this
+/// device will never hold -- so the sender resolves it against the EPUB's spine
+/// and sends that instead. There may therefore be NO `locationHex` at all, which
+/// is the one case where an entry with an empty location is still valid.
+struct SpineJump {
+  bool present = false;
+  uint16_t spineIndex = 0;
+  float fraction = 0.0f;
+  /// Spine item count the sender measured. Checked against this reader's own
+  /// copy at open; a mismatch means a different file and the jump is discarded.
+  uint16_t spineCount = 0;
+};
+
+/// `percentBp` is how far through the book the incoming position is, in basis
+/// points (0..10000), or 0 for "not supplied".
+///
+/// It has to travel with the position. The device's shelf reads its percentage
+/// out of the progress.time sidecar, so a position applied without one wrote a
+/// sidecar saying 0% and the book lost its percentage on the library screen --
+/// not merely failing to gain the sender's figure, but ERASING whatever the
+/// reader had worked out for itself.
 ApplyResult applyProgress(const char* booksRoot, const std::string& relativePath, const std::string& locationHex,
-                          uint32_t timestamp);
+                          uint32_t timestamp, const SpineJump& jump = {}, uint16_t percentBp = 0);
 
 }  // namespace BookProgressSync

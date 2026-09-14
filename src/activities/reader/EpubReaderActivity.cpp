@@ -1,3 +1,6 @@
+#if FREEINK_CAP_BLE_TRANSFER
+#include "network/BleLink.h"
+#endif
 #include "EpubReaderActivity.h"
 
 #include <Epub/Page.h>
@@ -42,6 +45,7 @@
 #include "SdCardFontSystem.h"
 #include "activities/settings/TextSettingsActivity.h"
 #include "components/UITheme.h"
+#include "components/themes/BaseTheme.h"
 #include "fontIds.h"
 #include "util/BookmarkUtil.h"
 #include "util/ButtonNavigator.h"
@@ -189,7 +193,6 @@ bool EpubReaderActivity::loadBook() {
 
   const bool uncached = !Storage.exists((loadedEpub->getCachePath() + "/book.bin").c_str());
   if (uncached) {
-    disableFastInitialRefresh();
     GUI.drawPopup(renderer, tr(STR_INDEXING));
   }
 
@@ -219,6 +222,17 @@ bool EpubReaderActivity::loadBook() {
     if (dataSize == 4 || dataSize == 6 || dataSize == 10) {
       currentSpineIndex = data[0] + (data[1] << 8);
       nextPageNumber = data[2] + (data[3] << 8);
+      // A saved position can now outlive the file it was saved against: the
+      // BLE upload keeps progress.bin when Calibre sends a revised copy. A
+      // revision that shortened the book would otherwise leave this pointing
+      // past the last spine item. Start of book is the honest fallback; kosync
+      // can still move it forward on the next sync.
+      if (currentSpineIndex >= epub->getSpineItemsCount()) {
+        LOG_INF("ERS", "Saved spine %d no longer exists (%d items); starting at the beginning", currentSpineIndex,
+                epub->getSpineItemsCount());
+        currentSpineIndex = 0;
+        nextPageNumber = 0;
+      }
       if (nextPageNumber == UINT16_MAX) {
         LOG_DBG("ERS", "Ignoring stale last-page sentinel from progress cache");
         nextPageNumber = 0;
@@ -273,7 +287,9 @@ void EpubReaderActivity::openReaderMenu() {
         static_cast<float>(section->currentPage) / static_cast<float>(section->estimatedTotalPages());
     bookProgress = epub->calculateProgress(currentSpineIndex, chapterProgress) * 100.0f;
   }
-  const int bookProgressPercent = clampPercent(static_cast<int>(bookProgress + 0.5f));
+  // Carried as a float: clamping through an int here is what made the menu
+  // disagree with the top bar.
+  const float bookProgressPercent = bookProgress < 0.0f ? 0.0f : (bookProgress > 100.0f ? 100.0f : bookProgress);
   startActivityForResult(std::make_unique<EpubReaderMenuActivity>(
                              renderer, mappedInput, epub->getTitle(), currentPage, totalPages, bookProgressPercent,
                              SETTINGS.orientation, !currentPageFootnotes.empty(), !cachedBookmarks.empty()),
@@ -296,10 +312,20 @@ bool EpubReaderActivity::buildTickHeapGate() {
   return !buildHeapPaused;
 }
 
-void EpubReaderActivity::showBuildPopup(GfxRenderer& renderer, int& pagesUntilFullRefresh) {
+void EpubReaderActivity::showBuildPopup(GfxRenderer& renderer) {
   if (!buildPopupPending || !renderer.hasFrameBuffer()) return;
+  // Not before the build has actually kept the reader waiting.
+  //
+  // The wait loop below already applied this deadline, but the progress
+  // callback handed to startBuild() did not -- so any build that reported
+  // progress at all raised the popup immediately, however fast it finished.
+  // That is invisible in a normal book, whose sections are few and large. In a
+  // book split into 1210 sections of a few hundred bytes each, it means a
+  // popup flashing up every few taps for a build that was over before it was
+  // drawn. Judged by measured elapsed time rather than by section size, so a
+  // large section that builds quickly stays quiet too.
+  if (millis() - buildStartMs < BUILD_POPUP_DEADLINE_MS) return;
   GUI.drawPopup(renderer, tr(STR_INDEXING));
-  pagesUntilFullRefresh = 1;
   buildPopupPending = false;
 }
 
@@ -319,6 +345,10 @@ void EpubReaderActivity::openDictionaryWordSelect() {
                                    &orientedMarginLeft);
   orientedMarginTop += SETTINGS.screenMargin;
   orientedMarginLeft += SETTINGS.screenMargin;
+  // Same reservation the page was laid out with (see renderPage): word-selection
+  // hit boxes are offsets into the page, so a top margin that disagrees with the
+  // one the text was drawn at picks the wrong word.
+  orientedMarginTop += BaseTheme::readerTopBarHeight();
 
   startActivityForResult(std::make_unique<DictionaryWordSelectActivity>(renderer, mappedInput, std::move(page),
                                                                         orientedMarginLeft, orientedMarginTop),
@@ -329,6 +359,38 @@ void EpubReaderActivity::loop() {
   if (!epub) {
     finish();
     return;
+  }
+
+  // A position that arrived from another device while this book was closed.
+  //
+  // Resolved HERE rather than when it was received, because it is expressed as a
+  // spine item plus a fraction and turning that into a page needs the book open
+  // and the section paginated -- neither of which is true inside a BLE transfer.
+  //
+  // Consumed exactly once, whatever the outcome. A jump that survived would drag
+  // the book back to another device's position on every single open.
+  if (!syncJumpChecked) {
+    syncJumpChecked = true;
+    uint16_t jumpSpine = 0;
+    uint16_t jumpCount = 0;
+    float jumpFraction = 0.0f;
+    const std::string cachePath = epub->getCachePath();
+    if (ProgressFile::readSyncJump(cachePath, jumpSpine, jumpFraction, jumpCount)) {
+      ProgressFile::clearSyncJump(cachePath);
+      const int spineCount = epub->getSpineItemsCount();
+      if (spineCount > 0 && static_cast<int>(jumpCount) == spineCount && static_cast<int>(jumpSpine) < spineCount) {
+        LOG_INF("ERS", "Applying synced position: spine %u frac %.4f", static_cast<unsigned>(jumpSpine),
+                static_cast<double>(jumpFraction));
+        jumpToSpine(static_cast<int>(jumpSpine), jumpFraction);
+        return;
+      }
+      // The sender measured a different file -- a re-conversion, or another
+      // copy of the same title. Its spine indices do not describe this book, so
+      // the jump is dropped rather than applied to whatever chapter happens to
+      // sit at that index. The sender publishes a percentage for this case.
+      LOG_INF("ERS", "Ignoring synced position: spine count %u != this book's %d", static_cast<unsigned>(jumpCount),
+              spineCount);
+    }
   }
 
   // A book that would not index: hold the message long enough to read, then go
@@ -368,6 +430,76 @@ void EpubReaderActivity::loop() {
             scope.endScanAndPrewarm();
             LOG_DBG("ERS", "Idle prewarm: page %d in %lums", nextPage, millis() - t0);
           }
+        }
+      }
+    }
+  }
+
+  // Pre-build the next chapter while nothing else is happening.
+  //
+  // Answers the fair complaint that on-demand paging is not really caching. The
+  // work cannot be done at load -- laying out all 96 spine items before showing
+  // page one is the freeze a big book used to produce, and the layout depends on
+  // the render spec, so it would be thrown away the moment the font size moved.
+  // But it CAN be done ahead of the moment it is needed, which is what this does:
+  // between page turns, four pages at a time, on the chapter the reader is most
+  // likely to ask for next.
+  //
+  // Cheap to abandon. Section's destructor calls suspendBuild(), which persists
+  // a partial index rather than discarding it, so a pass interrupted by the user
+  // still leaves the next open faster than it would have been.
+  if (!RenderLock::peek() && buildViewportWidth > 0 && section && !section->isBuilding() && !section->isPartial() &&
+      lastRenderCompleteMs != 0 && millis() - lastRenderCompleteMs > IDLE_PREWARM_DEBOUNCE_MS &&
+      ESP.getFreeHeap() > RENDER_MIN_FREE_HEAP && ESP.getMaxAllocHeap() > BACKGROUND_BUILD_MIN_MAX_ALLOC) {
+    // Which chapter is "next" is a TOC question, not a spine question: a chapter
+    // split across files would otherwise have us pre-building its own second
+    // half, which is already indexed.
+    int target = -1;
+    const int tocCount = epub->getTocItemsCount();
+    const int here = tocCount > 0 ? epub->getTocIndexForSpineIndex(currentSpineIndex) : -1;
+    if (here >= 0 && here + 1 < tocCount) {
+      const auto item = epub->getTocItem(here + 1);
+      if (item.spineIndex > currentSpineIndex) target = item.spineIndex;
+    } else if (currentSpineIndex + 1 < epub->getSpineItemsCount()) {
+      target = currentSpineIndex + 1;
+    }
+
+    if (target < 0) {
+      prebuildSection.reset();
+      prebuildSpine = -1;
+    } else {
+      RenderLock lock;
+      if (prebuildSection && prebuildSpine != target) {
+        prebuildSection.reset();  // destructor persists what it reached
+        prebuildSpine = -1;
+      }
+      const ReaderRenderSpec spec = SETTINGS.readerRenderSpec(buildViewportWidth, buildViewportHeight);
+      if (!prebuildSection && prebuildSpine != target) {
+        // Once per chapter. This used to run on EVERY idle tick: a chapter found
+        // already indexed reset prebuildSection, the test above saw it empty again,
+        // and the section file was deserialised ~19 times a second for as long as the
+        // book stayed open (1311 times in 70 s on the reader). prebuildSpine is what
+        // remembers the answer; it moves on when the reader moves to a new chapter.
+        auto candidate = std::unique_ptr<Section>(new Section(epub, target, renderer));
+        // Already indexed for these settings? Then there is nothing to do, and
+        // saying so once stops this from re-checking every idle tick.
+        if (candidate->loadSectionFile(spec) && !candidate->isPartial()) {
+          prebuildSpine = target;
+          prebuildSection.reset();
+          idlePrewarmSpine = currentSpineIndex;  // nothing further to warm here
+        } else if (candidate->startBuild(spec)) {
+          prebuildSpine = target;
+          prebuildSection = std::move(candidate);
+          LOG_DBG("ERS", "Pre-building next chapter (spine %d)", target);
+        }
+      } else if (prebuildSection && !prebuildSection->isBuildComplete()) {
+        if (!prebuildSection->buildSomeMore(PREBUILD_PAGES_PER_TICK)) {
+          LOG_DBG("ERS", "Pre-build of spine %d abandoned", prebuildSpine);
+          prebuildSection.reset();
+        } else if (prebuildSection->isBuildComplete()) {
+          LOG_DBG("ERS", "Pre-built next chapter (spine %d, %d pages)", prebuildSpine,
+                  prebuildSection->pageCount);
+          prebuildSection.reset();
         }
       }
     }
@@ -420,7 +552,19 @@ void EpubReaderActivity::loop() {
     pendingReadFolderMove = false;
   }
 
-  const auto touch = ReaderUtils::detectTouchPageTurn(renderer, mappedInput);
+  auto touch = ReaderUtils::detectTouchPageTurn(renderer, mappedInput);
+  // A link inside a page-turn cell is still a link: the tap follows it (below)
+  // rather than turning the page out from under it.
+  if ((touch.prev || touch.next) && !currentPageLinks.empty()) {
+    int tapX = 0;
+    int tapY = 0;
+    if (mappedInput.wasScreenTapped(tapX, tapY) &&
+        EpubReaderUtils::linkAtPoint(currentPageLinks, tapX, tapY, currentPageLinkMarginLeft,
+                                     currentPageLinkMarginTop)) {
+      touch.prev = false;
+      touch.next = false;
+    }
+  }
 
   if (showBookmarkMessage && (millis() - bookmarkMessageTime) >= ReaderUtils::BOOKMARK_MESSAGE_DURATION_MS) {
     showBookmarkMessage = false;
@@ -554,8 +698,9 @@ void EpubReaderActivity::loop() {
     }
   }
 
-  // Link taps take priority over the reader-menu and page-turn zones.
-  if (!atEndOfBook && !currentPageLinks.empty() && SETTINGS.touchReaderControls && mappedInput.hasTouch()) {
+  // Link taps take priority over the reader-menu and page-turn zones. Like
+  // page-turn taps, they are gated only by the global touchscreen switch.
+  if (!atEndOfBook && !currentPageLinks.empty() && mappedInput.hasTouch()) {
     int touchX = 0;
     int touchY = 0;
     if (mappedInput.wasScreenTapped(touchX, touchY)) {
@@ -677,16 +822,50 @@ void EpubReaderActivity::loop() {
   requestUpdate();
 }
 
-void EpubReaderActivity::jumpToPercent(int percent) {
+// Straight to a spine item and a fraction through it.
+//
+// This is what jumpToPercent() computes internally after converting a percentage
+// into a byte offset and walking cumulative spine FILE sizes to find the item
+// that offset lands in. When the sender already knows the item, all of that is
+// not merely unnecessary but actively harmful: file size includes markup, and
+// markup density varies enough between chapters (measured at 1.23 to 4.41 bytes
+// per text character within one book) that the walk can select a different
+// chapter than the sender meant.
+void EpubReaderActivity::jumpToSpine(const int spineIndex, const float fraction) {
+  if (!epub) return;
+  const int spineCount = epub->getSpineItemsCount();
+  if (spineIndex < 0 || spineIndex >= spineCount) return;
+
+  RenderLock lock;
+  clearDeferredReposition();
+  currentSpineIndex = spineIndex;
+  pendingSpineProgress = std::clamp(fraction, 0.0f, 1.0f);
+  nextPageNumber = 0;
+  pendingPercentJump = true;
+  section.reset();
+  requestUpdate();
+}
+
+// `percent` is a FLOAT, deliberately.
+//
+// It used to be an int, which quantised every jump to 1% of the book -- about
+// four pages in a 400-page novel, spent before any other source of error was
+// even involved. That was invisible while the only caller was a percent picker
+// whose own resolution was 1%, and it becomes the floor on accuracy the moment a
+// position arrives from somewhere that knows better (a reading position synced
+// from another device, which is measured to four decimals).
+void EpubReaderActivity::jumpToPercent(float percent) {
   if (!epub) return;
   const size_t bookSize = epub->getBookSize();
   if (bookSize == 0) return;
 
-  percent = clampPercent(percent);
+  percent = std::clamp(percent, 0.0f, 100.0f);
 
-  size_t targetSize =
-      (bookSize / 100) * static_cast<size_t>(percent) + (bookSize % 100) * static_cast<size_t>(percent) / 100;
-  if (percent >= 100) targetSize = bookSize - 1;
+  // Scaled in a double so the fraction survives: the old form split the
+  // multiplication into whole and remainder parts specifically to avoid
+  // overflowing size_t on a large book, which a double does not need.
+  size_t targetSize = static_cast<size_t>(static_cast<double>(bookSize) * (percent / 100.0));
+  if (targetSize >= bookSize) targetSize = bookSize - 1;
 
   const int spineCount = epub->getSpineItemsCount();
   if (spineCount == 0) return;
@@ -1206,16 +1385,11 @@ void EpubReaderActivity::renderBook() {
   orientedMarginLeft += SETTINGS.screenMargin;
   orientedMarginRight += SETTINGS.screenMargin;
 
-  const uint8_t statusBarHeight = UITheme::getInstance().getStatusBarHeight();
-
-  if (automaticPageTurnActive &&
-      (statusBarHeight == 0 || statusBarHeight == UITheme::getInstance().getProgressBarHeight())) {
-    orientedMarginBottom +=
-        std::max(SETTINGS.screenMargin,
-                 static_cast<uint8_t>(statusBarHeight + UITheme::getInstance().getMetrics().statusBarVerticalMargin));
-  } else {
-    orientedMarginBottom += std::max(SETTINGS.screenMargin, statusBarHeight);
-  }
+  // The status band is at the TOP of the reader now, so it is the top margin
+  // that has to make room for it and the bottom margin is plain page margin.
+  // Reserving the bottom as well would leave a dead strip under the last line.
+  orientedMarginTop += BaseTheme::readerTopBarHeight();
+  orientedMarginBottom += SETTINGS.screenMargin;
 
   const uint16_t viewportWidth = renderer.getScreenWidth() - orientedMarginLeft - orientedMarginRight;
   const uint16_t viewportHeight = renderer.getScreenHeight() - orientedMarginTop - orientedMarginBottom;
@@ -1252,7 +1426,6 @@ void EpubReaderActivity::renderBook() {
       const bool needsFullBuild = pendingPercentJump;
       if (needsFullBuild) {
         GUI.drawPopup(renderer, tr(STR_INDEXING));
-        pagesUntilFullRefresh = 1;
         const auto popupFn = [this]() {
           if (renderer.hasFrameBuffer()) GUI.drawPopup(renderer, tr(STR_INDEXING));
         };
@@ -1288,14 +1461,13 @@ void EpubReaderActivity::renderBook() {
           }
           if (showPopup) {
             GUI.drawPopup(renderer, tr(STR_INDEXING));
-            pagesUntilFullRefresh = 1;
           }
           buildPopupPending = !showPopup;
-          const unsigned long buildStartMs = millis();
+          buildStartMs = millis();
           bool started;
           {
             GfxRenderer::FrameBufferLoan loan(renderer);
-            started = section->startBuild(renderSpec, [this] { showBuildPopup(renderer, pagesUntilFullRefresh); });
+            started = section->startBuild(renderSpec, [this] { showBuildPopup(renderer); });
           }
           if (!started) {
             LOG_ERR("ERS", "Failed to start section build");
@@ -1310,7 +1482,7 @@ void EpubReaderActivity::renderBook() {
                   : offsetJump.has_value() ? !section->buildReachedVisibleTextOffset(*offsetJump)
                                            : static_cast<int>(section->pageCount) <= target)) {
             if (buildPopupPending && millis() - buildStartMs >= BUILD_POPUP_DEADLINE_MS) {
-              showBuildPopup(renderer, pagesUntilFullRefresh);
+              showBuildPopup(renderer);
             }
             if (!section->buildSomeMore(BUILD_PAGES_PER_CHUNK)) {
               LOG_ERR("ERS", "Failed during incremental section build");
@@ -1366,7 +1538,6 @@ void EpubReaderActivity::renderBook() {
 
   if (section->isPartial() && section->currentPage >= static_cast<int>(section->pageCount)) {
     GUI.drawPopup(renderer, tr(STR_INDEXING));
-    pagesUntilFullRefresh = 1;
   }
   while (section->isPartial() && section->currentPage >= static_cast<int>(section->pageCount)) {
     if (!section->isBuilding() && !section->startBuild(renderSpec)) {
@@ -1559,7 +1730,22 @@ bool EpubReaderActivity::saveProgress(int spineIndex, int currentPage, int pageC
                  ? currentPageVisibleOffset
                  : section->getVisibleTextOffsetForPage(static_cast<uint16_t>(currentPage));
   }
-  return EpubReaderUtils::saveProgress(*epub, spineIndex, currentPage, pageCount, offset);
+  // The same number the status bar shows, recorded alongside the position so the
+  // library list can label the book without opening it.
+  float bookPercent = -1.0f;
+  if (epub) {
+    const float chapterProgress =
+        (pageCount > 0) ? (static_cast<float>(currentPage + 1) / static_cast<float>(pageCount)) : 0.0f;
+    bookPercent = epub->calculateProgress(spineIndex, chapterProgress);
+  }
+  const bool saved = EpubReaderUtils::saveProgress(*epub, spineIndex, currentPage, pageCount, offset, bookPercent);
+#if FREEINK_CAP_BLE_TRANSFER
+  // Tell a listening phone the moment the position moves, rather than making it
+  // wait for the next heartbeat. Cheap: re-reads the eleven-byte sidecar that
+  // was just written, and notifies nothing at all when no phone is connected.
+  if (saved) BLE_LINK.notePositionChanged();
+#endif
+  return saved;
 }
 
 void EpubReaderActivity::rememberCurrentContentOffset() {
@@ -1591,9 +1777,18 @@ void EpubReaderActivity::renderContents(std::unique_ptr<Page> page, const int or
 
   const bool pageHasImages = page->hasImages();
   const bool pageHasImagesNeedingDecode = pageHasImages && page->hasImagesNeedingDecode();
+  // Page turns never flash on their own. A manual refresh request
+  // (handleForcedRefresh) is consumed here; an image page takes it as a HALF base
+  // refresh below.
   const bool manualRefreshPending = forcedRefreshPending;
   forcedRefreshPending = false;
-  const bool cleanImageBasePending = manualRefreshPending || pagesUntilFullRefresh <= 1;
+  // Anti-aliased text is the user's choice. On a panel that cannot fold the B/W
+  // base into the grayscale pass (all but Paper Mono) it costs a second
+  // full-panel waveform per page, which re-drives every pixel:
+  //
+  //   on  -- clean page every turn, a visible flash every turn
+  //   off -- no flash; ghosting builds up until a manual refresh or, if enabled,
+  //          the change budget scrubs (CrossPointSettings::getGhostCleanupPercent)
   const bool needsTextGrayscale = SETTINGS.textAntiAliasing;
   const bool needsAnyGrayscale = needsTextGrayscale || pageHasImages;
   const bool tiledGrayscale = needsAnyGrayscale && renderer.supportsStripGrayscale();
@@ -1602,7 +1797,14 @@ void EpubReaderActivity::renderContents(std::unique_ptr<Page> page, const int or
   // separately makes the gray pass re-drive the whole text body — a visible
   // flash on every AA page.
   const bool combinedGrayscaleBase = tiledGrayscale && !pageHasImages && renderer.combinesGrayscaleBase();
-  const bool overlapRefresh = tiledGrayscale && renderer.supportsAsyncRefresh() && !pageHasImages;
+  // Async whenever the panel can do it, not only when there is a grayscale pass
+  // to overlap with: a text page is one waveform and the reader has no reason to
+  // block on it. Starting it and returning to input means the next tap is
+  // already being handled while the panel settles.
+  //
+  // Image pages stay synchronous: their grayscale pass has to follow this
+  // refresh in a defined order.
+  const bool overlapRefresh = renderer.supportsAsyncRefresh() && !pageHasImages;
   auto renderGrayscalePass = [&]() {
     if (needsTextGrayscale) {
       page->render(renderer, fontId, orientedMarginLeft, orientedMarginTop);
@@ -1624,16 +1826,15 @@ void EpubReaderActivity::renderContents(std::unique_ptr<Page> page, const int or
 
   if (pageHasImages) {
     // Image pages use one base refresh before the grayscale pass. FAST leaves
-    // the panel receptive to the gray waveform; pending cleanup still honors
-    // the scheduled/manual HALF refresh.
-    renderer.displayBuffer(cleanImageBasePending ? HalDisplay::HALF_REFRESH : HalDisplay::FAST_REFRESH);
-    pagesUntilFullRefresh = 1;
+    // the panel receptive to the gray waveform; a pending manual refresh takes
+    // HALF instead.
+    renderer.displayBuffer(manualRefreshPending ? HalDisplay::HALF_REFRESH : HalDisplay::FAST_REFRESH);
   } else if (combinedGrayscaleBase) {
     // Stash the base without activating; displayGrayBuffer() below commits
     // base + grays as one waveform.
-    ReaderUtils::displayBaseWithRefreshCycle(renderer, pagesUntilFullRefresh);
+    ReaderUtils::displayReaderPageBase(renderer);
   } else {
-    ReaderUtils::displayWithRefreshCycle(renderer, pagesUntilFullRefresh, overlapRefresh);
+    ReaderUtils::displayReaderPage(renderer, overlapRefresh);
   }
   const auto tDisplay = millis();
 
@@ -1790,31 +1991,18 @@ void EpubReaderActivity::renderStatusBar() const {
   const float sectionChapterProg = (pageCount > 0) ? (static_cast<float>(currentPage) / pageCount) : 0;
   const float bookProgress = epub ? (epub->calculateProgress(currentSpineIndex, sectionChapterProg) * 100) : 0;
 
-  std::string title;
-  int textYOffset = 0;
-  const auto sb = SETTINGS.statusBarSpec();
+  // The chapter, always -- not whatever STATUS_BAR_TITLE says. The top band has
+  // exactly one centre lane and the chapter is what belongs in it; honouring a
+  // "no title" setting here would leave a percentage floating in whitespace,
+  // and honouring "book title" would repeat what the user just chose to open.
+  // The auto-page-turn banner is the one thing allowed to take the lane, because
+  // while it is running it is the only state the reader can be in that the page
+  // itself does not show.
+  const std::string title = automaticPageTurnActive
+                                ? tr(STR_AUTO_TURN_ENABLED) + std::to_string(60 * 1000 / pageTurnDuration)
+                                : currentChapterTitle();
 
-  if (automaticPageTurnActive) {
-    title = tr(STR_AUTO_TURN_ENABLED) + std::to_string(60 * 1000 / pageTurnDuration);
-    const uint8_t statusBarHeight = UITheme::getInstance().getStatusBarHeight();
-    if (statusBarHeight == 0 || statusBarHeight == UITheme::getInstance().getProgressBarHeight()) {
-      textYOffset += UITheme::getInstance().getMetrics().statusBarVerticalMargin;
-    }
-  } else if (sb.titleMode == CrossPointSettings::STATUS_BAR_TITLE::CHAPTER_TITLE) {
-    title = tr(STR_UNNAMED);
-    if (epub) {
-      const int tocIndex = epub->getTocIndexForSpineIndex(currentSpineIndex);
-      if (tocIndex != -1) {
-        const auto tocItem = epub->getTocItem(tocIndex);
-        title = tocItem.title;
-      }
-    }
-  } else if (sb.titleMode == CrossPointSettings::STATUS_BAR_TITLE::BOOK_TITLE) {
-    title = epub ? epub->getTitle() : "";
-  }
-
-  GUI.drawStatusBar(renderer, bookProgress, currentPage, pageCount, title, 0, textYOffset, true, currentPageBookmarked,
-                    section ? section->isBuilding() : false);
+  BaseTheme::drawReaderTopBar(renderer, title, bookProgress);
 }
 
 // ---------------------------------------------------------------------------
@@ -2122,6 +2310,45 @@ void EpubReaderActivity::handleOverlayInput() {
     }
     requestUpdate();
   };
+  // Step by CHAPTER, not by spine item.
+  //
+  // These two are not the same thing and assuming they were is what made the
+  // arrows land short. Calibre splits long chapters across several files, so a
+  // book can carry far more spine items than chapters -- Weakest Beast Tamer 2
+  // reports "96 spine, 51 TOC entries", roughly two files per chapter. Stepping
+  // the spine index therefore walked to the NEXT FRAGMENT, which is the middle
+  // of the chapter you were already in, and the chapter's real title page was
+  // still a page turn away. Picking the same chapter from the Contents list
+  // always worked because that path uses TOC entries, anchor and all.
+  //
+  // Falls back to a spine step only when the book has no usable TOC, where a
+  // fragment step is the best available meaning for "next chapter".
+  const auto gotoChapter = [this, gotoSpine](const int direction) {
+    const int tocCount = epub->getTocItemsCount();
+    const int here = tocCount > 0 ? epub->getTocIndexForSpineIndex(currentSpineIndex) : -1;
+    if (here < 0) {
+      gotoSpine(currentSpineIndex + direction);
+      return;
+    }
+    const int target = here + direction;
+    if (target < 0 || target >= tocCount) return;
+    const auto item = epub->getTocItem(target);
+    if (item.spineIndex < 0) {
+      gotoSpine(currentSpineIndex + direction);
+      return;
+    }
+    RenderLock lock;
+    clearDeferredReposition();
+    currentSpineIndex = item.spineIndex;
+    // The anchor matters here for the same reason it does in the Contents list:
+    // when two chapters share one file, the spine index alone cannot say which
+    // of them was asked for.
+    pendingAnchor = item.anchor;
+    nextPageNumber = 0;
+    section.reset();
+    requestUpdate();
+  };
+
   const auto toolOverlay = [](int tool) {
     return tool == 0 ? Overlay::Contents : (tool == 1 ? Overlay::Text : Overlay::More);
   };
@@ -2141,10 +2368,10 @@ void EpubReaderActivity::handleOverlayInput() {
         openOverlay(toolOverlay(focusedTool));
         return;
       case ReaderToolbarUi::Event::PrevChapter:
-        gotoSpine(currentSpineIndex - 1);
+        gotoChapter(-1);
         return;
       case ReaderToolbarUi::Event::NextChapter:
-        gotoSpine(currentSpineIndex + 1);
+        gotoChapter(1);
         return;
       case ReaderToolbarUi::Event::Scrub:
         gotoSpine(static_cast<int>((static_cast<float>(routed.permille) / 1000.0f) *
@@ -2176,10 +2403,14 @@ void EpubReaderActivity::handleOverlayInput() {
       openOverlay(toolOverlay(focusedTool));
       return;
     }
+    // The hardware buttons do the same thing as the on-screen arrows beside
+    // them. They were still stepping the SPINE while the arrows had moved to
+    // stepping chapters, so the same gesture gave two different answers
+    // depending on whether it was made with a finger or a button.
     const bool prev = mappedInput.wasReleased(MappedInputManager::Button::Up);
     const bool next = mappedInput.wasReleased(MappedInputManager::Button::Down);
     if (prev || next) {
-      gotoSpine(currentSpineIndex + (next ? 1 : -1));
+      gotoChapter(next ? 1 : -1);
     }
     return;
   }

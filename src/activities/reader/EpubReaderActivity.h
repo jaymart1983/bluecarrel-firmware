@@ -57,6 +57,19 @@ class EpubReaderActivity final : public ReaderActivity {
   bool currentPageBookmarked = false;
   int idlePrewarmSpine = -1;
   int idlePrewarmPage = -1;
+
+  // Lays out the NEXT chapter while the reader sits idle, so stepping to it
+  // finds a finished page index instead of paying for one.
+  //
+  // Held as a second Section rather than by reusing `section`, which belongs to
+  // the page on screen and must not be disturbed. Abandoned whenever the target
+  // stops being the next chapter -- the destructor persists whatever was built,
+  // so an abandoned pass is not wasted work.
+  std::unique_ptr<Section> prebuildSection;
+  int prebuildSpine = -1;
+  // Small: this runs between page turns and must never be what the user is
+  // waiting on. Four pages is a few tens of milliseconds.
+  static constexpr int PREBUILD_PAGES_PER_TICK = 4;
   unsigned long lastRenderCompleteMs = 0;
   bool bookmarkRemoved = false;
   std::vector<BookmarkEntry> cachedBookmarks;
@@ -129,12 +142,23 @@ class EpubReaderActivity final : public ReaderActivity {
   static constexpr size_t BUILD_POPUP_BYTE_THRESHOLD = 96 * 1024;
   static constexpr unsigned long BUILD_POPUP_DEADLINE_MS = 1000;
   bool buildPopupPending = false;
-  void showBuildPopup(GfxRenderer& renderer, int& pagesUntilFullRefresh);
+  // When the in-progress section build started, so the popup can be withheld
+  // until the wait is actually worth reporting. A member rather than a local
+  // because startBuild's progress callback needs it too.
+  unsigned long buildStartMs = 0;
+  void showBuildPopup(GfxRenderer& renderer);
   bool applyDeferredReposition();
   void clearDeferredReposition();
   void rememberCurrentContentOffset();
   bool saveProgress(int spineIndex, int currentPage, int pageCount);
-  void jumpToPercent(int percent);
+  // Float, not int: an int quantised every jump to 1% of the book. See the
+  // definition for why that matters once positions arrive from elsewhere.
+  void jumpToPercent(float percent);
+  // Directly to a spine item and a fraction through it, skipping the
+  // percentage -> byte offset -> file-size search jumpToPercent has to do.
+  void jumpToSpine(int spineIndex, float fraction);
+  // A synced position is looked for ONCE per visit to this book.
+  bool syncJumpChecked = false;
   void onReaderMenuConfirm(EpubReaderMenuActivity::MenuAction action);
   void openReaderMenu();
   // Toolbar reader menu (see Overlay above).
@@ -192,9 +216,8 @@ class EpubReaderActivity final : public ReaderActivity {
   void onEndOfBookRendered() override;
 
  public:
-  explicit EpubReaderActivity(GfxRenderer& renderer, MappedInputManager& mappedInput, std::string bookPath,
-                              bool allowFastInitialRefresh)
-      : ReaderActivity("EpubReader", renderer, mappedInput, std::move(bookPath), allowFastInitialRefresh) {}
+  explicit EpubReaderActivity(GfxRenderer& renderer, MappedInputManager& mappedInput, std::string bookPath)
+      : ReaderActivity("EpubReader", renderer, mappedInput, std::move(bookPath)) {}
   ~EpubReaderActivity() override;
 
   void loop() override;

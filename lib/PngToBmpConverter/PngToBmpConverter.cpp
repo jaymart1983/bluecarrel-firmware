@@ -721,10 +721,17 @@ bool PngToBmpConverter::pngFileToBmpStreamInternal(HalFile& pngFile, Print& bmpO
       bmpOut.write(rowBuffer, bytesPerRow);
       yieldDuringDecode(rowsSinceYield);
     } else {
-      // Area-averaging scaling (same as JpegToBmpConverter)
+      // Area-averaging scaling (same as JpegToBmpConverter), including its
+      // two-tap floor: a truncated fixed-point box collapses to a single sample
+      // at mild downscales and stops filtering entirely. See the long note in
+      // JpegToBmpConverter.cpp for why that turns a good cover into an aliased
+      // one while a more heavily reduced cover looks fine.
       for (int outX = 0; outX < outWidth; outX++) {
         const int srcXStart = (static_cast<uint32_t>(outX) * scaleX_fp) >> 16;
-        const int srcXEnd = (static_cast<uint32_t>(outX + 1) * scaleX_fp) >> 16;
+        int srcXEnd = (static_cast<uint32_t>(outX + 1) * scaleX_fp) >> 16;
+        // Two-tap floor only when actually reducing. On an enlargement the box is
+        // empty for most outputs, so forcing two taps blurs rather than filters.
+        if (scaleX_fp > 65536 && srcXEnd < srcXStart + 2) srcXEnd = srcXStart + 2;
 
         int sum = 0;
         int count = 0;
@@ -832,6 +839,12 @@ bool PngToBmpConverter::pngFileToBmpStream(HalFile& pngFile, Print& bmpOut, bool
   const int targetWidth = display.getDisplayHeight();
   const int targetHeight = display.getDisplayWidth();
   return pngFileToBmpStreamInternal(pngFile, bmpOut, targetWidth, targetHeight, false, crop);
+}
+
+bool PngToBmpConverter::pngFileTo1BitBmpStream(HalFile& pngFile, Print& bmpOut, bool crop) {
+  const int targetWidth = display.getDisplayHeight();
+  const int targetHeight = display.getDisplayWidth();
+  return pngFileToBmpStreamInternal(pngFile, bmpOut, targetWidth, targetHeight, true, crop);
 }
 
 bool PngToBmpConverter::pngFileToBmpStreamWithSize(HalFile& pngFile, Print& bmpOut, int targetMaxWidth,

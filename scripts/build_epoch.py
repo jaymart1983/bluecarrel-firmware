@@ -49,9 +49,9 @@ def source_date_epoch():
     this script cannot otherwise handle: a build tree with no usable git repo.
     That covers a source tarball, a CI checkout that strips .git, a `git
     worktree` whose .git is a pointer to a gitdir outside the tree -- and a
-    build host the sources were copied to without .git, which is how the
-    CrossPoint X4 Pro builds run. In all of those the git lookup below fails
-    and the fallback is the wall clock, which changes this global -D on every
+    build host the sources were copied to without .git. In all of those the
+    git lookup below fails and the fallback is the wall clock, which changes
+    this global -D on every
     build and so invalidates the entire compile cache every time: the very
     thing the module docstring set out to avoid.
 

@@ -104,7 +104,9 @@ class ActivityManager {
   // Validate, confirm and flash `path`. `stagedDrop` says the image came out of
   // the watched /firmware folder, which is the only case that clears that folder
   // afterwards.
-  void goToFirmwareUpdate(std::string path, bool stagedDrop);
+  // autoConfirm: the user already said yes (Update now, or an install at sleep).
+  // sleepAfter: reboot straight back into sleep once installed.
+  void goToFirmwareUpdate(std::string path, bool stagedDrop, bool autoConfirm = false, bool sleepAfter = false);
   // Browse Files / Recent Books / File Transfer / Settings, demoted off the
   // home screen when home became a shelf.
   void goToMoreMenu();
@@ -118,7 +120,7 @@ class ActivityManager {
 #if FREEINK_CAP_NETWORK
   void goToBrowser();
 #endif
-  void goToReader(std::string path, bool allowFastInitialRefresh = false);
+  void goToReader(std::string path);
   void goToSleep(bool fromTimeout = false);
   void goToBoot();
   void goToFullScreenMessage(std::string message, EpdFontFamily::Style style = EpdFontFamily::REGULAR);

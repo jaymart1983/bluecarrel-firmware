@@ -10,3 +10,7 @@ void silentRestartToReader();  // currently-open EPUB (APP_STATE.openEpubPath)
 // Reboots immediately after an activity releases exclusive raw storage. The
 // RTC target ensures setup() lands on Home instead of resuming a reader.
 void restartToHomeAfterStorageHandoff();
+
+// After a firmware update installed on the way to sleep: setup() goes straight
+// back to sleep, keeping the resume-to-book state from before the install.
+void restartToSleepAfterUpdate();

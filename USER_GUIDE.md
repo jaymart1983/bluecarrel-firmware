@@ -78,7 +78,9 @@ Alternatively, while reading a book, press the **Confirm** button to open the re
 
 The X4 Pro has a built-in frontlight with adjustable brightness and warmth. It is controlled from a swipe panel rather than the Settings menu:
 
-* **Open the control centre:** Tap the **top centre** of the screen (the status-bar strip) on Home, Browse Files, Settings, or the transfer screen — or **tap the Power button**, which works from any screen including while reading. A **~1 second hold** on the Power button closes it again. Drag the brightness and warmth sliders to adjust the light live, or tap the sun icon to turn it on or off. The panel also carries quick tiles for Night Mode, Refresh, Reading Orientation, **Touch**, **Sleep**, **Settings**, and **Home**. The old top-edge swipe-down no longer opens it.
+* **Open the Control Centre:** Tap the **top centre** of the screen (the status-bar strip) on Home, Browse Files, Settings or while reading, or **tap the Power button** from any screen. Tap Power again to close it. Drag the brightness and warmth sliders to adjust the light, or tap the sun icon to turn it on or off. The panel also has tiles for **Night Mode**, **Refresh Screen**, **Touch**, **Sleep**, **Settings** and **Home** (plus **USB Drive** while a cable is attached). Boards other than the X4 Pro also get a Reading Orientation tile.
+* **Refresh Screen tile:** clears ghosting with one full-screen refresh. Holding the **Home** tile does the same thing instead of going Home.
+* **Settings tile (X4 Pro):** opens the device Settings page, which has two sections: **Bluetooth** (pairing) and **Firmware** (running version and any waiting update). Other settings are changed from the X4 Pro Sync app, or from **Home > More > Settings**.
 * **Quick toggle:** The **sun button** beside the brightness slider turns the light on or off in one tap, and so does a **double tap of the Power button** from anywhere. (There is no separate Frontlight tile — it was the same switch twice.)
 
 > [!NOTE]
@@ -94,6 +96,7 @@ If the frontlight doesn't come back on after the device wakes from sleep, check 
 
 To turn the device on or off, **press and hold the Power button for approximately half a second**.
 In the **[Controls Settings](#363-controls)** you can configure the power button to turn the device off with a short press instead of a long one.
+On the X4 Pro, holding Power for about 0.6 seconds puts the device to sleep; see [Button Gestures (X4 Pro)](#button-gestures-x4-pro).
 
 To reboot the device (for example after a firmware update or if it's frozen), press and release the Reset button, and then quickly press and hold the Power button for a few seconds.
 
@@ -106,24 +109,22 @@ keys, so what a side key does depends on where you are.
 
 | Gesture | Action |
 | --- | --- |
-| Tap | Open the control centre |
-| Hold ~1 second | Close the control centre |
+| Tap | Open the Control Centre, or close it if it is open |
+| Hold ~0.6 second | Sleep |
 | Double tap | Frontlight on / off |
 
-Because a double tap exists, a single tap has to wait about a third of a second
-to be sure no second tap is coming. You will notice it; it is deliberate. That
-delay was refused for page turns and for Select, which you do constantly and on
-a rhythm, but opening the control centre is an occasional thing and the panel
-takes about half a second to draw anyway, so the wait is spent inside a
-transition you were already waiting for.
+A single tap waits about a third of a second to make sure no second tap is
+coming, so the Control Centre opens with a short delay.
 
-Holding for somewhere between the two — roughly three quarters of a second —
-deliberately does nothing: a slow tap and a short hold cannot be told apart
-there, and a menu opening or closing when you did not ask is worse than nothing
-happening.
+A press longer than a tap (about 0.35 second) but released before the hold
+fires does nothing. The hold does not sleep while Side Down is also pressed,
+because Power + Side Down takes a screenshot.
 
-The Power button does not sleep the device. **Sleep** is a tile in the control
-centre instead.
+The tap opens the Control Centre while **Settings > Controls > Short Power
+Button Click** is set to **Control Centre**, which is the X4 Pro default.
+
+There is no on-screen Back button on the X4 Pro. Outside a book, hold a side key
+for Back (see below).
 
 **The side keys, while reading a book:**
 
@@ -277,16 +278,19 @@ Bluetooth is **always on while the reader is awake**. It stops when the device s
 There is nothing to start and no screen to keep open — the companion app can reach the reader while you are reading a
 book, sitting on the home screen, or anywhere else.
 
-Pairing happens in exactly one place: **Settings > Bluetooth**.
+The X4 Pro build needs the **X4 Pro Sync** Android app for books, reading-position sync, settings and firmware
+updates.
 
-- **Not paired yet:** the page shows a six-digit code. Type it into the app. The reader remembers the phone the
-  instant the code is accepted, so the two sides agree from that moment on — you should never have to type it twice.
-- **Already paired:** the page shows which phone is paired and whether it is currently connected, and offers
-  **Forget**.
+Pairing happens on the Bluetooth section of the Settings page. On the X4 Pro, open the Control Centre and tap
+**Settings**. (The same page is **Settings > System > Bluetooth**.)
 
-The code is on that page whether or not a phone is paired, and it stays on it even when a connection attempt fails —
-if the app ever reports that the reader does not recognise it, open Settings > Bluetooth and pair again with the code
-that is already on the screen.
+- **Not paired yet:** the page shows a six-digit code. Type it into the app. The reader remembers the phone as soon as
+  the code is accepted.
+- **Already paired:** the code is hidden. The page shows **Paired with** and the phone's name (as the app reports it),
+  whether it is connected, and a **Forget** button.
+
+If the app reports that the reader does not recognise it, tap **Forget** on the reader; the code appears again and you
+can pair afresh.
 
 The reader remembers **one** phone at a time. Pairing a second replaces the first.
 
@@ -302,40 +306,60 @@ Two details worth knowing:
   most people plug a reader into a computer in the first place. Wake the device first, then plug in, if you want the
   drive.
 - **A wall charger looks like a computer at first.** The reader mounts, waits about twenty seconds for a computer that
-  is never going to answer, and then restarts to the home screen. Press **Back** to skip the wait.
+  is never going to answer, and then restarts to the home screen. Press any button (Power or a side key on the X4 Pro)
+  to skip the wait; a button press also ends USB Drive while a computer is connected.
 
 ### 3.5.4 Firmware updates from the SD card
 
-Copy a firmware image into a folder called `firmware` at the root of the SD card, together with a small text file
-holding its checksum:
+*This applies to builds with the Bluetooth link, such as the X4 Pro.*
+
+Firmware updates are files in a folder called `firmware` at the root of the SD card:
 
 ```
-/firmware/firmware.bin
-/firmware/firmware.bin.sha256
+/firmware/firmware.bin            the firmware image
+/firmware/firmware.bin.sha256     its SHA-256 checksum
+/firmware/firmware.bin.version    the version (optional; written by the app)
 ```
 
-The `.sha256` file contains the SHA-256 of the image. The output of `sha256sum firmware.bin` works as-is:
+**From the app.** The X4 Pro Sync app sends the image over Bluetooth and the reader writes these files itself.
+
+**By hand.** Plug the reader into a computer (USB Drive), copy `firmware.bin` into `/firmware`, and add
+`firmware.bin.sha256` with its checksum. The output of `sha256sum firmware.bin` works as-is:
 
 ```
 9f2c…a1  firmware.bin
 ```
 
 On macOS use `shasum -a 256 firmware.bin`; on Windows, `certutil -hashfile firmware.bin SHA256` (paste just the hash).
+Eject the drive. Both routes then behave the same way.
 
-Eject the drive. Within about half a minute the reader notices the new image, checks it against the checksum, and — if
-it matches, and only then — asks whether to install it. Confirm and it flashes and reboots; both files are deleted
-afterwards so you are not asked again. Decline and nothing is deleted; the reader simply stops asking about that image
-until you replace it or restart the device.
+**What happens next.** The reader checks the folder about every 30 seconds. When it finds an image whose checksum
+matches, it shows **Firmware update found** over whatever is on screen, including an open book, with three choices:
 
-The companion app writes the same two files over Bluetooth, so an app-delivered update and a hand-copied one are the
-same thing arriving by different roads.
+- **Update Now:** closes the book (saving your place), installs, and restarts.
+- **Later:** installs the next time the reader goes to sleep, then goes back to sleep. When you wake it, it is on the
+  new firmware.
+- **Cancel:** does nothing now. The update is offered again after a restart. The files stay on the card.
+
+The question stays on screen until you choose one. You can also leave it by going Home from the Control Centre; the
+update then waits in Settings.
+
+After a successful install the files are deleted, so the update is not offered again. An image whose checksum does not
+match is ignored and left on the card.
+
+**Auto-install.** With **Settings > System > Auto-install Firmware Updates** on, there is no question: a verified update
+installs the next time the reader sleeps.
+
+**Where to see it.** The **Firmware** section of the Settings page (Control Centre > Settings on the X4 Pro) shows the
+running version (a build stamp such as `20260913.1914`) and the state of the card: *Up to date*, *Checking*,
+*ready to install*, *installs at sleep*, or *Invalid image*. The **Firmware Update** row in **Settings > System** shows
+the same state. When an update is ready, tap either one to get the same three choices.
 
 > [!NOTE]
 > **The checksum is there to catch a bad copy, not to prove where the firmware came from.** Anyone who can write
 > `firmware.bin` onto the card can write `firmware.bin.sha256` beside it, so a matching checksum tells you the image is
-> intact — not that it is trustworthy. Only install firmware you obtained from a source you trust. What protects the
-> device from a broken or wrong-device image is the reader's own validation of the image, which runs twice, and the
-> confirmation prompt you answer on the device itself.
+> intact, not that it is trustworthy. Only install firmware from a source you trust. The reader also checks that the
+> image is a valid firmware image for this device before installing it.
 
 ### 3.6 Settings
 
@@ -381,8 +405,9 @@ The Settings screen allows you to configure the device's behavior. There are a f
   - "In Reader" - Show battery percentage everywhere except in reading mode
   - "Always" - Always hide battery percentage
 
-- **Refresh Frequency**: Set how often the screen does a full refresh while reading to reduce ghosting; options are every 1, 5, 10, 15, or 30 pages.
-- **Ghost Cleanup**: Watches how much of the screen actually changes and cleans the panel once enough has moved, so menus, popups and toolbars stop leaving shadows -- Refresh Frequency only counts reader page turns. *Light* waits for three screens' worth of change, *Normal* (default) for one and a half, *Aggressive* for three quarters; *Off* leaves the page count as the only trigger. Whichever fires first wins.
+- **Ghost Cleanup**: Watches how much of the screen actually changes and cleans the panel with a full refresh once enough has moved. *Light* waits longest, *Normal* less, *Aggressive* least; *Off* never refreshes automatically. Default: *Normal*, or *Off* on the X4 Pro (an X4 Pro upgrading from an earlier build is switched to Off once; you can turn it back on afterwards).
+
+  There is no page-count refresh setting: no reader (EPUB, TXT or XTC) does scheduled full-screen refreshes while you read. To clean the screen by hand, use the **Refresh Screen** tile in the Control Centre, or hold its **Home** tile.
 
 - **UI Theme**: Set which UI theme to use:
   
@@ -482,8 +507,10 @@ The Settings screen allows you to configure the device's behavior. There are a f
 
 - **Clear Reading Cache**: Clear the internal SD card cache.
 
-- **Bluetooth**: Pair a phone, see which phone is paired, or forget it. This is the only pairing screen — see [3.5.2](#352-bluetooth). *(Only on builds with the Bluetooth link, such as the X4 Pro.)*
-- **Check for updates** *(not on the X4 Pro build)*: Check for Crosspoint firmware updates over Wi-Fi. Firmware can also be updated by dropping an image and its checksum into `/firmware` on the SD card — see [3.5.4](#354-firmware-updates-from-the-sd-card). That route is the only one on the X4 Pro, and the companion app uses it too.
+- **Bluetooth**: Opens the Settings page with the Bluetooth and Firmware sections: pair a phone, see which phone is paired, or forget it. On the X4 Pro the Control Centre's Settings tile opens the same page — see [3.5.2](#352-bluetooth). *(Only on builds with the Bluetooth link, such as the X4 Pro.)*
+- **Firmware Update** *(Bluetooth builds)*: Shows whether an update is waiting on the SD card; tap it when one is ready. See [3.5.4](#354-firmware-updates-from-the-sd-card).
+- **Auto-install Firmware Updates**: Off (default) asks with Update Now / Later / Cancel when an update is found. On installs it at the next sleep without asking.
+- **Check for updates** *(not on the X4 Pro build)*: Check for Crosspoint firmware updates over Wi-Fi. On the X4 Pro, updates come from the X4 Pro Sync app or a file copied to `/firmware` — see [3.5.4](#354-firmware-updates-from-the-sd-card).
 
 - **Language**: Set the UI language. CrossPoint supports 32 languages: English, Spanish, French, German, Czech, Brazilian Portuguese, European Portuguese, Russian, Swedish, Romanian, Catalan, Ukrainian, Belarusian, Italian, Polish, Finnish, Danish, Dutch, Turkish, Kazakh, Hungarian, Lithuanian, Slovenian, Valencian, Hebrew, Arabic, Slovak, Bosnian, Vietnamese, Norwegian Bokmål, Indonesian, and Orangutan.
 
@@ -745,6 +772,28 @@ The role of the side buttons can be swapped in the **[Controls Settings](#363-co
 
 If the **Short Power Button Click** setting is set to "Page Turn", you can also turn to the next page by briefly pressing the Power button.
 
+**Touch page turns (touch devices such as the X4 Pro).** Think of the page as a 4 x 4 grid:
+
+```
++----+----+----+----+
+|    |    |    |    |
++----+----+----+----+
+|back|    |    |next|
++----+----+----+----+
+|back|    |    |next|
++----+----+----+----+
+|    |    |    |    |
++----+----+----+----+
+```
+
+- Tap the middle two cells of the **left** column to go back a page, and the middle two cells of the **right** column to
+  go forward.
+- **Touch Reader Controls > Inverted Tap** swaps the two sides. **Swipe** also turns pages with a horizontal swipe.
+- Tapping the centre of the page opens the reader menu. The top and bottom rows do not turn pages.
+- A link inside a page-turn cell is followed instead of turning the page.
+- Page-turn taps and link taps follow the touchscreen switch (the **Touch** tile in the Control Centre): with touch
+  off, only the side keys turn pages.
+
 ### Chapter Navigation
 
 * **Next Chapter:** Press and **hold** the **Right** (or **Side Down**) button briefly, then release.
@@ -774,6 +823,7 @@ See [docs/dictionary.md](docs/dictionary.md) for supported formats, setup, and w
 
 ### System Navigation
 
+* **X4 Pro:** there is no Back button or on-screen Back. To leave a book, open the Control Centre (tap Power; in an EPUB you can also tap the top centre of the page) and tap **Home**, or choose **Go Home** in the reader menu. Opening a book moves it to the front of the Home shelf straight away.
 * **Return to Home:** Press the **Back** button to close the book and return to the **[Home](#31-home-screen)** screen.
 * **Return to Browse Files:** Press and hold the **Back** button to close the book and return to the **[Browse Files](#33-browse-files-screen)** screen.
 * **Reader Menu:** Press **Confirm** to open the **[Reader Menu](#5-reader-menu)**, which includes chapter navigation, reading options, and more.
@@ -806,7 +856,7 @@ Available options include:
 - **Take screenshot** – Save a screenshot of the current page to the `screenshots/` folder.
 - **Show page as QR** – Display a QR code encoding the current reading position.
 - **Go Home** – Close the book and return to the Home screen.
-- **Sync Progress** – Push or pull reading progress with a KOReader sync server (see [KOReader Sync Quick Setup](#367-koreader-sync-quick-setup)).
+- **Sync Progress** – Push or pull reading progress with a KOReader sync server (see [KOReader Sync Quick Setup](#367-koreader-sync-quick-setup)). *(Not on the X4 Pro build, where the X4 Pro Sync app syncs positions over Bluetooth.)*
 - **Delete Book Cache** – Clear the cached layout data for the current book, forcing a re-index on next open.
 
 Press **Back** at any time to close the menu and return to your current page.

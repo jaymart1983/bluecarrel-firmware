@@ -23,6 +23,7 @@ constexpr bool USE_FLOYD_STEINBERG = false;  // Floyd-Steinberg error diffusion 
 constexpr bool USE_NOISE_DITHERING = false;  // Hash-based noise dithering (good for downsampling)
 // Pre-resize to target display size (CRITICAL: avoids dithering artifacts from post-downsampling)
 constexpr bool USE_PRESCALE = true;  // true: scale image to target size before dithering
+
 // ============================================================================
 
 inline void write16(Print& out, const uint16_t value) {
@@ -475,10 +476,31 @@ int bmpDrawCallback(JPEGDRAW* pDraw) {
       // 1:1 — outWidth == srcWidth, write directly
       writeOutputRow(ctx, srcRow, y);
     } else {
-      // Fixed-point area averaging on X axis
+      // Fixed-point area averaging on X axis, with a floor of TWO taps.
+      //
+      // The box is [start, end) computed by truncating fixed-point products, so
+      // its width is floor-quantised. At a mild downscale -- say a 585px cover
+      // into a 480px panel, 1.22 source pixels per output pixel -- that box is
+      // one pixel wide for four outputs in every five, and the filter silently
+      // degenerates into NEAREST NEIGHBOUR. Detailed art then aliases: fine
+      // detail and JPEG ringing pass through unaveraged, and the ditherer that
+      // follows faithfully reproduces the noise.
+      //
+      // It is invisible at larger reductions -- a 778px cover into the same
+      // panel gives a 1.62-wide box that usually spans two pixels and really
+      // does average -- which is exactly why some covers looked fine and others
+      // looked terrible with no code difference between them.
+      //
+      // Two taps is the minimum that filters at all, and at these scales it is
+      // within a rounding error of the correct partial-coverage weighting.
+      // Only meaningful when we are actually shrinking; on an enlargement it would
+      // be a pure blur. Enlargements take the bilinear path above, so this is a
+      // belt-and-braces guard.
+      const bool isReduction = ctx->scaleX_fp > FP_ONE;
       for (int outX = 0; outX < ctx->outWidth; outX++) {
         const int srcXStart = (static_cast<uint32_t>(outX) * ctx->scaleX_fp) >> 16;
-        const int srcXEnd = (static_cast<uint32_t>(outX + 1) * ctx->scaleX_fp) >> 16;
+        int srcXEnd = (static_cast<uint32_t>(outX + 1) * ctx->scaleX_fp) >> 16;
+        if (isReduction && srcXEnd < srcXStart + 2) srcXEnd = srcXStart + 2;
         int sum = 0;
         int count = 0;
         for (int srcX = srcXStart; srcX < srcXEnd && srcX < ctx->srcWidth; srcX++) {
@@ -599,8 +621,20 @@ bool JpegToBmpConverter::jpegFileToBmpStreamInternal(HalFile& jpegFile, Print& b
     needsScaling = true;
   }
 
-  const bool smoothUpscale =
-      progressiveDecode && needsScaling && scaleSrcWidth <= outWidth && scaleSrcHeight <= outHeight;
+  // Any enlargement goes through bilinear interpolation, not the box path.
+  //
+  // The box path computes [start, end) by truncating fixed-point products. When
+  // scale < 1.0 (an enlargement) that interval is empty for most outputs, so the
+  // filter degenerates to nearest neighbour and the two-tap floor below turns it
+  // into an unconditional 2px smear -- applied to exactly the covers with the
+  // least resolution to spare. Small epub covers (313x500, 333x500) enlarged into
+  // the 480x720 panel were being blurred while a 778x1244 cover, which genuinely
+  // downscales, came through clean.
+  //
+  // This used to be gated on progressiveDecode, but progressive streams are only
+  // one way to arrive at an enlargement -- and in practice cover art is baseline,
+  // so the correct resampler never ran for the case that needed it most.
+  const bool smoothUpscale = needsScaling && scaleSrcWidth <= outWidth && scaleSrcHeight <= outHeight;
 
   // Write BMP header with output dimensions
   int bytesPerRow;
@@ -718,6 +752,12 @@ bool JpegToBmpConverter::jpegFileToBmpStream(HalFile& jpegFile, Print& bmpOut, b
   const int targetWidth = display.getDisplayHeight();
   const int targetHeight = display.getDisplayWidth();
   return jpegFileToBmpStreamInternal(jpegFile, bmpOut, targetWidth, targetHeight, false, crop);
+}
+
+bool JpegToBmpConverter::jpegFileTo1BitBmpStream(HalFile& jpegFile, Print& bmpOut, bool crop) {
+  const int targetWidth = display.getDisplayHeight();
+  const int targetHeight = display.getDisplayWidth();
+  return jpegFileToBmpStreamInternal(jpegFile, bmpOut, targetWidth, targetHeight, true, crop);
 }
 
 // Convert with custom target size (for thumbnails, 2-bit)

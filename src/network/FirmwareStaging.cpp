@@ -58,6 +58,23 @@ bool writeExpectedHash(const std::string& hex) {
   return Storage.writeFile(HASH_PATH, String((hex + "  " + IMAGE_NAME + "\n").c_str()));
 }
 
+bool readVersion(std::string& out) {
+  out.clear();
+  char buffer[48] = {};
+  const size_t read = Storage.readFileToBuffer(VERSION_PATH, buffer, sizeof(buffer) - 1);
+  if (read == 0) return false;
+  std::string value(buffer);
+  while (!value.empty() && std::isspace(static_cast<unsigned char>(value.back()))) value.pop_back();
+  if (value.empty()) return false;
+  out = std::move(value);
+  return true;
+}
+
+bool writeVersion(const std::string& version) {
+  if (version.empty()) return false;
+  return Storage.writeFile(VERSION_PATH, String((version + "\n").c_str()));
+}
+
 void clearStaged() {
   if (Storage.exists(IMAGE_PATH) && !Storage.remove(IMAGE_PATH)) {
     LOG_ERR("FWDROP", "could not remove %s", IMAGE_PATH);
@@ -66,6 +83,7 @@ void clearStaged() {
     LOG_ERR("FWDROP", "could not remove %s", HASH_PATH);
   }
   if (Storage.exists(PART_PATH)) Storage.remove(PART_PATH);
+  if (Storage.exists(VERSION_PATH)) Storage.remove(VERSION_PATH);
 }
 
 }  // namespace firmware_staging

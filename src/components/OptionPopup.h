@@ -26,6 +26,10 @@
 // publication so a release cannot be dropped during a highlight repaint.
 class OptionPopup {
  public:
+  // The on-screen Back chip (touch boards). Off where the options already offer a
+  // way out -- a Cancel entry -- so the screen does not carry two exits.
+  void setTouchBack(const bool on) { touchBack_ = on; }
+
   void show(StrId titleId, const StrId* optionIds, int optionCount, int currentIndex,
             std::function<void(int)> onSelect) {
     title = I18N.get(titleId);
@@ -134,7 +138,8 @@ class OptionPopup {
   bool processRender(GfxRenderer& renderer, const MappedInputManager& input) const {
     if (!active) return false;
     const auto popupLabels = input.mapLabels(tr(STR_BACK), tr(STR_SELECT), tr(STR_DIR_UP), tr(STR_DIR_DOWN));
-    GUI.drawButtonHints(renderer, popupLabels.btn1, popupLabels.btn2, popupLabels.btn3, popupLabels.btn4);
+    GUI.drawButtonHints(renderer, popupLabels.btn1, popupLabels.btn2, popupLabels.btn3, popupLabels.btn4,
+                        touchBack_);
     render(renderer);
     renderer.displayBuffer();
     return true;
@@ -237,6 +242,7 @@ class OptionPopup {
   }
 
  private:
+  bool touchBack_ = true;
   // The dialog has no scrolling, so options past MAX_OPTIONS would render off
   // screen anyway; a fixed cap keeps the DialogOption array on the stack and
   // the interaction table small. +1 slot for the chrome guard rect.

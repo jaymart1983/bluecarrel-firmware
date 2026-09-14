@@ -172,6 +172,11 @@ void XtcReaderActivity::renderPage() {
     return;
   }
 
+  // A manual refresh request (handleForcedRefresh) is consumed by this page and
+  // takes a HALF refresh. Every other page goes out FAST.
+  const bool manualRefreshPending = forcedRefreshPending;
+  forcedRefreshPending = false;
+
   renderer.clearScreen();
 
   const uint16_t maxSrcY = pageHeight;
@@ -200,10 +205,10 @@ void XtcReaderActivity::renderPage() {
       }
     }
 
-    if (pagesUntilFullRefresh <= 1) {
-      // Periodic ghost cleanup: scrub via the normal path, then run the
-      // settle flavor of the grayscale base pass (DTM planes are equal after
-      // the display sync, so only the gentle reinforcement cells fire).
+    if (manualRefreshPending) {
+      // Requested clean refresh: scrub via the normal path, then run the settle
+      // flavor of the grayscale base pass (DTM planes are equal after the
+      // display sync, so only the gentle reinforcement cells fire).
       // Combined-base panels (Paper Mono) instead defer the base so the gray
       // planes below join it in one waveform.
       if (renderer.combinesGrayscaleBase()) {
@@ -212,12 +217,8 @@ void XtcReaderActivity::renderPage() {
         renderer.displayBuffer(HalDisplay::HALF_REFRESH);
         renderer.preconditionGrayscale();
       }
-      pagesUntilFullRefresh = SETTINGS.getRefreshFrequency();
     } else {
       renderer.displayGrayscaleBase(HalDisplay::FAST_REFRESH);
-      // The change budget may have promoted that base to a clean waveform; if
-      // it did, the cadence restarts rather than scheduling a second scrub.
-      ReaderUtils::noteRefreshCycle(renderer, pagesUntilFullRefresh);
     }
 
     renderer.clearScreen(0x00);
@@ -284,7 +285,11 @@ void XtcReaderActivity::renderPage() {
     renderStatusBarOverlay(renderer, StatusBarOverlayPosition::Bottom);
   }
 
-  ReaderUtils::displayWithRefreshCycle(renderer, pagesUntilFullRefresh);
+  if (manualRefreshPending) {
+    renderer.displayBuffer(HalDisplay::HALF_REFRESH);
+  } else {
+    ReaderUtils::displayReaderPage(renderer);
+  }
 
   LOG_DBG("XTR", "Rendered page %lu/%lu (%u-bit)", currentPage + 1, xtc->getPageCount(), bitDepth);
 }

@@ -255,10 +255,6 @@ inline std::vector<SettingInfo> getSettingsList(const SdCardFontRegistry* regist
         SettingInfo::Enum(StrId::STR_HIDE_BATTERY, &CrossPointSettings::hideBatteryPercentage,
                           {StrId::STR_NEVER, StrId::STR_IN_READER, StrId::STR_ALWAYS}, "hideBatteryPercentage",
                           StrId::STR_CAT_DISPLAY),
-        SettingInfo::Enum(StrId::STR_REFRESH_FREQ, &CrossPointSettings::refreshFrequency,
-                          {StrId::STR_PAGES_1, StrId::STR_PAGES_5, StrId::STR_PAGES_10, StrId::STR_PAGES_15,
-                           StrId::STR_PAGES_30, StrId::STR_NEVER},
-                          "refreshFrequency", StrId::STR_CAT_DISPLAY),
         // Change-accumulation ghost cleanup. Order matches
         // CrossPointSettings::GHOST_CLEANUP (persisted by index -- append only).
         SettingInfo::Enum(StrId::STR_GHOST_CLEANUP, &CrossPointSettings::ghostCleanup,
@@ -409,8 +405,14 @@ inline std::vector<SettingInfo> getSettingsList(const SdCardFontRegistry* regist
                             "removeReadBooksFromRecents", StrId::STR_CAT_SYSTEM),
         SettingInfo::Toggle(StrId::STR_MOVE_FINISHED_TO_READ, &CrossPointSettings::moveFinishedToReadFolder,
                             "moveFinishedToReadFolder", StrId::STR_CAT_SYSTEM),
+        SettingInfo::Toggle(StrId::STR_AUTO_INSTALL_FIRMWARE, &CrossPointSettings::autoInstallFirmware,
+                            "autoInstallFirmware", StrId::STR_CAT_SYSTEM),
 
 #if FREEINK_CAP_NETWORK
+        // Device name: persisted + synced, category-less so the on-device Settings
+        // screen does not offer it. Named from the app.
+        SettingInfo::String(StrId::STR_DEVICE_NAME, &SETTINGS.deviceName[0], sizeof(SETTINGS.deviceName),
+                            "deviceName"),
         // OPDS download folder: persisted + web-exposed, but category-less so it
         // is hidden from the on-device Settings screen (edited via OPDS UI).
         SettingInfo::String(StrId::STR_OPDS_DOWNLOAD_FOLDER, &SETTINGS.opdsDownloadFolder[0],

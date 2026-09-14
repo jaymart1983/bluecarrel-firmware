@@ -21,28 +21,23 @@ struct BleLinkRuntime;
 // The reader's Bluetooth link. One NimBLE peripheral, one hello/HMAC gate, one
 // framed upload path with credit flow control and SHA-256, one download path.
 //
-// WHY THIS IS NOT AN ACTIVITY. It used to be: BleTransferActivity owned the
-// radio, so the link existed only while its screen was open and died the moment
-// the user left. That made the phone app's job impossible -- it could not reach
-// a reader that was showing a book, and the Store could not ask the phone for a
-// catalogue page unless the radio happened to be up for another reason. The
-// radio is a property of the device being awake, not of any one screen, so it
-// lives here and is started once at boot (main.cpp) and stopped on the way into
-// deep sleep. Wake from deep sleep is a chip reset, so start-on-boot is also
-// start-on-wake.
+// WHY THIS IS NOT AN ACTIVITY. The radio is a property of the device being awake,
+// not of any one screen: the phone app must be able to reach a reader that is
+// showing a book, and the Store must be able to ask the phone for a catalogue
+// page whatever else is up. So the link lives here, is started once at boot
+// (main.cpp) and is stopped on the way into deep sleep. Wake from deep sleep is a
+// chip reset, so start-on-boot is also start-on-wake.
 //
 // WHAT A SCREEN DOES INSTEAD. A screen that wants to show link state registers
 // as an Observer and is told when something changed; it repaints itself. The
 // Store additionally attaches its controller so the request channel has
 // somewhere to publish to. Neither owns the radio and neither can take it down.
 //
-// PAIRING lives in exactly one place, BlePairingActivity in Settings. A host is
-// written to flash the instant a `hello` carrying the right six-digit code also
-// carries a credential -- not after some later upload completes. The old
-// after-an-upload rule is what produced the deadlock this class was rebuilt to
-// end: the phone saved its half of the pairing immediately, the reader saved its
-// half only if the session happened to finish a transfer, and every later
-// reconnect authenticated against a credential the reader had never kept.
+// PAIRING UI is BlePairingActivity. A host is written to flash the instant a
+// `hello` carrying the right six-digit code also carries a credential, because
+// the phone saves its half of the pairing immediately: if the reader waited for
+// anything later (such as a completed upload), every reconnect could
+// authenticate against a credential the reader had never kept.
 class BleLink {
  public:
   enum class State {
@@ -73,7 +68,8 @@ class BleLink {
     // enum and takes the whole class declaration with it.
     BOOK_META,        ///< app -> device: a book's cover and metadata, sent ahead of the book
     SETTINGS_INBOX,   ///< app -> device: a settings document to apply
-    SETTINGS_SNAPSHOT ///< device -> app: the current settings document
+    SETTINGS_SNAPSHOT, ///< device -> app: the current settings document
+    ABOUT              ///< device -> app: build identity (firmware version, running slot)
   };
 
   // A screen that paints something about the link. There is at most one: only
@@ -86,10 +82,6 @@ class BleLink {
   };
 
   static BleLink& getInstance();
-
-  // The Web Bluetooth companion. A session constant, shown on the pairing page
-  // and published in `status` as browser_companion_url.
-  static const char* companionUrl();
 
   // --- radio lifecycle -------------------------------------------------------
   // Start the peripheral and begin advertising. Idempotent; safe to call when
@@ -128,6 +120,22 @@ class BleLink {
   void armStoreBookFetch(const std::string& filename) { storeExpectedBook_ = filename; }
   void publishStatusNow();
 
+  // --- heartbeat ("ping") -------------------------------------------------
+  //
+  // The reader is a peripheral: it cannot call the phone, it can only notify a
+  // phone that is already connected. These are the moments worth notifying.
+  //
+  // Position changed -- a page turn, or a saved position. Cheap: re-reads one
+  // eleven-byte sidecar, no book is opened.
+  void notePositionChanged();
+  // Something wrote to the card, so the library fingerprint is stale. Does not
+  // recompute here; the next heartbeat pays for the walk.
+  void noteLibraryChanged();
+  // Last word before deep sleep. Without it the app cannot tell "asleep" from
+  // "out of range" or "crashed"; it just sees the link drop. Waking is a chip
+  // reset, so the first status after boot already reports the reader awake.
+  void notifySleeping();
+
   // --- observers -------------------------------------------------------------
   void setObserver(Observer* observer) { observer_ = observer; }
   void clearObserver(const Observer* observer) {
@@ -135,11 +143,8 @@ class BleLink {
   }
 
   State state() const { return state_; }
-  TransferKind transferKind() const { return transferKind_; }
   const std::string& errorMessage() const { return errorMessage_; }
   const std::string& fileName() const { return fileName_; }
-  size_t receivedBytes() const { return receivedBytes_; }
-  size_t expectedSize() const { return expectedSize_; }
   // A transfer is in flight. The inactivity timer honours this, so a book
   // arriving while the reader sits on the home screen is not cut off halfway by
   // auto-sleep.
@@ -201,6 +206,8 @@ class BleLink {
 
   std::string sessionCode_;
   std::string fileName_;
+  // Build stamp sent with a firmware image, if any (sanitised).
+  std::string firmwareVersion_;
   std::string partPath_;
   std::string finalPath_;
   std::string expectedSha256_;
@@ -243,6 +250,36 @@ class BleLink {
   bool hostPaired_ = false;
   bool pendingCommit_ = false;
   bool statusDirty_ = true;
+
+  // Cached answers to "what is this reader holding, and where is it?", so the
+  // status can carry them without doing the work on every publish. The library
+  // fingerprint is a directory walk (tens of ms for hundreds of books) and is
+  // recomputed only when something says the card changed.
+  uint32_t pingLibBooks_ = 0;
+  uint32_t pingLibHash_ = 0;
+  std::string pingBook_;
+  float pingPct_ = -1.0f;
+  // A book is on screen right now -- not merely the last one opened (pingBook_).
+  bool pingOpen_ = false;
+  // A delete_book with close:true whose book was open: the reader is being sent
+  // Home, and tick() deletes once it has actually left the book.
+  std::string pendingDeleteName_;
+  std::string pendingDeletePath_;
+  unsigned long pendingDeleteAt_ = 0;
+  void deleteBookNow(const std::string& name, const std::string& path);
+  bool pingLibDirty_ = true;
+  // Reported to the app so it can tell "gone to sleep" from "went away".
+  bool sleeping_ = false;
+  // start_put asked to overwrite an existing book (a Calibre update). Reset per transfer.
+  bool replaceExisting_ = false;
+  unsigned long lastHeartbeatMs_ = 0;
+  // 60s while awake and connected. A safety net under the event triggers above,
+  // not the primary mechanism: an event-driven notify is both faster and cheaper
+  // than any poll, and while the reader sleeps no cadence runs at all.
+  static constexpr unsigned long HEARTBEAT_INTERVAL_MS = 60UL * 1000UL;
+
+  // Refreshes the cached ping fields. `withLibrary` pays for the directory walk.
+  void refreshPingSnapshot(bool withLibrary);
   bool removePartOnExit_ = false;
   bool uploadResumable_ = false;
   bool shaActive_ = false;
@@ -262,6 +299,7 @@ class BleLink {
   // Serialises the live settings to a scratch file and streams that, rather
   // than holding the document in RAM for the length of a chunked transfer.
   void startSettingsDownload(size_t offset, size_t chunkSize);
+  void startAboutDownload(size_t offset, size_t chunkSize);
   // Parses a committed settings document and applies it. Returns false with
   // the error already set when the document is unusable.
   bool applySettingsDocument();
@@ -291,19 +329,19 @@ class BleLink {
   // link is running behind a reader page, which is the normal case.
   void notifyObserver();
   void publishStatus();
-  // The largest NOTIFY document that fits `capBytes`, shrinking a level at a
-  // time. Never returns truncated JSON. Returns an empty string when not even
-  // `{"state":"..."}` fits, meaning "send no notification at all" -- an empty
-  // object parses as a status and reports as an unreadable one.
-  // The READ value, shed until it fits the 512-byte ATT attribute ceiling.
-  // Never returns a document that would be served truncated.
   // Last authentication state the header was repainted for. The indicator is
   // drawn by every screen's header, but only ONE screen at a time can be a
   // link Observer -- so a screen that is not the observer (the home screen,
   // normally) never learns the link came up, and shows no BLE until something
   // else happens to redraw it.
   bool lastPublishedAuth_ = false;
+  // The READ value, shed until it fits the 512-byte ATT attribute ceiling.
+  // Never returns a document that would be served truncated.
   std::string buildReadJson() const;
+  // The largest NOTIFY document that fits `capBytes`, shrinking a level at a
+  // time. Never returns truncated JSON. Returns an empty string when not even
+  // `{"state":"..."}` fits, meaning "send no notification at all" -- an empty
+  // object parses as a status and reports as an unreadable one.
   std::string buildNotifyJson(size_t capBytes) const;
 };
 

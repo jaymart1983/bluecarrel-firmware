@@ -293,7 +293,19 @@ bool Section::loadSectionFile(const ReaderRenderSpec& spec) {
         spec.hyphenationEnabled != fileHyphenationEnabled || spec.embeddedStyle != fileEmbeddedStyle ||
         spec.imageRendering != fileImageRendering || spec.focusReadingEnabled != fileFocusReadingEnabled) {
       file.close();
-      LOG_ERR("SCT", "Deserialization failed: Parameters do not match");
+      // Name the field that disagreed. "Parameters do not match" is true and
+      // useless: this is the one branch that turns a cached book into a rebuild,
+      // and when a reader re-indexes on every open this line is the only place
+      // that knows why.
+      LOG_ERR("SCT",
+              "Cache rejected: font %d/%d comp %.3f/%.3f para %d/%d align %u/%u "
+              "vp %ux%u/%ux%u hyph %d/%d embed %d/%d img %u/%u focus %d/%d",
+              spec.fontId, fileFontId, spec.lineCompression, fileLineCompression,
+              spec.extraParagraphSpacing, fileExtraParagraphSpacing, spec.paragraphAlignment,
+              fileParagraphAlignment, spec.viewportWidth, spec.viewportHeight, fileViewportWidth,
+              fileViewportHeight, spec.hyphenationEnabled, fileHyphenationEnabled, spec.embeddedStyle,
+              fileEmbeddedStyle, spec.imageRendering, fileImageRendering, spec.focusReadingEnabled,
+              fileFocusReadingEnabled);
       clearCache();
       return false;
     }

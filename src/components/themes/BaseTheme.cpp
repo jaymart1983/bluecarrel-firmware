@@ -14,6 +14,7 @@
 #include <string>
 
 #include "I18n.h"
+#include "CrossPointSettings.h"
 #include "RecentBooksStore.h"
 #include "components/UIScale.h"
 #include "components/UITheme.h"
@@ -266,6 +267,9 @@ void BaseTheme::setTouchBackButtonVisible(const bool visible) {
 }
 
 void BaseTheme::drawTouchBackButton(const GfxRenderer& renderer) {
+  // The X4 Pro has no Back control on screen: a side-key hold is Back outside a
+  // book (MappedInputManager), so a chip would be a second way to do one thing.
+  if (CrossPointSettings::usesPowerGestures()) return;
   // Already drawn in the title bar this frame: drawing it again would put two
   // Back controls on one screen, and the hit rect can only describe one of them.
   if (gBackInHeader.load(std::memory_order_relaxed)) return;
@@ -281,19 +285,17 @@ void BaseTheme::drawTouchBackButton(const GfxRenderer& renderer) {
   // (GfxRenderer.cpp: yPos = y + getFontAscenderSize). So centring on
   // getTextHeight (== the font-wide ascender) centres the font's design box,
   // not the ink: the ascender covers the tallest glyph in the whole font plus
-  // the designer's leading, while "<< Back" only reaches cap height. On the
-  // 480x800 portrait frame with UI_10 (ascender 20, cap height 15) that left
-  // the ink at rows 775..789 of a 764..795 chip -- 11 rows of slack above, 6
-  // below, which is the bias visible on the device.
+  // the designer's leading, while "<< Back" only reaches cap height. With UI_10
+  // (ascender 20, cap height 15) that leaves visibly more slack above the ink
+  // than below it.
   //
   // Measuring the glyphs actually being drawn removes it. Solving
   //   baseline - inkTop - rect.y == rect.y + rect.height - baseline
   // for the baseline gives (rect.height + inkTop) / 2, and drawText wants the
   // box top, which is the baseline minus the ascender.
   //
-  // Do NOT add the text height to this Y. That was the earlier "fix": it put
-  // the baseline at 810 and the ink at 794..809, ten rows past the bottom of
-  // the panel -- the 309-clipped-pixels-per-frame burst in ble3.log.
+  // Do NOT add the text height to this Y: that pushes the ink below the chip and
+  // off the bottom of the panel.
   int inkTop = 0;
   int inkBottom = 0;
   const int textTop = renderer.getTextInkBounds(UI_10_FONT_ID, label, inkTop, inkBottom)
@@ -410,7 +412,9 @@ void BaseTheme::drawSideButtonHints(const GfxRenderer& renderer, const char* top
 
 void BaseTheme::drawHeader(const GfxRenderer& renderer, Rect rect, const char* title, const char* subtitle,
                            const bool withBack) const {
-  gBackInHeader.store(withBack, std::memory_order_relaxed);
+  // No header Back on the X4 Pro either -- see drawTouchBackButton().
+  const bool showBack = withBack && !CrossPointSettings::usesPowerGestures();
+  gBackInHeader.store(showBack, std::memory_order_relaxed);
   // Every activity header renders through the FreeInkUI header + battery
   // indicator components, styled by the active theme's tokens (padding,
   // centering, underline). Non-interactive frame: no hit rects registered.
@@ -469,11 +473,12 @@ void BaseTheme::drawHeader(const GfxRenderer& renderer, Rect rect, const char* t
   // condition, and the header should be quiet in it.
   showBle = BLE_LINK.isAuthenticated();
 #endif
-  // "USB" means the host has the card -- not that a cable carries power.
-  // HalGPIO::isUsbConnected() is a VBUS pin: it reads HIGH for a wall charger
-  // and for a charge-only cable, neither of which is a USB drive, so labelling
-  // that "USB" promised something the device was not doing.
-  const bool showUsb = Storage.usbDriveHandoffPending();
+  // "USB" means a cable is attached, not that a host has the card: USB Drive is
+  // an explicit choice from the control centre, so a cable can sit there with
+  // the card still ours. A wall charger reads HIGH on VBUS too, which is fine --
+  // the label only claims something is plugged in, which is exactly what
+  // decides whether the control centre offers the USB Drive tile.
+  const bool showUsb = gpio.isUsbConnected();
 
   const int16_t clockWidth =
       showClock ? ui.target.measureText(fui::GfxRendererTarget::FONT_SMALL, clockText, tokens.smallText).width : 0;
@@ -508,7 +513,7 @@ void BaseTheme::drawHeader(const GfxRenderer& renderer, Rect rect, const char* t
   // A centred title ignores leftReserve, so with Back in the band the two land
   // on top of each other and read as one control. Left-align the title when Back
   // is present, so it sits after the rule rather than over it.
-  if (withBack) props.titleText.align = fui::TextAlign::Left;
+  if (showBack) props.titleText.align = fui::TextAlign::Left;
   props.subtitleText = tokens.smallText;
   props.styles = tokens.popup;
   props.sidePadding = tokens.headerSidePadding;
@@ -525,7 +530,7 @@ void BaseTheme::drawHeader(const GfxRenderer& renderer, Rect rect, const char* t
     // The Back label lives at the far left of the band, so the title has to be
     // kept clear of it exactly as it is kept clear of the battery.
     const int16_t backReserve =
-        withBack ? static_cast<int16_t>(renderer.getTextWidth(UI_10_FONT_ID, backHeaderLabel()) + kHeaderBackGap * 3)
+        showBack ? static_cast<int16_t>(renderer.getTextWidth(UI_10_FONT_ID, backHeaderLabel()) + kHeaderBackGap * 3)
                  : 0;
     const int16_t reserve = static_cast<int16_t>(batteryReserve + labelReserve + tokens.spaceMd);
     (void)clockReserve;
@@ -533,8 +538,8 @@ void BaseTheme::drawHeader(const GfxRenderer& renderer, Rect rect, const char* t
       props.leftReserve = reserve;
       props.rightReserve = clockReserve;
     } else {
-      props.rightReserve = static_cast<int16_t>(reserve + clockReserve);
-      props.leftReserve = backReserve;
+      props.rightReserve = static_cast<int16_t>(reserve + (showBack ? clockReserve : 0));
+      props.leftReserve = static_cast<int16_t>(backReserve + (showBack ? 0 : clockReserve));
     }
     if (batteryLeft) {
       props.leftReserve = static_cast<int16_t>(props.leftReserve + clockReserve + backReserve);
@@ -584,15 +589,18 @@ void BaseTheme::drawHeader(const GfxRenderer& renderer, Rect rect, const char* t
     if (showUsb) place(usbWidth, "USB", false);
 
     if (showClock) {
-      // Always on the battery's side, immediately inboard of the status words.
-      // It used to take the opposite end of the band, which is the same left
-      // inset Back now uses -- the two stacked on top of each other.
-      const int clockX = batteryLeft ? cursorX : cursorX - clockWidth;
+      // Top left, which is where a clock belongs -- unless this header also
+      // carries Back, which occupies that inset. Then it sits inboard of the
+      // battery instead; the two stacked on each other when both wanted the
+      // left edge.
+      const int clockX = (!showBack && !batteryLeft)
+                             ? static_cast<int>(band.x) + tokens.headerSidePadding
+                             : (batteryLeft ? cursorX : cursorX - clockWidth);
       drawStatusLabel(renderer, clockX, centerY, clockText, false);
     }
   }
 
-  if (withBack) {
+  if (showBack) {
     // "< Back |" beside the title, ON THE TITLE'S OWN LINE.
     //
     // Centring it in the whole band put it above the title in themes that give
@@ -903,7 +911,12 @@ void BaseTheme::drawRowCover(const GfxRenderer& renderer, const std::string& pat
 void BaseTheme::drawButtonMenu(GfxRenderer& renderer, Rect rect, int buttonCount, int selectedIndex,
                                const std::function<std::string(int index)>& buttonLabel,
                                const std::function<UIIcon(int index)>& rowIcon,
-                              const std::function<std::string(int index)>& rowCover) const {
+                              const std::function<std::string(int index)>& rowCover, const int rowHeightOverride,
+                              const std::function<bool(int index)>& rowMarked,
+                              const std::function<float(int index)>& rowPercent) const {
+  (void)rowHeightOverride;  // the base menu draws at its own row height
+  (void)rowMarked;          // the Last Read badge is drawn by the Library's theme only
+  (void)rowPercent;         // ...as is the progress dial
   for (int i = 0; i < buttonCount; ++i) {
     const int tileY = BaseMetrics::values.verticalSpacing + rect.y +
                       static_cast<int>(i) * (BaseMetrics::values.menuRowHeight + BaseMetrics::values.menuSpacing);
@@ -984,6 +997,143 @@ void BaseTheme::fillPopupProgress(const GfxRenderer& renderer, const Rect& layou
   }
 
   renderer.displayBuffer(HalDisplay::FAST_REFRESH);
+}
+
+int BaseTheme::readerTopBarHeight() {
+  const ThemeMetrics& metrics = UITheme::getInstance().getMetrics();
+  // topPadding + the status strip the header uses + a gap + the rule. Derived
+  // from the same metrics the header is built from, so the band is the same
+  // height here as it is everywhere else rather than a number that happens to
+  // look close.
+  return metrics.topPadding + metrics.batteryBarHeight + kReaderTopBarRuleGap + 2;
+}
+
+void BaseTheme::drawReaderTopBar(const GfxRenderer& renderer, const std::string& chapter,
+                                 const float bookProgressPercent) {
+  // Deliberately built from the SAME pieces, metrics and anchors as
+  // drawHeader's status strip: the clock at headerSidePadding, the battery
+  // inset from the right edge, and every label centred on the battery band's
+  // midline. The first version of this laid the row out on its own terms --
+  // its own insets, its own vertical centring -- and the result was a top bar
+  // that was subtly out of step with the identical bar on every other screen.
+  // The only thing that differs here is the chapter and percent between them.
+  namespace fui = freeink::ui;
+  const auto spec = uiScaleSpec();
+  fui::GfxRendererFrame<1> ui(renderer, spec.smallFontId, spec.bodyFontId, spec.titleFontId);
+  const fui::ThemeTokens& tokens = refreshSharedUiThemeTokens(ui.target);
+  ui.target.setFont(fui::GfxRendererTarget::FONT_SMALL, SMALL_FONT_ID);
+  const ThemeMetrics& metrics = UITheme::getInstance().getMetrics();
+
+  const fui::Rect band{0, static_cast<int16_t>(metrics.topPadding),
+                       static_cast<int16_t>(renderer.getScreenWidth()),
+                       static_cast<int16_t>(metrics.batteryBarHeight)};
+
+  // --- battery: measured exactly as the header measures it -------------------
+  const bool showBatteryPercentage =
+      SETTINGS.hideBatteryPercentage != CrossPointSettings::HIDE_BATTERY_PERCENTAGE::HIDE_ALWAYS;
+  const uint16_t percentage = powerManager.getBatteryPercentage();
+  char percentText[8];
+  snprintf(percentText, sizeof(percentText), "%u%%", static_cast<unsigned>(percentage));
+  // The icon glyph extends 2px past glyphWidth (terminal nub); reserve it or
+  // the percent label's rect comes up short and the text truncates.
+  constexpr int16_t batteryNubWidth = 2;
+  int16_t batteryReserve = static_cast<int16_t>(metrics.batteryWidth + batteryNubWidth);
+  if (showBatteryPercentage) {
+    batteryReserve = static_cast<int16_t>(
+        batteryReserve + batteryPercentSpacing +
+        ui.target.measureText(fui::GfxRendererTarget::FONT_SMALL, percentText, tokens.smallText).width);
+  }
+
+  char clockText[16];
+  const bool showClock =
+      halClock.isAvailable() && halClock.formatTime(clockText, sizeof(clockText), SETTINGS.clockUtcOffsetQ,
+                                                    SETTINGS.clockFormat == 1);
+  bool showBle = false;
+#if FREEINK_CAP_BLE_TRANSFER
+  showBle = BLE_LINK.isAuthenticated();
+#endif
+  // Same rule as the header's: a cable, not a handover. See drawHeader.
+  const bool showUsb = gpio.isUsbConnected();
+  const int bleWidth = showBle ? renderer.getTextWidth(SMALL_FONT_ID, "BLE") : 0;
+  const int usbWidth = showUsb ? renderer.getTextWidth(SMALL_FONT_ID, "USB") : 0;
+  const int clockWidth = showClock ? renderer.getTextWidth(SMALL_FONT_ID, clockText) : 0;
+
+  fui::BatteryIndicatorProps battery;
+  battery.percent = static_cast<uint8_t>(percentage > 100 ? 100 : percentage);
+  battery.charging = gpio.isUsbConnected();
+  battery.label = showBatteryPercentage ? percentText : nullptr;
+  battery.text = tokens.smallText;
+  battery.glyphWidth = static_cast<int16_t>(metrics.batteryWidth);
+  battery.glyphHeight = static_cast<int16_t>(metrics.batteryHeight);
+  battery.gap = batteryPercentSpacing;
+  const int16_t batteryEdgeInset = metrics.headerBatteryDetached ? 12 : tokens.headerSidePadding;
+  const int16_t batteryX = static_cast<int16_t>(band.right() - batteryEdgeInset - batteryReserve);
+  fui::batteryIndicator(ui.frame, fui::Rect{batteryX, band.y, batteryReserve, band.height}, battery);
+
+  // --- labels and clock, on the battery band's midline -----------------------
+  const int centerY = static_cast<int>(band.y) + static_cast<int>(band.height) / 2;
+  int cursorX = static_cast<int>(batteryX) - tokens.spaceMd;
+  const auto place = [&](const int width, const char* text) {
+    drawStatusLabel(renderer, cursorX - width, centerY, text, false);
+    cursorX -= width + tokens.spaceMd;
+  };
+  if (showBle) place(bleWidth, "BLE");
+  if (showUsb) place(usbWidth, "USB");
+
+  const int clockX = static_cast<int>(band.x) + tokens.headerSidePadding;
+  if (showClock) drawStatusLabel(renderer, clockX, centerY, clockText, false);
+
+  // --- centre: chapter, then percent of book ---------------------------------
+  // Percent of the BOOK, not of the chapter: it is the number the library list
+  // shows for the same book, and two different "progress" numbers on the same
+  // device is worse than one.
+  // One decimal, to match the app exactly.
+  //
+  // Whole percent is a coarse unit at the start of a book: "0%" for a book you
+  // have demonstrably started reads as "nothing was recorded" rather than "not
+  // far in". The precision was always there -- the sidecar stores basis points
+  // (ProgressFile.h) and the wire value carries four decimals -- so rounding to
+  // an int here was the only thing throwing it away, and it made the device and
+  // the app disagree about the same book by up to half a percent.
+  //
+  // Zero stays "0%": a decimal on nothing is noise, and the app renders it the
+  // same way.
+  char progressText[12];
+  if (bookProgressPercent <= 0.0f) {
+    snprintf(progressText, sizeof(progressText), "0%%");
+  } else {
+    snprintf(progressText, sizeof(progressText), "%.1f%%", static_cast<double>(bookProgressPercent));
+  }
+  const int progressWidth = renderer.getTextWidth(SMALL_FONT_ID, progressText);
+  constexpr int chapterPercentGap = 10;
+
+  // What is left between the clock and whatever the right cluster has grown to.
+  const int laneLeft = clockX + clockWidth + (showClock ? tokens.spaceMd : 0);
+  const int laneRight = cursorX;
+  const int laneWidth = laneRight - laneLeft;
+  if (laneWidth > progressWidth + chapterPercentGap) {
+    std::string title = chapter;
+    const int maxChapterWidth = laneWidth - progressWidth - chapterPercentGap;
+    if (renderer.getTextWidth(SMALL_FONT_ID, title.c_str()) > maxChapterWidth) {
+      title = renderer.truncatedText(SMALL_FONT_ID, title.c_str(), maxChapterWidth);
+    }
+    const int chapterWidth = renderer.getTextWidth(SMALL_FONT_ID, title.c_str());
+    const int blockWidth = chapterWidth + (chapterWidth > 0 ? chapterPercentGap : 0) + progressWidth;
+    int x = laneLeft + (laneWidth - blockWidth) / 2;
+    if (chapterWidth > 0) {
+      drawStatusLabel(renderer, x, centerY, title.c_str(), false);
+      x += chapterWidth + chapterPercentGap;
+    }
+    drawStatusLabel(renderer, x, centerY, progressText, false);
+  }
+
+  // --- the rule --------------------------------------------------------------
+  // Full width, edge to edge, ignoring the side insets: it separates two regions
+  // of the screen, so stopping it short would read as an underline belonging to
+  // the text above it. screenWidth - 1 because the last valid column is
+  // width - 1; drawing to width puts a pixel off-panel every frame.
+  const int ruleY = band.y + band.height + kReaderTopBarRuleGap;
+  renderer.drawLine(0, ruleY, renderer.getScreenWidth() - 1, ruleY, true);
 }
 
 void BaseTheme::drawStatusBar(GfxRenderer& renderer, const float bookProgress, const int currentPage,

@@ -54,6 +54,13 @@ constexpr size_t THUMB_EXPECTED_BYTES = 62 + 9 * 108;
 
 // The detail view has the whole screen, so it gets a cover four times the area:
 // 18 bytes per row, 216 rows, 3950 bytes.
+// The shelf row's cover, drawn 1:1 and NEVER scaled. A 1-bit dither encodes
+// tone in the placement of pixels, so resampling one is not a resize -- it is
+// destruction. A 144x216 cover squeezed into a 64px row came out as a black
+// block with a few stray dots, which is what a downscaled dither looks like.
+// The phone renders at exactly this size instead.
+constexpr int ROW_COVER_WIDTH = 88;
+constexpr int ROW_COVER_HEIGHT = 132;
 constexpr int COVER_WIDTH = 144;
 constexpr int COVER_HEIGHT = 216;
 constexpr size_t COVER_EXPECTED_BYTES = 62 + 18 * 216;

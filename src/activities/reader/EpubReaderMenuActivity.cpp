@@ -13,7 +13,7 @@ namespace fui = freeink::ui;
 
 EpubReaderMenuActivity::EpubReaderMenuActivity(GfxRenderer& renderer, MappedInputManager& mappedInput,
                                                const std::string& title, const int currentPage, const int totalPages,
-                                               const int bookProgressPercent, const uint8_t currentOrientation,
+                                               const float bookProgressPercent, const uint8_t currentOrientation,
                                                const bool hasFootnotes, const bool hasBookmarks)
     : UiListActivity("EpubReaderMenu", renderer, mappedInput),
       title(title),
@@ -174,7 +174,15 @@ void EpubReaderMenuActivity::buildScreen(UiScreen& screen) {
     progressLine = std::string(tr(STR_CHAPTER_PREFIX)) + std::to_string(currentPage) + "/" +
                    std::to_string(totalPages) + std::string(tr(STR_PAGES_SEPARATOR));
   }
-  progressLine += std::string(tr(STR_BOOK_PREFIX)) + std::to_string(bookProgressPercent) + "%";
+    // One decimal, matching drawReaderTopBar() and the app. std::to_string on a
+  // float would give six.
+  char bookPct[12];
+  if (bookProgressPercent <= 0.0f) {
+    snprintf(bookPct, sizeof(bookPct), "0%%");
+  } else {
+    snprintf(bookPct, sizeof(bookPct), "%.1f%%", static_cast<double>(bookProgressPercent));
+  }
+  progressLine += std::string(tr(STR_BOOK_PREFIX)) + bookPct;
   const fui::Rect band = screen.takeTop(static_cast<int16_t>(metrics.tabBarHeight));
   const int16_t pad = screen.theme().headerSidePadding;
   screen.target().text(band.inset(fui::Insets{0, pad, 0, pad}), progressLine.c_str(), screen.theme().smallText);

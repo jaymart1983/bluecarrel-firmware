@@ -10,13 +10,10 @@
 // Watches the firmware drop folder (see FirmwareStaging.h) and offers an update
 // when what is there checks out.
 //
-// WHY A WATCHER RATHER THAN A FLOW. Firmware used to arrive through an
-// interactive BLE session: the phone pushed an image, the reader validated it
-// mid-transfer and threw a Yes/No prompt on screen while the radio was still
-// live. That put a reboot-the-device prompt on the far end of a wireless link,
-// and it only worked at all while one particular screen was open. Now a drop is
-// just a file. The app writes it, or a person writes it with the card mounted
-// over USB, and the two routes are the same route.
+// WHY A WATCHER RATHER THAN A FLOW. A drop is just a file. The app writes it over
+// BLE, or a person writes it with the card mounted over USB, and the two routes
+// are the same route. No reboot-the-device prompt depends on a wireless link
+// still being up or on one particular screen being open.
 //
 // COST. Hashing a 3 MB image off SD is seconds of work, so it is not done on a
 // timer -- it is done once, in HASH_CHUNK_BYTES bites spread across main-loop
@@ -41,6 +38,17 @@ class FirmwareWatcher {
   // The offer comes back if the file on the card changes, or at the next boot --
   // declining an update does not delete anybody's file.
   void standDown();
+
+  // "Later" (or auto-install): install the staged image the next time the reader
+  // goes to sleep. RAM only -- a restart forgets it and the offer comes back.
+  void deferToSleep() { installAtSleep_ = true; }
+  bool installAtSleep() const;
+  void clearDeferral() { installAtSleep_ = false; }
+
+  // What the card holds, for the Settings row: nothing staged, being checked,
+  // verified and waiting (offered or not), or present but failing its hash.
+  enum class StageState : uint8_t { NONE, CHECKING, READY, INVALID };
+  StageState stageState() const;
 
  private:
   enum class Phase : uint8_t {
@@ -70,6 +78,15 @@ class FirmwareWatcher {
   size_t imageSize_ = 0;
   mbedtls_sha256_context sha_{};
   bool shaActive_ = false;
+  bool installAtSleep_ = false;
+  // The staged image hashed to its companion file. Survives standDown().
+  bool verified_ = false;
 };
 
 #define FIRMWARE_WATCHER FirmwareWatcher::getInstance()
+
+// One-line firmware status for the settings screens: the staged build stamp (if
+// any) with "installs at sleep" / "ready to install", or checking / invalid /
+// up to date. "Up to date" means no update is waiting on this card; whether a
+// newer build exists anywhere is the phone's to know.
+std::string firmwareStageStatusText();

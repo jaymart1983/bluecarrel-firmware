@@ -1,6 +1,7 @@
 #include "FirmwareWatcher.h"
 
 #include <Arduino.h>
+#include <I18n.h>
 #include <Logging.h>
 
 #include <algorithm>
@@ -70,6 +71,7 @@ void FirmwareWatcher::tick() {
     if (phase_ != Phase::IDLE) {
       phase_ = Phase::IDLE;
       verdictSize_ = 0;
+      verified_ = false;
     }
     return;
   }
@@ -108,6 +110,7 @@ void FirmwareWatcher::beginHash() {
   mbedtls_sha256_starts(&sha_, 0);
   shaActive_ = true;
   hashedBytes_ = 0;
+  verified_ = false;
   phase_ = Phase::HASHING;
   LOG_INF("FWDROP", "hashing %s (%u bytes) against %s", firmware_staging::IMAGE_PATH,
           static_cast<unsigned>(imageSize_), firmware_staging::HASH_PATH);
@@ -126,11 +129,13 @@ void FirmwareWatcher::finishHash() {
     // Not deleted. A digest that does not match is far more likely to be a copy
     // that was interrupted or a hash file someone forgot to update than an
     // attack, and throwing away the user's file is not this code's call to make.
+    verified_ = false;
     phase_ = Phase::DECLINED;
     LOG_ERR("FWDROP", "%s does not match %s -- ignoring this image", firmware_staging::IMAGE_PATH,
             firmware_staging::HASH_PATH);
     return;
   }
+  verified_ = true;
   phase_ = Phase::READY;
   LOG_INF("FWDROP", "staged firmware verified; offering the update");
 }
@@ -142,10 +147,37 @@ void FirmwareWatcher::abandon(const char* reason) {
   }
   if (image_) image_.close();
   LOG_ERR("FWDROP", "%s", reason);
+  verified_ = false;
   verdictSize_ = imageSize_;
   phase_ = Phase::DECLINED;
 }
 
 void FirmwareWatcher::standDown() {
   if (phase_ == Phase::READY) phase_ = Phase::DECLINED;
+}
+
+FirmwareWatcher::StageState FirmwareWatcher::stageState() const {
+  if (!firmware_staging::imageStaged()) return StageState::NONE;
+  if (verified_) return StageState::READY;
+  if (phase_ == Phase::DECLINED && verdictSize_ != 0) return StageState::INVALID;
+  return StageState::CHECKING;
+}
+
+bool FirmwareWatcher::installAtSleep() const { return installAtSleep_ && firmware_staging::imageStaged(); }
+
+std::string firmwareStageStatusText() {
+  std::string version;
+  firmware_staging::readVersion(version);
+  const std::string prefix = version.empty() ? "" : version + " ";
+  if (FIRMWARE_WATCHER.installAtSleep()) return prefix + tr(STR_FIRMWARE_AT_SLEEP);
+  switch (FIRMWARE_WATCHER.stageState()) {
+    case FirmwareWatcher::StageState::READY:
+      return prefix + tr(STR_FIRMWARE_READY_TO_INSTALL);
+    case FirmwareWatcher::StageState::CHECKING:
+      return tr(STR_FIRMWARE_CHECKING);
+    case FirmwareWatcher::StageState::INVALID:
+      return tr(STR_FIRMWARE_INVALID);
+    default:
+      return tr(STR_FIRMWARE_UP_TO_DATE);
+  }
 }

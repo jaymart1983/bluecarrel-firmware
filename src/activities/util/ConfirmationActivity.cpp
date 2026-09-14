@@ -27,6 +27,8 @@ void ConfirmationActivity::onEnter() {
   startY = renderer.getScreenHeight() / 6;
 
   const char* options[] = {I18N.get(StrId::STR_CANCEL), I18N.get(StrId::STR_CONFIRM)};
+  // Cancel is one of the two options, so no separate Back chip.
+  confirmPopup.setTouchBack(false);
   confirmPopup.show(safeHeading.c_str(), options, 2, 0, [this](int idx) {
     ActivityResult res;
     res.isCancelled = (idx != 1);

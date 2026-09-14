@@ -1,0 +1,68 @@
+Subject: Uc8279X4Driver: let the panel settle before power-off
+
+waitBusy() only means the controller finished clocking the waveform. Cutting
+analog power straight away lets intermediate grey levels relax, which washed
+out the sleep cover. Hold power briefly before POF on the turn-off and deep
+sleep paths; page turns keep power up and are unaffected.
+
+diff --git a/libs/display/FreeInkDisplay/src/driver/Uc8279X4Driver.cpp b/libs/display/FreeInkDisplay/src/driver/Uc8279X4Driver.cpp
+index 0a78add..5ce18f8 100644
+--- a/libs/display/FreeInkDisplay/src/driver/Uc8279X4Driver.cpp
++++ b/libs/display/FreeInkDisplay/src/driver/Uc8279X4Driver.cpp
+@@ -31,6 +31,21 @@ constexpr uint8_t CMD_POWER_ON = 0x04;            // PON
+ constexpr uint8_t CMD_DEEP_SLEEP = 0x07;          // DSLP (check code 0xA5)
+ constexpr uint8_t CMD_DTM1 = 0x10;                // OLD plane in KW mode / AA plane0
+ constexpr uint8_t CMD_DISPLAY_REFRESH = 0x12;     // DRF
++
++// Hold analog power for a moment after a waveform finishes, before POF.
++//
++// waitBusy() reports that the CONTROLLER stopped clocking the waveform, not
++// that the ink has settled. Dropping VCOM/VDH immediately lets pixels relax off
++// their target tone -- "kickback". Fully-driven black and white barely move, but
++// the 4-level AA path parks pixels at INTERMEDIATE charge states, and those
++// relax readily: the sleep cover was rendering crisp on its B/W base pass and
++// then visibly washing out as the AA pass powered down behind it.
++//
++// Only paid when something explicitly asks for the panel to be turned off
++// (sleep, or the sunlight fading fix). Page turns leave analog power up and
++// never reach these paths, so the reading cadence is unaffected.
++constexpr unsigned long POWER_OFF_SETTLE_MS = 200;
++constexpr unsigned long POWER_OFF_SETTLE_GRAY_MS = 300;
+ constexpr uint8_t CMD_DTM2 = 0x13;                // NEW plane in KW mode / AA plane1
+ constexpr uint8_t CMD_PLL = 0x30;                 // PLL frame rate
+ constexpr uint8_t CMD_VCOM_DATA_INTERVAL = 0x50;  // CDI — 1 data byte on this part
+@@ -382,6 +397,7 @@ void Uc8279X4Driver::displayFinish(EpdBus& bus, const uint8_t* fb) {
+   _needFullClear = false;
+ 
+   if (_pendingTurnOff) {
++    delay(POWER_OFF_SETTLE_MS);
+     bus.cmd(CMD_POWER_OFF);
+     bus.waitBusy(" 8279x4_POF");
+     _isScreenOn = false;
+@@ -397,6 +413,9 @@ void Uc8279X4Driver::skipInitialResync() { _needFullClear = false; }
+ 
+ void Uc8279X4Driver::deepSleep(EpdBus& bus) {
+   if (_isScreenOn) {
++    // Last chance for the panel to hold its final tone: this is the power-down
++    // the sleep cover is left sitting on for hours.
++    delay(POWER_OFF_SETTLE_GRAY_MS);
+     bus.cmd(CMD_POWER_OFF);
+     bus.waitBusy(" 8279x4 power-down");
+     _isScreenOn = false;
+@@ -468,6 +487,8 @@ void Uc8279X4Driver::displayGray(EpdBus& bus, const uint8_t* fb, bool turnOff, c
+ 
+   bus.cmd(CMD_DISPLAY_REFRESH);
+   bus.waitBusy(" 8279x4_gray");
++  // Let the intermediate grey levels settle under drive before any power-down.
++  if (turnOff) delay(POWER_OFF_SETTLE_GRAY_MS);
+   // Vendor production behavior: the UC8279 AA path leaves analog power enabled
+   // between page refreshes (the UC8179 sibling does the same — its gray_aa sends
+   // no POF). Honor only an explicit turnOff.
+@@ -533,6 +554,7 @@ void Uc8279X4Driver::transitionGrayscaleBase(EpdBus& bus, const uint8_t* fb, boo
+   _redriveAfterGray = false;
+   _needFullClear = false;
+   if (turnOff && _isScreenOn) {
++    delay(POWER_OFF_SETTLE_MS);
+     bus.cmd(CMD_POWER_OFF);
+     bus.waitBusy(" 8279x4_gray_base_POF");
+     _isScreenOn = false;

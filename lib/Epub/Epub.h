@@ -52,8 +52,11 @@ class Epub {
   const std::string& getTitle() const;
   const std::string& getAuthor() const;
   const std::string& getLanguage() const;
-  std::string getCoverBmpPath(bool cropped = false) const;
-  bool generateCoverBmp(bool cropped = false) const;
+  /// \p oneBit selects the 1-bit Atkinson-dithered variant, cached separately
+  /// from the 2-bit one so switching between them regenerates rather than
+  /// silently reusing whichever was made first.
+  std::string getCoverBmpPath(bool cropped = false, bool oneBit = false) const;
+  bool generateCoverBmp(bool cropped = false, bool oneBit = false) const;
   std::string getThumbBmpPath() const;
   std::string getThumbBmpPath(int height) const;
   bool generateThumbBmp(int height) const;

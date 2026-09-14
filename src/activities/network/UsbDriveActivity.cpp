@@ -128,7 +128,18 @@ void UsbDriveActivity::render(RenderLock&&) {
     const auto labels = mappedInput.mapLabels(tr(STR_BACK), "", "", "");
     GUI.drawButtonHints(renderer, labels.btn1, labels.btn2, labels.btn3, labels.btn4);
   }
-  renderer.displayBuffer();
+  // A full clean waveform, every time, stated here rather than left to the
+  // ghosting heuristic.
+  //
+  // The default FAST refresh is a partial waveform: it only moves pixels that
+  // differ from what the panel believes it is showing, and it does not fully
+  // drive them. Entering this screen replaces the whole Library, so a FAST
+  // push leaves the outgoing page faintly under the new one -- the "blended"
+  // screen that survived two attempts at fixing it through the renderer's
+  // automatic whole-screen detection. This screen is shown rarely and then sits
+  // static for minutes, so the cost of a clean waveform is irrelevant and the
+  // cost of a muddy one is the whole screen.
+  renderer.displayBuffer(HalDisplay::HALF_REFRESH);
 }
 
 void UsbDriveActivity::driveScreen(UiScreen& screen, void* user) {

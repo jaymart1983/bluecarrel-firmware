@@ -39,11 +39,14 @@ class SdFirmwareUpdateActivity : public Activity {
   // says the file came out of the watched folder, which is the only case that
   // clears the folder afterwards -- an image the user picked by hand out of their
   // own directory is theirs, and deleting it would be a surprise.
-  SdFirmwareUpdateActivity(GfxRenderer& renderer, MappedInputManager& mappedInput, std::string path, bool stagedDrop)
+  SdFirmwareUpdateActivity(GfxRenderer& renderer, MappedInputManager& mappedInput, std::string path, bool stagedDrop,
+                           bool autoConfirm = false, bool sleepAfter = false)
       : Activity("SdFirmwareUpdate", renderer, mappedInput),
         firmwarePath(std::move(path)),
         presetPath(true),
-        stagedDrop(stagedDrop) {}
+        stagedDrop(stagedDrop),
+        autoConfirm(autoConfirm),
+        sleepAfter(sleepAfter) {}
 
   void onEnter() override;
   void loop() override;
@@ -61,6 +64,12 @@ class SdFirmwareUpdateActivity : public Activity {
   // was never opened.
   bool presetPath = false;
   bool stagedDrop = false;
+  // The answer was already given (FirmwareReadyActivity, or an install at sleep).
+  bool autoConfirm = false;
+  // Installed on the way to sleep: reboot back into sleep rather than onto Home.
+  bool sleepAfter = false;
+  // The build stamp staged beside the image, when the app sent one.
+  std::string stagedVersion;
   size_t firmwareSize = 0;
   size_t writtenBytes = 0;
   unsigned int lastRenderedPercent = 101;

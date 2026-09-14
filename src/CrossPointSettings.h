@@ -179,10 +179,9 @@ class CrossPointSettings : public PersistableStore<CrossPointSettings> {
   };
 
   // Ghost cleanup: how much of the screen may change through fast differential
-  // updates before the next one is promoted to a clean waveform. Complements
-  // refreshFrequency, which counts reader page turns only -- menus, popups and
-  // toolbars never touched that counter, so a chrome-heavy session accumulated
-  // residue with nothing to clear it. Persisted by index; append only.
+  // updates before the next one is promoted to a clean waveform. Counts every
+  // screen update (reader pages, menus, popups), not page turns. Persisted by
+  // index; append only.
   enum GHOST_CLEANUP {
     GHOST_CLEANUP_OFF = 0,
     GHOST_CLEANUP_LIGHT = 1,
@@ -409,7 +408,7 @@ class CrossPointSettings : public PersistableStore<CrossPointSettings> {
   // Changing a default that shipped therefore needs a migration keyed on this
   // revision, not just a new initialiser. Bump it when you add one; absent in
   // the file means 0, i.e. everything written before revisions existed.
-  static constexpr uint8_t SETTINGS_REV = 1;
+  static constexpr uint8_t SETTINGS_REV = 2;
   // Not in SettingsList and not user-visible: read and written by hand in
   // fromJson()/toJson() alongside the other manually-persisted fields.
   uint8_t settingsRev = 0;
@@ -438,10 +437,14 @@ class CrossPointSettings : public PersistableStore<CrossPointSettings> {
   uint8_t paragraphAlignment = JUSTIFIED;
   // Auto-sleep timeout setting (default 10 minutes). Legacy sleepTimeout enum values are migration-only.
   uint8_t sleepTimeoutMinutes = 10;
-  // E-ink refresh frequency (default 15 pages)
+  // Retained only for settings-file compatibility. Reader page turns have no
+  // refresh cadence, and nothing reads or writes this field.
   uint8_t refreshFrequency = REFRESH_15;
   // Change-accumulation ghost cleanup (see GHOST_CLEANUP)
-  uint8_t ghostCleanup = GHOST_CLEANUP_NORMAL;
+  // Off on the X4 Pro: its anti-ghosting holds up without scheduled scrubs, and the
+  // scrub is a full-screen flash every few pages. Refresh is on demand there (Action
+  // Centre Refresh tile, or a long press on its Home tile). See rev 2 in fromJson.
+  uint8_t ghostCleanup = FREEINK_DEVICE_X4PRO ? GHOST_CLEANUP_OFF : GHOST_CLEANUP_NORMAL;
   uint8_t hyphenationEnabled = 0;
 
   // Reader screen margin settings
@@ -452,6 +455,12 @@ class CrossPointSettings : public PersistableStore<CrossPointSettings> {
   // OPDS download destination folder ("" = SD root). Global; edited from the
   // OPDS server list. Persisted via a category-less SettingInfo::String in
   // SettingsList.h, so it stays out of the on-device Settings screen.
+  // What this reader calls itself in the phone app. Sixteen characters plus a
+  // terminator: long enough for "Sam's Pixel 9 Pro", short enough to sit in a pill
+  // beside an icon without being truncated. Category-less in SettingsList, so it
+  // persists and syncs but never appears on the device's own settings screen --
+  // there is no keyboard worth typing a name on here, and the app has one.
+  char deviceName[17] = "";
   char opdsDownloadFolder[64] = "";
   // On-disk filename format for OPDS downloads (0=Author-Title default, 1=Title-Author,
   // 2=Title). See OpdsFilenameFormat. Persisted via a category-less SettingInfo::Enum,
@@ -468,13 +477,22 @@ class CrossPointSettings : public PersistableStore<CrossPointSettings> {
   uint8_t uiTheme = LYRA;
   // Sunlight fading compensation
   uint8_t fadingFix = 0;
+  // Firmware updates: 1 = install a verified update at the next sleep without
+  // asking; 0 = offer Update now / Later / Cancel the moment it is ready.
+  uint8_t autoInstallFirmware = 0;
   // Power button return from footnotes (1 = enabled, 0 = disabled)
   uint8_t pwrBtnFootnoteBack = 1;
   // Use book's embedded CSS styles for EPUB rendering (1 = enabled, 0 = disabled)
   uint8_t embeddedStyle = 1;
   // Focus Reading - emphasizes the first part of words with bold
   uint8_t focusReadingEnabled = 0;
-  uint8_t readerMenuStyle = READER_MENU_LIST;
+  // Toolbar, not the full-screen list. This board is touch-first, and the
+  // toolbar is the chrome built for it: a bottom sheet painted OVER the page
+  // that is already on screen, so the text stays visible behind it and opening
+  // it costs one refresh instead of a whole screen change. usesToolbarMenu()
+  // still forces the list on button-only boards, where a sheet with no cursor
+  // would be unusable.
+  uint8_t readerMenuStyle = READER_MENU_TOOLBAR;
   // SD card font family name (empty = use built-in fontFamily)
   char sdFontFamilyName[32] = "";
   // Dictionary folder name under /dictionaries (empty = no dictionary)
@@ -594,10 +612,9 @@ class CrossPointSettings : public PersistableStore<CrossPointSettings> {
 
   float getReaderLineCompression() const;
   unsigned long getSleepTimeoutMs() const;
-  int getRefreshFrequency() const;
   // Change budget for GfxRenderer::setChangeBudgetPercent(): percent of the
   // panel that may flip through fast updates before one is promoted to a clean
-  // waveform. 0 = off (page cadence only).
+  // waveform. 0 = off.
   uint16_t getGhostCleanupPercent() const;
 };
 

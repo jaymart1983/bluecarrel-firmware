@@ -31,3 +31,6 @@ lib/EpdFont/scripts/output/
 /sdkconfig.*
 sdkconfig.sticky
 flake.*
+
+# Generated at build time by scripts/build_stamp.py
+/src/network/BuildStamp.h

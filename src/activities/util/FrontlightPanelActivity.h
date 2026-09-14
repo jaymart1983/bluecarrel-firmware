@@ -57,8 +57,9 @@ class FrontlightPanelActivity final : public Activity, private UiAppHost {
     TILE_SETTINGS = 4,
     TILE_HOME = 5,
     TILE_SLEEP = 6,
+    TILE_USB_DRIVE = 7,
   };
-  static constexpr int kMaxTiles = 7;
+  static constexpr int kMaxTiles = 8;
   // Grid order, filled by buildTileOrder() in onEnter(): the visible subset of
   // the ids above, in the order they are laid out.
   int16_t tileIds[kMaxTiles] = {};

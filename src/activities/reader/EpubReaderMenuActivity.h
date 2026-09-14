@@ -38,7 +38,7 @@ class EpubReaderMenuActivity final : public UiListActivity {
   static void buildMenuItems(std::vector<MenuItem>& items, bool hasFootnotes, bool hasBookmarks);
 
   explicit EpubReaderMenuActivity(GfxRenderer& renderer, MappedInputManager& mappedInput, const std::string& title,
-                                  const int currentPage, const int totalPages, const int bookProgressPercent,
+                                  const int currentPage, const int totalPages, const float bookProgressPercent,
                                   const uint8_t currentOrientation, const bool hasFootnotes, bool hasBookmarks);
 
   void render(RenderLock&&) override;
@@ -78,5 +78,7 @@ class EpubReaderMenuActivity final : public UiListActivity {
   const std::vector<const char*> pageTurnLabels = {I18N.get(StrId::STR_STATE_OFF), "1", "3", "6", "12"};
   int currentPage = 0;
   int totalPages = 0;
-  int bookProgressPercent = 0;
+  // Float, so the menu and the reader's top bar cannot disagree about the same
+  // book. Rounding this to an int made them differ by up to half a percent.
+  float bookProgressPercent = 0.0f;
 };

@@ -9,22 +9,31 @@
 #include <algorithm>
 #include <string>
 
+#include "FirmwareReadyActivity.h"
 #include "MappedInputManager.h"
 #include "activities/util/ConfirmationActivity.h"
 #include "components/UITheme.h"
 #include "fontIds.h"
+#include "network/BuildStamp.h"
+#include "network/FirmwareWatcher.h"
 
 namespace {
+
+constexpr unsigned long STAGE_POLL_MS = 1000;
+
+bool hitRect(const Rect& r, const int x, const int y) {
+  return r.height > 0 && x >= r.x && x < r.x + r.width && y >= r.y && y < r.y + r.height;
+}
+
 }  // namespace
 
 void BlePairingActivity::onEnter() {
   Activity::onEnter();
-  // The radio is already up. If it is not, something failed at boot and the page
-  // should say so rather than silently showing a code nobody can use, so ask for
-  // a start here too -- begin() is idempotent.
+  // The radio is already up. If it is not, something failed at boot, so ask for a
+  // start here too -- begin() is idempotent.
   BLE_LINK.begin();
   BLE_LINK.setObserver(this);
-  forgetSelected_ = BLE_LINK.hasTrustedHost();
+  refreshFirmwareStage();
   requestUpdate();
 }
 
@@ -33,24 +42,49 @@ void BlePairingActivity::onExit() {
   Activity::onExit();
 }
 
+void BlePairingActivity::refreshFirmwareStage() {
+  lastStageCheckMs_ = millis();
+  const auto stage = FIRMWARE_WATCHER.stageState();
+  firmwareReady_ = stage == FirmwareWatcher::StageState::READY;
+  const int key = static_cast<int>(stage) * 2 + (FIRMWARE_WATCHER.installAtSleep() ? 1 : 0);
+  if (key != lastStage_) {
+    lastStage_ = key;
+    requestUpdate();
+  }
+}
+
 void BlePairingActivity::loop() {
   if (mappedInput.wasPressed(MappedInputManager::Button::Back)) {
     finish();
     return;
   }
 
-  if (!BLE_LINK.hasTrustedHost()) return;
+  // The staged image changes on its own -- a hash finishing, an upload landing --
+  // and nothing tells this screen, so look once a second and repaint on a change.
+  if (millis() - lastStageCheckMs_ >= STAGE_POLL_MS) refreshFirmwareStage();
 
-  if (mappedInput.wasPressed(MappedInputManager::Button::Confirm)) {
-    promptForget();
-    return;
-  }
+  const bool canForget = BLE_LINK.hasTrustedHost();
 
   int x = 0;
   int y = 0;
-  if (forgetRect_.height > 0 && mappedInput.wasScreenTapped(x, y) && x >= forgetRect_.x &&
-      x < forgetRect_.x + forgetRect_.width && y >= forgetRect_.y && y < forgetRect_.y + forgetRect_.height) {
-    promptForget();
+  if (mappedInput.wasScreenTapped(x, y)) {
+    if (firmwareReady_ && hitRect(firmwareRect_, x, y)) {
+      openFirmware();
+      return;
+    }
+    if (canForget && hitRect(forgetRect_, x, y)) {
+      promptForget();
+      return;
+    }
+  }
+
+  if (mappedInput.wasPressed(MappedInputManager::Button::Confirm)) {
+    // The highlighted row: the waiting update when there is one, else Forget.
+    if (firmwareReady_) {
+      openFirmware();
+    } else if (canForget) {
+      promptForget();
+    }
   }
 }
 
@@ -64,90 +98,95 @@ void BlePairingActivity::promptForget() {
           RenderLock lock(*this);
           if (!BLE_LINK.forgetTrustedHost()) LOG_ERR("BLE", "could not forget the trusted host");
         }
-        forgetSelected_ = false;
         requestUpdate();
       });
+}
+
+void BlePairingActivity::openFirmware() {
+  startActivityForResult(std::make_unique<FirmwareReadyActivity>(renderer, mappedInput),
+                         [this](const ActivityResult&) {
+                           lastStage_ = -1;
+                           refreshFirmwareStage();
+                           requestUpdate();
+                         });
 }
 
 void BlePairingActivity::render(RenderLock&&) {
   const auto& metrics = UITheme::getInstance().getMetrics();
   const int pageWidth = renderer.getScreenWidth();
-  const int pageHeight = renderer.getScreenHeight();
-  const int lineHeight = renderer.getLineHeight(UI_10_FONT_ID);
-  const int smallHeight = renderer.getLineHeight(SMALL_FONT_ID);
+  const int left = metrics.contentSidePadding;
+  const int contentWidth = pageWidth - left * 2;
+  const int bodyLine = renderer.getLineHeight(UI_10_FONT_ID);
 
   const bool paired = BLE_LINK.hasTrustedHost();
   const std::string hostLabel = BLE_LINK.trustedHostLabel();
   const std::string& authError = BLE_LINK.authError();
 
   renderer.clearScreen();
-  GUI.drawHeader(renderer, Rect{0, metrics.topPadding, pageWidth, metrics.headerHeight}, tr(STR_BLUETOOTH));
+  GUI.drawHeader(renderer, Rect{0, metrics.topPadding, pageWidth, metrics.headerHeight}, tr(STR_SETTINGS_TITLE));
 
   int y = metrics.topPadding + metrics.headerHeight + metrics.verticalSpacing;
 
-  // --- who, if anyone -------------------------------------------------------
-  if (paired) {
-    renderer.drawCenteredText(UI_10_FONT_ID, y, tr(STR_BLE_PAIRED_WITH));
-    y += lineHeight;
-    renderer.drawCenteredText(UI_12_FONT_ID, y, hostLabel.c_str(), true, EpdFontFamily::BOLD);
-    y += renderer.getLineHeight(UI_12_FONT_ID);
-    renderer.drawCenteredText(SMALL_FONT_ID, y,
-                              BLE_LINK.isAuthenticated() ? tr(STR_CONNECTED) : tr(STR_BLE_NOT_CONNECTED), true);
-    y += smallHeight + metrics.verticalSpacing;
-  } else {
-    renderer.drawCenteredText(UI_12_FONT_ID, y, tr(STR_BLE_PAIR_PHONE), true, EpdFontFamily::BOLD);
-    y += renderer.getLineHeight(UI_12_FONT_ID);
-    renderer.drawCenteredText(SMALL_FONT_ID, y, tr(STR_BLE_PAIR_HINT), true);
-    y += smallHeight + metrics.verticalSpacing;
-  }
+  // Everything left-aligned at the content margin, one line per call.
+  const auto line = [&](const int font, const std::string& value, const EpdFontFamily::Style style) {
+    const std::string fitted = renderer.truncatedText(font, value.c_str(), contentWidth, style);
+    renderer.drawText(font, left, y, fitted.c_str(), true, style);
+    y += renderer.getLineHeight(font);
+  };
+  const auto sectionTitle = [&](const char* title) {
+    line(UI_12_FONT_ID, title, EpdFontFamily::BOLD);
+    y += 2;
+    renderer.drawLine(left, y, pageWidth - left, y, true);
+    y += metrics.verticalSpacing;
+  };
+  // A row that does something: outlined, label left-aligned, heavier when it is
+  // the one Confirm would activate.
+  const auto actionRow = [&](const std::string& label, const bool highlighted) -> Rect {
+    const int top = y + metrics.verticalSpacing;
+    const int height = metrics.menuRowHeight;
+    renderer.drawRoundedRect(left, top, contentWidth, height, highlighted ? 2 : 1, 6, true);
+    const std::string fitted =
+        renderer.truncatedText(UI_10_FONT_ID, label.c_str(), contentWidth - 24, EpdFontFamily::REGULAR);
+    renderer.drawText(UI_10_FONT_ID, left + 12, top + (height - bodyLine) / 2, fitted.c_str(), true,
+                      EpdFontFamily::REGULAR);
+    y = top + height + metrics.verticalSpacing;
+    return Rect{left, top, contentWidth, height};
+  };
 
-  // --- the code -------------------------------------------------------------
-  // Shown only while no phone is paired. Once a trusted host is stored the code
-  // is not merely unnecessary, it is misleading: a paired phone reconnects over
-  // its saved credential and never sends the code, so showing six digits invites
-  // the user to type something that is not what the reader is waiting for.
-  //
-  // This does not strand anyone. Forget, below, is on this same screen and takes
-  // the device back to the unpaired state -- which is what brings the code back.
-  // That is the route out of a broken credential, and it is a deliberate action
-  // rather than a number sitting on screen at all times.
-  if (!paired) {
-    const std::string code = std::string(tr(STR_BLE_TRANSFER_CODE)) + BLE_LINK.sessionCode();
-    renderer.drawCenteredText(UI_12_FONT_ID, y, code.c_str(), true, EpdFontFamily::BOLD);
-    y += renderer.getLineHeight(UI_12_FONT_ID) + metrics.verticalSpacing;
-  }
-
-  if (!authError.empty()) {
-    // Under the code, in the small face: a refusal is a footnote to the code, not
-    // a replacement for it.
-    const std::string line = std::string(tr(STR_ERROR_MSG)) + ": " + authError;
-    renderer.drawCenteredText(SMALL_FONT_ID, y, line.c_str(), true);
-    y += smallHeight + metrics.verticalSpacing;
-  }
-
-  // No QR and no companion URL. The web companion was how a browser paired with
-  // the reader; this device pairs with the phone app, and putting a second,
-  // unrelated way to connect on the one screen that teaches pairing is how the
-  // Store ended up sending people to a web page instead of the app they had
-  // open. The six digits above are the whole instruction.
+  // --- Bluetooth -------------------------------------------------------------
+  sectionTitle(tr(STR_BLUETOOTH));
   forgetRect_ = Rect{0, 0, 0, 0};
-  const int forgetReserve = paired ? metrics.menuRowHeight + metrics.verticalSpacing : 0;
-  const int reservedBelow = metrics.buttonHintsHeight + metrics.verticalSpacing + forgetReserve;
-  y = std::max(y, pageHeight - reservedBelow);
-
   if (paired) {
-    // One tile, drawn with the theme's own button-menu so it matches every other
-    // button on the device. drawButtonMenu insets the tile by verticalSpacing.
-    const Rect band{0, y, pageWidth, metrics.menuRowHeight + metrics.verticalSpacing};
-    GUI.drawButtonMenu(
-        renderer, band, 1, forgetSelected_ ? 0 : -1, [](int) { return std::string(tr(STR_FORGET_BUTTON)); },
-        [](int) { return UIIcon::None; });
-    forgetRect_ = Rect{metrics.contentSidePadding, y + metrics.verticalSpacing,
-                       pageWidth - metrics.contentSidePadding * 2, metrics.menuRowHeight};
+    line(UI_10_FONT_ID, std::string(tr(STR_BLE_PAIRED_WITH)) + " " + hostLabel, EpdFontFamily::BOLD);
+    line(SMALL_FONT_ID, BLE_LINK.isAuthenticated() ? tr(STR_CONNECTED) : tr(STR_BLE_NOT_CONNECTED),
+         EpdFontFamily::REGULAR);
+  } else {
+    line(UI_10_FONT_ID, tr(STR_BLE_PAIR_PHONE), EpdFontFamily::BOLD);
+    line(SMALL_FONT_ID, tr(STR_BLE_PAIR_HINT), EpdFontFamily::REGULAR);
+    y += metrics.verticalSpacing;
+    // The code only while no phone is paired: a paired phone reconnects over its
+    // saved credential and never sends it. Forget brings it back.
+    line(UI_12_FONT_ID, std::string(tr(STR_BLE_TRANSFER_CODE)) + BLE_LINK.sessionCode(), EpdFontFamily::BOLD);
+  }
+  if (!authError.empty()) {
+    line(SMALL_FONT_ID, std::string(tr(STR_ERROR_MSG)) + ": " + authError, EpdFontFamily::REGULAR);
+  }
+  if (paired) forgetRect_ = actionRow(tr(STR_FORGET_BUTTON), !firmwareReady_);
+  y += metrics.verticalSpacing * 3;
+
+  // --- Firmware --------------------------------------------------------------
+  sectionTitle(tr(STR_FIRMWARE_SECTION));
+  line(UI_10_FONT_ID, std::string(tr(STR_FIRMWARE_VERSION)) + " " + X4_BUILD_STAMP, EpdFontFamily::REGULAR);
+  firmwareRect_ = Rect{0, 0, 0, 0};
+  const std::string status = firmwareStageStatusText();
+  if (firmwareReady_) {
+    // A row, because it does something: Update Now / Later / Cancel.
+    firmwareRect_ = actionRow(status, true);
+  } else {
+    line(SMALL_FONT_ID, status, EpdFontFamily::REGULAR);
   }
 
-  const auto labels = mappedInput.mapLabels(tr(STR_BACK), paired ? tr(STR_FORGET_BUTTON) : "", "", "");
-  GUI.drawButtonHints(renderer, labels.btn1, labels.btn2, labels.btn3, labels.btn4);
+  GUI.drawButtonHints(renderer, "", "", "", "", /*touchBack=*/false);
   renderer.displayBuffer();
 }
 

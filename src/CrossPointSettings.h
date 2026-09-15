@@ -452,15 +452,23 @@ class CrossPointSettings : public PersistableStore<CrossPointSettings> {
   static constexpr uint8_t SCREEN_MARGIN_MAX = 40;
   static constexpr uint8_t SCREEN_MARGIN_STEP = 5;
   uint8_t screenMargin = SCREEN_MARGIN_MIN;
+  // What this reader is called: its Bluetooth advertising and GAP name, and the
+  // label the phone app shows. Empty means DEFAULT_DEVICE_NAME. Edited on the X4
+  // Pro's Settings page (BlePairingActivity) and from the app; category-less in
+  // SettingsList, so SettingsActivity does not list it.
+  static constexpr const char* DEFAULT_DEVICE_NAME = "Bluecarrel";
+  static constexpr size_t DEVICE_NAME_MAX_BYTES = 16;
+  char deviceName[DEVICE_NAME_MAX_BYTES + 1] = "";
+  // The one rule for every way a name comes in: trims ASCII whitespace from both
+  // ends, then accepts at most DEVICE_NAME_MAX_BYTES of printable ASCII
+  // (0x20-0x7E), which an advertising packet carries unmangled. Writes the result
+  // to `out` (outSize > DEVICE_NAME_MAX_BYTES) and returns true; false writes
+  // nothing. An empty result is valid and means the default.
+  static bool normalizeDeviceName(const char* in, char* out, size_t outSize);
+  const char* effectiveDeviceName() const { return deviceName[0] != '\0' ? deviceName : DEFAULT_DEVICE_NAME; }
   // OPDS download destination folder ("" = SD root). Global; edited from the
   // OPDS server list. Persisted via a category-less SettingInfo::String in
   // SettingsList.h, so it stays out of the on-device Settings screen.
-  // What this reader calls itself in the phone app. Sixteen characters plus a
-  // terminator: long enough for "Sam's Pixel 9 Pro", short enough to sit in a pill
-  // beside an icon without being truncated. Category-less in SettingsList, so it
-  // persists and syncs but never appears on the device's own settings screen --
-  // there is no keyboard worth typing a name on here, and the app has one.
-  char deviceName[17] = "";
   char opdsDownloadFolder[64] = "";
   // On-disk filename format for OPDS downloads (0=Author-Title default, 1=Title-Author,
   // 2=Title). See OpdsFilenameFormat. Persisted via a category-less SettingInfo::Enum,

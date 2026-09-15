@@ -82,7 +82,7 @@ The X4 Pro has a built-in frontlight with adjustable brightness and warmth. It i
 
 * **Open the Control Centre:** Tap the **top centre** of the screen (the status-bar strip) on Home, Browse Files, Settings or while reading, or **tap the Power button** from any screen. Tap Power again to close it. Drag the brightness and warmth sliders to adjust the light, or tap the sun icon to turn it on or off. The panel also has tiles for **Dark Mode** (it reads **Light Mode** while dark mode is on), **Refresh Screen**, **Touch**, **Sleep**, **Settings** and **Home** (plus **USB Drive** while a cable is attached). Boards other than the X4 Pro also get a Reading Orientation tile.
 * **Refresh Screen tile:** clears ghosting with one full-screen refresh. Holding the **Home** tile does the same thing instead of going Home.
-* **Settings tile (X4 Pro):** opens the device Settings page, which has two sections: **Bluetooth** (pairing) and **Firmware** (running version and any waiting update). Other settings are changed from the Bluecarrel app, or from **Home > More > Settings**.
+* **Settings tile (X4 Pro):** opens the device Settings page: a **Device name** row and two sections, **Bluetooth** (pairing) and **Firmware** (running version and any waiting update). Other settings are changed from the Bluecarrel app, or from **Home > More > Settings**.
 * **Quick toggle:** The **sun button** beside the brightness slider turns the light on or off in one tap, and so does a **double tap of the Power button** from anywhere. (There is no separate Frontlight tile — it was the same switch twice.)
 
 > [!NOTE]
@@ -285,6 +285,8 @@ updates.
 
 Pairing happens on the Bluetooth section of the Settings page. On the X4 Pro, open the Control Centre and tap
 **Settings**. (The same page is **Settings > System > Bluetooth**.)
+
+To name the reader, tap **Device name** at the top of that page (up to 16 plain letters, digits or punctuation); the app's reader list shows it, and the app's **Reader settings** can change it too.
 
 To pair:
 

@@ -407,12 +407,14 @@ inline std::vector<SettingInfo> getSettingsList(const SdCardFontRegistry* regist
                             "moveFinishedToReadFolder", StrId::STR_CAT_SYSTEM),
         SettingInfo::Toggle(StrId::STR_AUTO_INSTALL_FIRMWARE, &CrossPointSettings::autoInstallFirmware,
                             "autoInstallFirmware", StrId::STR_CAT_SYSTEM),
-
-#if FREEINK_CAP_NETWORK
-        // Device name: persisted + synced, category-less so the on-device Settings
-        // screen does not offer it. Named from the app.
+        // Device name: persisted and synced on every board. Category-less, so
+        // SettingsActivity does not list it; the X4 Pro edits it on its Settings
+        // page (BlePairingActivity) and the app sends it in a settings upload.
+        // fromJson() applies CrossPointSettings::normalizeDeviceName() to it.
         SettingInfo::String(StrId::STR_DEVICE_NAME, &SETTINGS.deviceName[0], sizeof(SETTINGS.deviceName),
                             "deviceName"),
+
+#if FREEINK_CAP_NETWORK
         // OPDS download folder: persisted + web-exposed, but category-less so it
         // is hidden from the on-device Settings screen (edited via OPDS UI).
         SettingInfo::String(StrId::STR_OPDS_DOWNLOAD_FOLDER, &SETTINGS.opdsDownloadFolder[0],

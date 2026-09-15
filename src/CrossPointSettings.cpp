@@ -129,9 +129,30 @@ void CrossPointSettings::toJson(JsonDocument& doc) const {
   }
 }
 
+bool CrossPointSettings::normalizeDeviceName(const char* in, char* out, const size_t outSize) {
+  if (!in || !out || outSize <= DEVICE_NAME_MAX_BYTES) return false;
+  const auto isSpace = [](const char c) { return c == ' ' || (c >= '\t' && c <= '\r'); };
+  const char* begin = in;
+  while (*begin != '\0' && isSpace(*begin)) begin++;
+  const char* end = begin + strlen(begin);
+  while (end > begin && isSpace(end[-1])) end--;
+  const size_t length = static_cast<size_t>(end - begin);
+  if (length > DEVICE_NAME_MAX_BYTES) return false;
+  for (const char* p = begin; p < end; p++) {
+    const auto c = static_cast<unsigned char>(*p);
+    if (c < 0x20 || c > 0x7E) return false;
+  }
+  memcpy(out, begin, length);
+  out[length] = '\0';
+  return true;
+}
+
 bool CrossPointSettings::fromJson(JsonVariantConst doc) {
   CrossPointSettings& s = *this;
   bool needsResave = false;
+  // The generic loop below overwrites deviceName before it can be judged.
+  char previousDeviceName[sizeof(deviceName)];
+  snprintf(previousDeviceName, sizeof(previousDeviceName), "%s", deviceName);
 
   auto clamp = [](uint8_t val, uint8_t maxVal, uint8_t def) -> uint8_t { return val < maxVal ? val : def; };
 
@@ -193,6 +214,22 @@ bool CrossPointSettings::fromJson(JsonVariantConst doc) {
           v = info.valueRange.max;
       }
       s.*(info.valuePtr) = v;
+    }
+  }
+
+  // Device name: the loop copied it truncated and unchecked, so judge what the
+  // document actually said. A name that breaks the rules keeps the old one; the
+  // rest of the document still applies.
+  if (doc["deviceName"].is<const char*>()) {
+    const char* raw = doc["deviceName"].as<const char*>();
+    char clean[sizeof(deviceName)];
+    if (normalizeDeviceName(raw, clean, sizeof(clean))) {
+      snprintf(deviceName, sizeof(deviceName), "%s", clean);
+      if (strcmp(raw, clean) != 0) needsResave = true;
+    } else {
+      LOG_ERR("CPS", "Invalid deviceName ignored, keeping '%s'", previousDeviceName);
+      snprintf(deviceName, sizeof(deviceName), "%s", previousDeviceName);
+      needsResave = true;
     }
   }
 

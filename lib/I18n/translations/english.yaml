@@ -490,6 +490,7 @@ STR_BLE_NOT_CONNECTED: "Not connected"
 STR_BLE_PAIRING_OUT_OF_DATE: "This phone's pairing is out of date. Pair it again."
 STR_BLE_PAIRING_TAP_PAIR_NEW: "Tap Pair new phone first."
 STR_BLE_PAIRING_FAILED: "Pairing failed. Try again."
+STR_DEVICE_NAME_INVALID: "Name not saved. Use up to 16 plain letters, digits or punctuation."
 
 STR_LIBRARY: "Library"
 STR_STORE: "Store"

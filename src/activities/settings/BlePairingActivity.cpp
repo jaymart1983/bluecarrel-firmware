@@ -8,11 +8,14 @@
 
 #include <algorithm>
 #include <cstdio>
+#include <cstring>
 #include <string>
 
+#include "CrossPointSettings.h"
 #include "FirmwareReadyActivity.h"
 #include "MappedInputManager.h"
 #include "activities/util/ConfirmationActivity.h"
+#include "activities/util/KeyboardEntryActivity.h"
 #include "components/UITheme.h"
 #include "fontIds.h"
 #include "network/BuildStamp.h"
@@ -50,6 +53,7 @@ void BlePairingActivity::onEnter() {
   if (!BLE_LINK.hasTrustedHost()) BLE_LINK.openPairingWindow();
   refreshFirmwareStage();
   selected_ = firmwareReady_ ? Row::FIRMWARE : Row::PAIR_NEW;
+  nameRejected_ = false;
   requestUpdate();
 }
 
@@ -72,12 +76,27 @@ void BlePairingActivity::refreshFirmwareStage() {
 
 size_t BlePairingActivity::visibleRows(Row rows[MAX_ROWS]) const {
   size_t count = 0;
+  rows[count++] = Row::NAME;
   if (BLE_LINK.hasTrustedHost()) {
     if (!BLE_LINK.pairingWindowOpen() && BLE_LINK.pairingLockSecondsLeft() == 0) rows[count++] = Row::PAIR_NEW;
     rows[count++] = Row::FORGET;
   }
   if (firmwareReady_) rows[count++] = Row::FIRMWARE;
   return count;
+}
+
+const Rect& BlePairingActivity::rectFor(const Row row) const {
+  switch (row) {
+    case Row::NAME:
+      return nameRect_;
+    case Row::PAIR_NEW:
+      return pairNewRect_;
+    case Row::FORGET:
+      return forgetRect_;
+    case Row::FIRMWARE:
+      break;
+  }
+  return firmwareRect_;
 }
 
 BlePairingActivity::Row BlePairingActivity::effectiveSelection() const {
@@ -106,6 +125,9 @@ void BlePairingActivity::moveSelection(const int delta) {
 
 void BlePairingActivity::activate(const Row row) {
   switch (row) {
+    case Row::NAME:
+      editName();
+      return;
     case Row::PAIR_NEW:
       selected_ = Row::FORGET;
       BLE_LINK.openPairingWindow();
@@ -144,8 +166,7 @@ void BlePairingActivity::loop() {
     Row rows[MAX_ROWS];
     const size_t count = visibleRows(rows);
     for (size_t i = 0; i < count; i++) {
-      const Rect& rect = rows[i] == Row::PAIR_NEW ? pairNewRect_ : rows[i] == Row::FORGET ? forgetRect_ : firmwareRect_;
-      if (hitRect(rect, x, y)) {
+      if (hitRect(rectFor(rows[i]), x, y)) {
         activate(rows[i]);
         return;
       }
@@ -159,6 +180,35 @@ void BlePairingActivity::loop() {
     Row rows[MAX_ROWS];
     if (visibleRows(rows) > 0) activate(effectiveSelection());
   }
+}
+
+void BlePairingActivity::editName() {
+  startActivityForResult(
+      std::make_unique<KeyboardEntryActivity>(renderer, mappedInput, tr(STR_DEVICE_NAME), SETTINGS.deviceName,
+                                              CrossPointSettings::DEVICE_NAME_MAX_BYTES, InputType::Text),
+      [this](const ActivityResult& result) {
+        if (result.isCancelled) return;
+        char clean[CrossPointSettings::DEVICE_NAME_MAX_BYTES + 1];
+        if (!CrossPointSettings::normalizeDeviceName(std::get<KeyboardResult>(result.data).text.c_str(), clean,
+                                                     sizeof(clean))) {
+          LOG_ERR("BLE", "device name not saved: over %u bytes or not printable ASCII",
+                  static_cast<unsigned>(CrossPointSettings::DEVICE_NAME_MAX_BYTES));
+          nameRejected_ = true;
+          requestUpdate();
+          return;
+        }
+        nameRejected_ = false;
+        if (strcmp(clean, SETTINGS.deviceName) != 0) {
+          {
+            // render() reads the name.
+            RenderLock lock(*this);
+            snprintf(SETTINGS.deviceName, sizeof(SETTINGS.deviceName), "%s", clean);
+          }
+          if (!SETTINGS.saveToFile()) LOG_ERR("BLE", "could not save the device name");
+          BLE_LINK.applyDeviceName();
+        }
+        requestUpdate();
+      });
 }
 
 void BlePairingActivity::promptForget() {
@@ -233,6 +283,34 @@ void BlePairingActivity::render(RenderLock&&) {
     return Rect{left, top, contentWidth, height};
   };
 
+  // --- Device name -----------------------------------------------------------
+  // Label left, name right. With no name of its own the reader shows the default
+  // in the small regular font, as a placeholder: the UI font has no grey or italic.
+  {
+    const int top = y;
+    const int height = metrics.menuRowHeight;
+    renderer.drawRoundedRect(left, top, contentWidth, height, selection == Row::NAME ? 2 : 1, 6, true);
+    const char* label = tr(STR_DEVICE_NAME);
+    renderer.drawText(UI_10_FONT_ID, left + 12, top + (height - bodyLine) / 2, label, true, EpdFontFamily::REGULAR);
+    const bool named = SETTINGS.deviceName[0] != '\0';
+    const int valueFont = named ? UI_10_FONT_ID : SMALL_FONT_ID;
+    const EpdFontFamily::Style valueStyle = named ? EpdFontFamily::BOLD : EpdFontFamily::REGULAR;
+    const int labelWidth = renderer.getTextWidth(UI_10_FONT_ID, label, EpdFontFamily::REGULAR);
+    const int valueMaxWidth = std::max(0, contentWidth - 48 - labelWidth);
+    const std::string value =
+        renderer.truncatedText(valueFont, SETTINGS.effectiveDeviceName(), valueMaxWidth, valueStyle);
+    const int valueWidth = renderer.getTextWidth(valueFont, value.c_str(), valueStyle);
+    renderer.drawText(valueFont, left + contentWidth - 12 - valueWidth,
+                      top + (height - renderer.getLineHeight(valueFont)) / 2, value.c_str(), true, valueStyle);
+    nameRect_ = Rect{left, top, contentWidth, height};
+    y = top + height;
+    if (nameRejected_) {
+      y += 4;
+      line(SMALL_FONT_ID, tr(STR_DEVICE_NAME_INVALID), EpdFontFamily::REGULAR);
+    }
+    y += metrics.verticalSpacing * 2;
+  }
+
   // --- Bluetooth -------------------------------------------------------------
   sectionTitle(tr(STR_BLUETOOTH));
   pairNewRect_ = Rect{0, 0, 0, 0};
@@ -272,7 +350,8 @@ void BlePairingActivity::render(RenderLock&&) {
     pairNewRect_ = actionRow(tr(STR_BLE_PAIR_NEW_PHONE), selection == Row::PAIR_NEW);
   }
   if (paired) forgetRect_ = actionRow(tr(STR_FORGET_BUTTON), selection == Row::FORGET);
-  y += metrics.verticalSpacing * 3;
+  // Two spacings, not three: the name row above took the room.
+  y += metrics.verticalSpacing * 2;
 
   // --- Firmware --------------------------------------------------------------
   sectionTitle(tr(STR_FIRMWARE_SECTION));

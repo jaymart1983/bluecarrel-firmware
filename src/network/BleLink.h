@@ -128,6 +128,12 @@ class BleLink {
   bool isPeerConnected() const;
   // The gate is open: a phone is connected AND authenticated.
   bool isAuthenticated() const { return sessionAuthenticated(); }
+  // Advertises SETTINGS' device name (the default when blank) as the GAP name and
+  // in the scan response. Advertising restarts to carry it only when no phone is
+  // connected; with one connected, the next advertising start carries it. Nothing
+  // happens when the name is unchanged, or while the radio is off (begin() reads
+  // the setting). Main loop only.
+  void applyDeviceName();
 
   // --- store hosting ---------------------------------------------------------
   // The Store screen lends its controller to the link for as long as it is on

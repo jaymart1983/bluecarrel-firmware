@@ -53,7 +53,6 @@ extern GfxRenderer renderer;
 
 namespace {
 
-constexpr const char* BLE_DEVICE_NAME = "Bluecarrel";
 constexpr const char* BLE_SERVICE_UUID = "6f9f0a00-9b1d-4d1f-9f53-5b6b8b3d0f10";
 constexpr const char* BLE_CONTROL_UUID = "6f9f0a01-9b1d-4d1f-9f53-5b6b8b3d0f10";
 constexpr const char* BLE_DATA_IN_UUID = "6f9f0a02-9b1d-4d1f-9f53-5b6b8b3d0f10";
@@ -901,9 +900,12 @@ struct BleLinkRuntime {
   ServerCallbacks serverCallbacks;
   ControlCallbacks controlCallbacks;
   DataCallbacks dataCallbacks;
+  // What setAdvertisedName() last put on the air.
+  std::string advertisedName;
 
   bool begin() {
-    NimBLEDevice::init(BLE_DEVICE_NAME);
+    const std::string name = SETTINGS.effectiveDeviceName();
+    NimBLEDevice::init(name);
     // LE Secure Connections with bonding and MITM protection by passkey entry:
     // the reader displays the passkey, the phone types it.
     NimBLEDevice::setSecurityAuth(true, true, true);
@@ -949,7 +951,7 @@ struct BleLinkRuntime {
 
     NimBLEAdvertising* advertising = NimBLEDevice::getAdvertising();
     advertising->addServiceUUID(BLE_SERVICE_UUID);
-    advertising->setName(BLE_DEVICE_NAME);
+    setAdvertisedName(name);
     advertising->setMinInterval(BLE_ADV_INTERVAL_MIN_UNITS);
     advertising->setMaxInterval(BLE_ADV_INTERVAL_MAX_UNITS);
     advertising->start();
@@ -1042,6 +1044,34 @@ struct BleLinkRuntime {
   void startAdvertising() {
     NimBLEAdvertising* advertising = NimBLEDevice::getAdvertising();
     if (advertising) advertising->start();
+  }
+
+  // The name rides in the scan response, not the advertisement. The advertisement
+  // already carries the flags (3 bytes, set by NimBLEAdvertising's constructor)
+  // and the 128-bit service UUID (2 + 16): 21 of its 31 bytes. A name field costs
+  // 2 + its length, so 8 characters would fit there, not "Bluecarrel". The scan
+  // response is empty otherwise and holds up to 29 bytes of name. Android scans
+  // actively, so the ScanRecord it reports includes it.
+  //
+  // setScanResponseData() hands the data to the controller and keeps a copy, and
+  // enableScanResponse() marks the advertising data unsent, so the next start()
+  // sends both. The data is changed only while not advertising.
+  void setAdvertisedName(const std::string& name) {
+    if (!NimBLEDevice::setDeviceName(name)) LOG_ERR("BLE", "GAP device name '%s' refused", name.c_str());
+    NimBLEAdvertising* advertising = NimBLEDevice::getAdvertising();
+    if (!advertising) return;
+    NimBLEAdvertisementData scanResponse;
+    if (!scanResponse.setName(name)) {
+      LOG_ERR("BLE", "name '%s' does not fit the scan response", name.c_str());
+      return;
+    }
+    // Restart only with nobody connected; a peer's link is left alone.
+    const bool restart = !hasPeer() && advertising->isAdvertising();
+    if (restart) advertising->stop();
+    advertising->enableScanResponse(true);
+    if (!advertising->setScanResponseData(scanResponse)) LOG_ERR("BLE", "scan response refused");
+    advertisedName = name;
+    if (restart) advertising->start();
   }
 
   // Teardown runs on the main loop task while the NimBLE host task is still
@@ -1162,7 +1192,8 @@ void BleLink::begin() {
     return;
   }
 
-  LOG_INF("BLE", "advertising as '%s' (paired: %s)", BLE_DEVICE_NAME, BLE_TRUSTED_HOSTS.hasHosts() ? "yes" : "no");
+  LOG_INF("BLE", "advertising as '%s' (paired: %s)", SETTINGS.effectiveDeviceName(),
+          BLE_TRUSTED_HOSTS.hasHosts() ? "yes" : "no");
   setState(State::ADVERTISING);
   publishStatus();
 }
@@ -2665,6 +2696,7 @@ void BleLink::startAboutDownload(const size_t offset, const size_t chunkSize) {
     if (firmware_staging::readVersion(stagedVersion)) doc["staged_version"] = stagedVersion;
     doc["download_chunk_max"] = BLE_DOWNLOAD_CHUNK_BYTES_MAX;
     doc["dark_mode"] = SETTINGS.screenInverted != 0;
+    doc["device_name"] = SETTINGS.effectiveDeviceName();
     // Protocol features beyond the upload and download kinds. Here rather than in
     // `status`, whose read already sheds its capability lists to fit 512 bytes.
     JsonArray features = doc["features"].to<JsonArray>();
@@ -2759,6 +2791,15 @@ bool BleLink::applyBookMetaDocument() {
   return true;
 }
 
+void BleLink::applyDeviceName() {
+  if (!ble_) return;
+  const std::string name = SETTINGS.effectiveDeviceName();
+  if (name == ble_->advertisedName) return;
+  const bool connected = ble_->hasPeer();
+  ble_->setAdvertisedName(name);
+  LOG_INF("BLE", "device name now '%s'%s", name.c_str(), connected ? " (advertised after this connection)" : "");
+}
+
 bool BleLink::applySettingsDocument() {
   HalFile in;
   if (!Storage.openFileForRead("BLE", SETTINGS_INBOX_PATH, in)) {
@@ -2802,6 +2843,8 @@ bool BleLink::applySettingsDocument() {
   // BLE path simply never did them.
   UITheme::getInstance().reload();
   activityManager.requestUpdate();
+  // A new name goes on the air now, not at the next boot.
+  applyDeviceName();
   LOG_INF("BLE", "settings applied and re-rendered");
   return true;
 }

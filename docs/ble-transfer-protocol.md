@@ -19,7 +19,11 @@ book opens or closes and just before the device goes to sleep. See [Heartbeat fi
 ## Compatibility
 
 - Protocol version: `2`
-- Device name: `Bluecarrel` (protocol 1 readers advertised `CrossPoint Transfer`)
+- Device name: the reader's `deviceName` setting, or `Bluecarrel` when it is blank (protocol 1 readers advertised
+  `CrossPoint Transfer`). It is sent in the scan response, not the advertisement: the flags and the 128-bit service
+  UUID take 21 of the advertisement's 31 bytes. It is also the GAP Device Name. A new name is advertised at once
+  when no phone is connected, otherwise from the next advertising start. Android may keep showing a cached
+  `BluetoothDevice.getName()`; read the name from the scan record.
 - Service UUID: `6f9f0a00-9b1d-4d1f-9f53-5b6b8b3d0f10`
 
 Clients should discover the service by UUID. The user-visible name is not part of the compatibility contract.
@@ -195,7 +199,9 @@ Supported upload kinds:
   `version` and `signature`; without a well-formed pair `start_put` fails with `signature required`. It is validated on
   commit and then left there; nothing is flashed during the session
 - `progress`: a batch of reading positions to apply to books already on the card (see below)
-- `settings`: a settings document to apply. Refused as `book open` while a book is open
+- `settings`: a settings document to apply. Refused as `book open` while a book is open. `deviceName` is trimmed and
+  must then be at most 16 bytes of printable ASCII (`0x20`-`0x7E`); empty means `Bluecarrel`. A name that breaks the
+  rule is ignored and the old name kept; the rest of the document still applies
 - `book_meta`: book metadata for the app's library, capped at a small size
 - `catalog_page`: one screen of the app's Calibre library, answering a `catalog_page` request (see
   [The Store](#the-store-requests-over-the-notify-channel))
@@ -340,6 +346,7 @@ Support is advertised as `dark_mode` in the `features` list of the [`about`](#ab
 ```json
 {"firmware_version":"20260913.1914","running_partition":"app1","update_staged":true,
  "install_at_sleep":true,"staged_version":"20260914.0800","download_chunk_max":490,"dark_mode":false,
+ "device_name":"Bluecarrel",
  "features":["book_position","download_window","dark_mode"]}
 ```
 
@@ -352,6 +359,7 @@ Support is advertised as `dark_mode` in the `features` list of the [`about`](#ab
 | `staged_version` | string | Contents of `/firmware/firmware.bin.version`. Absent when there is no such file. |
 | `download_chunk_max` | integer | The largest `start_get` `chunk_size` this firmware accepts (`490`). Absent on older firmware, which accepts at most `160`. See [Download frames and acknowledgement](#download-frames-and-acknowledgement). |
 | `dark_mode` | bool | `true` while the reader draws inverted (dark mode). Set with [`set_dark_mode`](#set_dark_mode). Absent on older firmware. |
+| `device_name` | string | The name the reader advertises: its `deviceName` setting, or `Bluecarrel` when that is blank. Absent on older firmware. |
 | `features` | array of strings | Protocol features beyond the upload and download kinds. `book_position`: a `book` upload accepts `position` (see [Opening position](#opening-position)). `download_window`: `start_get` accepts `window` and `get_ack` is cumulative (see [Download frames and acknowledgement](#download-frames-and-acknowledgement)). `dark_mode`: the `set_dark_mode` op is supported and `dark_mode` is reported here. Absent on older firmware. |
 
 `about` is not listed in `download_kinds`.

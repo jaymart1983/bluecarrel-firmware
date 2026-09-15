@@ -11,12 +11,14 @@
 #include "components/themes/BaseTheme.h"  // Rect
 #include "network/BleLink.h"
 
-// The device's Settings screen (the Action Centre's Settings tile): Bluetooth and
-// Firmware, as two sections on one page.
+// The device's Settings screen (the Action Centre's Settings tile): the device
+// name, then Bluetooth and Firmware, as two sections on one page.
 //
 // Everything else a reader can be configured with is read and written from the
 // app over the link. What stays here is what the app cannot do for you: pair in
-// the first place, and see and install the firmware update the phone sent.
+// the first place, and see and install the firmware update the phone sent. The
+// name is here too, because it is what the phone's reader list shows before any
+// pairing exists.
 //
 // Pairing happens only while this screen is up. It opens BleLink's pairing
 // window on entry when no phone is paired, or when the user taps Pair new phone,
@@ -35,14 +37,18 @@ class BlePairingActivity final : public Activity, public BleLink::Observer {
   void onBleLinkChanged() override { requestUpdate(); }
 
  private:
-  enum class Row { PAIR_NEW, FORGET, FIRMWARE };
-  static constexpr size_t MAX_ROWS = 3;
+  enum class Row { NAME, PAIR_NEW, FORGET, FIRMWARE };
+  static constexpr size_t MAX_ROWS = 4;
 
   // Geometry of the action rows, written by render() and read by the touch
   // hit-test. Zero height means "not drawn".
+  Rect nameRect_{0, 0, 0, 0};
   Rect pairNewRect_{0, 0, 0, 0};
   Rect forgetRect_{0, 0, 0, 0};
   Rect firmwareRect_{0, 0, 0, 0};
+  // The last name typed broke CrossPointSettings::normalizeDeviceName() and was
+  // not saved. Cleared by the next accepted edit.
+  bool nameRejected_ = false;
   // A verified update is waiting (FirmwareWatcher::StageState::READY). Refreshed
   // once a second rather than per loop: each look is two SD existence checks.
   bool firmwareReady_ = false;
@@ -54,10 +60,12 @@ class BlePairingActivity final : public Activity, public BleLink::Observer {
   uint32_t lastLockStep_ = 0;
 
   size_t visibleRows(Row rows[MAX_ROWS]) const;
+  const Rect& rectFor(Row row) const;
   Row effectiveSelection() const;
   void moveSelection(int delta);
   void activate(Row row);
   void refreshFirmwareStage();
+  void editName();
   void promptForget();
   void openFirmware();
 };

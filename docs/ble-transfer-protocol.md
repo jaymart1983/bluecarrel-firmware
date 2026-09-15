@@ -181,6 +181,7 @@ Uploads use `start_put`, binary frames on `data-in`, then `commit`.
 | `size` | number | Total bytes. Required. |
 | `sha256` | string | 64 hex characters over the whole payload. Required. |
 | `replace` | bool | `book` only. `true` overwrites an existing `/Books/<name>`; without it an existing file is refused as `exists`. Replacing the book that is open on screen is refused as `book open`. Default `false`. |
+| `position` | object | `book` only, optional. The reading position to open the book at, applied on commit before the book appears on the shelf. See [Opening position](#opening-position). |
 | `version` | string | `firmware` only, required. The image's build stamp, `yyyyMMdd.HHmm` (for example `20260913.1914`). Saved as `firmware.bin.version`. |
 | `signature` | string | `firmware` only, required. The image signature as lowercase hex, even length, at most 256 characters (see [Signatures](#signatures)). Saved as `firmware.bin.sig`. |
 | `req` | number | Only when answering a Store request. |
@@ -214,6 +215,46 @@ The other control ops are `set_time` (see [Device clock](#device-clock)), `delet
 [`delete_book`](#delete_book)), `catalog_error` (the app declining a Store request it cannot answer) and `cancel`.
 `hello` and `pair` are described under [Authentication](#authentication).
 
+## Opening position
+
+A `book` upload may carry the position the reader should open it at, so a book sent with "resume at 89.5%" opens
+there the first time, not at 0%:
+
+```json
+{"op":"start_put","kind":"book","name":"Dune.epub","size":…,"sha256":…,
+ "position":{"timestamp":1725600000,"pct":0.895,"spine":41,"spine_n":58,"spine_frac":0.37}}
+```
+
+`position` takes the same fields as one [`progress`](#progress) entry, without `filename` (the book is `name`):
+
+| Field | Type | Meaning |
+| --- | --- | --- |
+| `timestamp` | integer | UTC epoch seconds the position was reached. Required, and inside the range `set_time` accepts. |
+| `location` | string | Optional. Hex-encoded saved position (see [Position encoding](#position-encoding)); a length the EPUB reader writes (8, 12 or 20 characters). |
+| `spine`, `spine_n` | integer | Optional, both or neither. Spine item index and the spine item count the sender measured; `0 <= spine < spine_n <= 65535`. |
+| `spine_frac` | number | Optional, with `spine`. Fraction `0`–`1` through that spine item. Default `0`. |
+| `pct` | number | Optional. Progress through the book, `0`–`1`, for the library screen. |
+
+At least one of `location` or `spine`/`spine_n` is required. It is checked at `start_put`: a `position` that is not an
+object, or has a missing or out-of-range field, a field of the wrong type, `spine_frac` without `spine`, or a
+malformed `location`, refuses the whole `start_put` with `error: "invalid position"`. An empty `location` string
+counts as absent.
+
+On `commit`, once the book is at its final path, the position is applied with the [conflict rule](#conflict-rule)
+**before** the Home shelf and library are told the book exists, so nothing can open it first. A new book has no saved
+position, so the position applies. A `replace` keeps the book's existing saved position, and the incoming one applies
+only if its `timestamp` is newer. The upload succeeds either way, and the committed status reports the outcome:
+
+```json
+{"state":"saved","kind":"book","received":1048576,"ack_bytes":4096,"size":1048576,"position_applied":true,…}
+```
+
+`position_applied` is present only when the `start_put` carried `position`. `false` means the position was not written
+(for example the device already had a newer save). The firmware log gives the result name. On `false` the app can
+send a `progress` batch as usual. It is dropped from a tight notification with the transfer counters, so read
+`status` if it is missing. Firmware that does not support this ignores `position` and never reports `position_applied`.
+It advertises support as `book_position` in the `features` list of the [`about`](#about) download.
+
 ## `delete_book`
 
 ```json
@@ -237,7 +278,7 @@ wildcards. Like every other op it requires `hello` first.
 
 ```json
 {"firmware_version":"20260913.1914","running_partition":"app1","update_staged":true,
- "install_at_sleep":true,"staged_version":"20260914.0800"}
+ "install_at_sleep":true,"staged_version":"20260914.0800","features":["book_position"]}
 ```
 
 | Field | Type | Meaning |
@@ -247,6 +288,7 @@ wildcards. Like every other op it requires `hello` first.
 | `update_staged` | bool | `/firmware/firmware.bin` and its `.sha256` file are both on the card. |
 | `install_at_sleep` | bool | A staged image will be installed the next time the reader sleeps (the user chose Later, or auto-install is on). |
 | `staged_version` | string | Contents of `/firmware/firmware.bin.version`. Absent when there is no such file. |
+| `features` | array of strings | Protocol features beyond the upload and download kinds. `book_position`: a `book` upload accepts `position` (see [Opening position](#opening-position)). Absent on older firmware. |
 
 `about` is not listed in `download_kinds`.
 
@@ -644,7 +686,7 @@ fits. It never truncates: a client always receives parseable JSON.
 | first | `protocol_version`, `store_supported`, `clock_supported`, `device_time` |
 | then | `has_trusted_host`, `trusted_host`, `reader_proof`, `paired`, `name`, `path`, `book` |
 | then | `pending` keeps only `req`, `op` and the `id`/`offset` an answer must quote back |
-| then | the transfer counters (`kind`, `received`, `sent`, `size`, `ack_bytes`, `resumable`, `entries`, `applied`) and the `error` / `auth_error` text |
+| then | the transfer counters (`kind`, `received`, `sent`, `size`, `ack_bytes`, `resumable`, `entries`, `applied`, `position_applied`) and the `error` / `auth_error` text |
 | never | `state`, the heartbeat fields `lib_n`, `lib_h`, `pct`, `open`, `sleeping`, and `pending` |
 
 If even the floor does not fit, no notification is sent; the GATT read still carries the session.
@@ -913,6 +955,10 @@ Status JSON includes capability fields so clients can hide unsupported controls:
 screen and has no mode. `firmware_ota_supported` means "this reader accepts the `firmware` upload kind"; what it does
 with it is the file drop described above. `download_kinds` does not list `about`, which is still supported. The
 firmware version is in the [`about`](#about) download, not in `status`.
+
+Features that are not a kind, such as `book_position`, are listed in the `features` array of the
+[`about`](#about) download, not in `status`. After `hello` the `status` read usually exceeds 512 bytes and drops
+`upload_kinds` / `download_kinds`, so do not treat their absence as "unsupported".
 
 The states `confirming`, `updating`, `restarting`, `save_host_prompt` and `forget_host_prompt` do not exist; the
 firmware prompt is shown by the reader on its own, not by the link.

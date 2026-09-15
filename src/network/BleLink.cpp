@@ -413,6 +413,68 @@ bool isSafeBleBookRelativePath(const std::string& value) {
   return true;
 }
 
+// The `position` of a book start_put: one `progress` batch entry without
+// `filename`. Unlike a batch entry, anything malformed refuses it outright.
+struct BookPosition {
+  std::string location;
+  uint32_t timestamp = 0;
+  BookProgressSync::SpineJump jump;
+  uint16_t percentBp = 0;
+};
+
+bool parseBookPosition(const JsonVariantConst position, const std::string& fileName, BookPosition& out) {
+  if (!position.is<JsonObjectConst>()) return false;
+
+  if (!position["timestamp"].is<int64_t>()) return false;
+  const int64_t timestamp = position["timestamp"].as<int64_t>();
+  if (timestamp <= 0 || timestamp > static_cast<int64_t>(UINT32_MAX) ||
+      !HalClock::isPlausibleEpoch(static_cast<uint32_t>(timestamp))) {
+    return false;
+  }
+  out.timestamp = static_cast<uint32_t>(timestamp);
+
+  const bool hasSpine = !position["spine"].isNull() || !position["spine_n"].isNull();
+  if (hasSpine) {
+    if (!position["spine"].is<int>() || !position["spine_n"].is<int>()) return false;
+    if (!position["spine_frac"].isNull() && !position["spine_frac"].is<float>()) return false;
+    const int spineIndex = position["spine"].as<int>();
+    const int spineCount = position["spine_n"].as<int>();
+    const float fraction = position["spine_frac"] | 0.0f;
+    if (spineIndex < 0 || spineCount <= 0 || spineIndex >= spineCount || spineCount > UINT16_MAX ||
+        !(fraction >= 0.0f && fraction <= 1.0f)) {
+      return false;
+    }
+    out.jump.present = true;
+    out.jump.spineIndex = static_cast<uint16_t>(spineIndex);
+    out.jump.fraction = fraction;
+    out.jump.spineCount = static_cast<uint16_t>(spineCount);
+  } else if (!position["spine_frac"].isNull()) {
+    return false;
+  }
+
+  if (!position["location"].isNull()) {
+    if (!position["location"].is<const char*>()) return false;
+    out.location = toLowerAscii(position["location"].as<const char*>());
+    if (!out.location.empty()) {
+      uint8_t bytes[BookProgressSync::MAX_PROGRESS_BYTES] = {};
+      size_t len = 0;
+      if (!BookProgressSync::decodeLocation(out.location, bytes, len) ||
+          !BookProgressSync::isValidLocationLength(fileName, len)) {
+        return false;
+      }
+    }
+  }
+  if (out.location.empty() && !out.jump.present) return false;
+
+  if (!position["pct"].isNull()) {
+    if (!position["pct"].is<float>()) return false;
+    const float pct = position["pct"].as<float>();
+    if (!(pct >= 0.0f && pct <= 1.0f)) return false;
+    out.percentBp = static_cast<uint16_t>(pct * 10000.0f + 0.5f);
+  }
+  return true;
+}
+
 // Pulls one top-level object at a time out of a JSON array held in a file.
 //
 // The batch is parsed incrementally on purpose: a few thousand entries is
@@ -1776,6 +1838,18 @@ void BleLink::onControlWrite(const std::string& value) {
           return;
         }
       }
+      if (!doc["position"].isNull()) {
+        BookPosition position;
+        if (!parseBookPosition(doc["position"].as<JsonVariantConst>(), fileName_, position)) {
+          setError("invalid position");
+          return;
+        }
+        positionGiven_ = true;
+        positionLocation_ = std::move(position.location);
+        positionTimestamp_ = position.timestamp;
+        positionJump_ = position.jump;
+        positionPercentBp_ = position.percentBp;
+      }
     } else if (kind == "bmp") {
       if (!isSafeBleBmpName(fileName_)) {
         setError("unsafe bmp filename");
@@ -2187,6 +2261,13 @@ void BleLink::processCommit() {
       clearBookCache(savedPath_);
       restorePositionFiles(positionCache, keptPosition);
       if (!keptPosition.empty()) LOG_INF("BLE", "Book replaced; kept its reading position");
+      // Before the shelf hears of the book, so nothing can open it first.
+      if (positionGiven_) {
+        const auto result = BookProgressSync::applyProgress(BOOKS_ROOT, fileName_, positionLocation_,
+                                                            positionTimestamp_, positionJump_, positionPercentBp_);
+        positionApplied_ = result == BookProgressSync::ApplyResult::APPLIED;
+        LOG_INF("BLE", "Position for %s: %s", fileName_.c_str(), BookProgressSync::applyResultName(result));
+      }
       // The Library reconciles once per visit, so a book that lands while the
       // shelf is on screen would otherwise not appear until a restart.
       //
@@ -2411,6 +2492,10 @@ void BleLink::startAboutDownload(const size_t offset, const size_t chunkSize) {
     doc["install_at_sleep"] = FIRMWARE_WATCHER.installAtSleep();
     std::string stagedVersion;
     if (firmware_staging::readVersion(stagedVersion)) doc["staged_version"] = stagedVersion;
+    // Protocol features beyond the upload and download kinds. Here rather than in
+    // `status`, whose read already sheds its capability lists to fit 512 bytes.
+    JsonArray features = doc["features"].to<JsonArray>();
+    features.add("book_position");
     if (Storage.exists(ABOUT_PATH)) Storage.remove(ABOUT_PATH);
     HalFile out;
     if (!Storage.openFileForWrite("BLE", ABOUT_PATH, out)) {
@@ -2710,6 +2795,12 @@ void BleLink::pumpDownload() {
 
 void BleLink::resetTransfer(const bool removePart) {
   replaceExisting_ = false;
+  positionGiven_ = false;
+  positionApplied_ = false;
+  positionLocation_.clear();
+  positionTimestamp_ = 0;
+  positionPercentBp_ = 0;
+  positionJump_ = {};
   firmwareVersion_.clear();
   firmwareSignature_.clear();
   if (shaActive_) {
@@ -3040,6 +3131,10 @@ std::string BleLink::buildStatusJson(const StatusScope scope, const unsigned det
       if (uploadResumable_) doc["resumable"] = true;
       doc["ack_bytes"] = uploadAckBytes_;
       doc["size"] = expectedSize_;
+      // Only for a saved book whose start_put carried `position`.
+      if (state_ == State::SAVED && transferKind_ == TransferKind::BOOK && positionGiven_) {
+        doc["position_applied"] = positionApplied_;
+      }
     }
   }
   if (wantIdentity && state_ == State::SAVED && !savedPath_.empty()) {

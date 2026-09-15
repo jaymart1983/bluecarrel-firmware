@@ -15,6 +15,8 @@
 #include <memory>
 #include <string>
 
+#include "util/BookProgressSync.h"
+
 class BleStoreController;
 struct BleLinkRuntime;
 
@@ -335,6 +337,13 @@ class BleLink {
   bool sleeping_ = false;
   // start_put asked to overwrite an existing book (a Calibre update). Reset per transfer.
   bool replaceExisting_ = false;
+  // The `position` a book start_put carried, applied at commit. Reset per transfer.
+  bool positionGiven_ = false;
+  bool positionApplied_ = false;
+  std::string positionLocation_;
+  uint32_t positionTimestamp_ = 0;
+  uint16_t positionPercentBp_ = 0;
+  BookProgressSync::SpineJump positionJump_;
   unsigned long lastHeartbeatMs_ = 0;
   // 60s while awake and connected. A safety net under the event triggers above,
   // not the primary mechanism: an event-driven notify is both faster and cheaper

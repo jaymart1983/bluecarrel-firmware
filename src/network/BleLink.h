@@ -9,6 +9,7 @@
 #include <freertos/semphr.h>
 #include <mbedtls/sha256.h>
 
+#include <array>
 #include <atomic>
 #include <cstdint>
 #include <deque>
@@ -97,6 +98,10 @@ class BleLink {
   // Pump the events the NimBLE host task queued. Called once per main loop,
   // whatever is on screen.
   void tick();
+  // The main loop's idle sleep: up to `ms`, returning early when a control
+  // write (get_ack, commit, start_get ...) is queued, so the answer to it is not
+  // held back by a fixed delay.
+  void waitForWork(unsigned long ms);
 
   // --- pairing ---------------------------------------------------------------
   // The pairing window: a new bond, and the `pair` op, are accepted only while
@@ -190,8 +195,9 @@ class BleLink {
   void enqueueBleDisconnected(uint16_t connHandle);
   // `peerIdAddress` is the raw ble_addr_t of the peer when the bond is new.
   void enqueueSecurityResult(uint16_t connHandle, bool accepted, bool newBond, const std::string& peerIdAddress);
-  void enqueueControlWrite(uint16_t connHandle, const std::string& value);
-  void enqueueDataWrite(uint16_t connHandle, const std::string& value);
+  // By value: the caller's temporary is moved into the queue, one copy per frame.
+  void enqueueControlWrite(uint16_t connHandle, std::string value);
+  void enqueueDataWrite(uint16_t connHandle, std::string value);
   // Called from the NimBLE host task on connect and on every MTU exchange. Zero
   // means "nothing negotiated". This is only a fallback: notifyCapBytes() asks
   // the live connection what the MTU actually is and uses this when there is no
@@ -200,6 +206,9 @@ class BleLink {
   // The most a notification may carry right now: ATT_MTU-3, never more than
   // BLE_STATUS_NOTIFY_MAX_BYTES. Public because the runtime sizes frames by it.
   size_t notifyCapBytes() const;
+  // The most a data-out frame may carry right now: ATT_MTU-3, without the status
+  // cap. Download chunks are sized from it.
+  size_t dataNotifyCapBytes() const;
 
   // READ is the authoritative document a GATT read returns -- everything the
   // session knows. NOTIFY is the doorbell: the same document with the fields a
@@ -266,6 +275,9 @@ class BleLink {
   HalFile uploadFile_;
   HalFile downloadFile_;
   SemaphoreHandle_t eventMutex_ = nullptr;
+  // Binary semaphore given by the host task when a control write is queued;
+  // waitForWork() blocks on it.
+  SemaphoreHandle_t eventSignal_ = nullptr;
   std::deque<BleEvent> bleEvents_;
   size_t queuedBleEventBytes_ = 0;
   bool bleEventOverflow_ = false;
@@ -302,15 +314,33 @@ class BleLink {
   size_t uploadAckBytes_ = 0;
   size_t downloadChunkSize_ = 0;
   uint32_t expectedSequence_ = 0;
+  // Next sequence to send, and the first one not yet acknowledged; frames in
+  // [downloadUnacked_, downloadSequence_) are in flight.
   uint32_t downloadSequence_ = 0;
-  uint32_t pendingDownloadAck_ = 0;
+  uint32_t downloadUnacked_ = 0;
+  // Frames that may be in flight at once (start_get `window`, 1..16).
+  uint8_t downloadWindow_ = 1;
+  // Every byte of the download has been read into a frame.
+  bool downloadEof_ = false;
+  // Bytes of downloadFrame_ built but not yet accepted by the stack; 0 when none.
+  // A frame the stack refused is resent as-is on the next tick.
+  size_t downloadFrameLength_ = 0;
+  // One frame: 4-byte sequence + BLE_DOWNLOAD_CHUNK_BYTES_MAX (490). A member,
+  // not a stack array (over the 256-byte local rule) and not a per-transfer heap
+  // block (a sync runs several downloads back to back); BleLink is a singleton, so
+  // this is 494 bytes of BSS once.
+  std::array<uint8_t, 494> downloadFrame_ = {};
+  // Upload bytes held before they go to the card in one multi-sector write.
+  // Allocated at start_put, freed by resetTransfer().
+  std::unique_ptr<uint8_t[]> uploadBuffer_;
+  size_t uploadBufferCapacity_ = 0;
+  size_t uploadBufferUsed_ = 0;
   // Last MTU the peer negotiated, written from the NimBLE host task and read
   // from the activity loop. 0 until an exchange happens; see notifyCapBytes().
   std::atomic<uint16_t> negotiatedMtu_{0};
   bool helloAccepted_ = false;
   bool transferOpen_ = false;
   bool downloadOpen_ = false;
-  bool downloadAwaitingAck_ = false;
   // A `pair` succeeded on this connection.
   bool hostPaired_ = false;
   bool pendingCommit_ = false;
@@ -359,6 +389,8 @@ class BleLink {
 
   void enqueueBleEvent(BleEvent event);
   void processBleEvents();
+  // Writes the held upload bytes to uploadFile_. False (buffer dropped) on a short write.
+  bool flushUploadBuffer();
   void onBleConnected(uint16_t connHandle);
   void onBleDisconnected(uint16_t connHandle);
   void onSecurityResult(const BleEvent& event);
@@ -418,6 +450,8 @@ class BleLink {
   // `{"state":"..."}` fits, meaning "send no notification at all" -- an empty
   // object parses as a status and reports as an unreadable one.
   std::string buildNotifyJson(size_t capBytes) const;
+  // Appends the download chunk in use to a chosen status document, if it fits `capBytes`.
+  void appendDownloadChunkSize(std::string& json, size_t capBytes) const;
 };
 
 #define BLE_LINK BleLink::getInstance()

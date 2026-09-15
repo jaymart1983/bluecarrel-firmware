@@ -8,6 +8,7 @@
 #include <Memory.h>
 #include <NimBLEDevice.h>
 #include <esp_mac.h>
+#include <nimble/porting/nimble/include/os/os_mbuf.h>
 #include <esp_ota_ops.h>
 #include <esp_random.h>
 #include <freertos/task.h>
@@ -43,6 +44,12 @@
 #include "activities/reader/ProgressFile.h"
 #include "util/BookProgressSync.h"
 #include "util/TaskWatchdog.h"
+
+#include <GfxRenderer.h>
+
+// The one renderer, defined in main.cpp. set_dark_mode hands it a one-shot clean
+// refresh the way the Action Centre Refresh tile does.
+extern GfxRenderer renderer;
 
 namespace {
 
@@ -95,6 +102,23 @@ void restorePositionFiles(const std::string& cachePath, const std::vector<KeptPo
     f.close();
   }
 }
+// True when `path` already holds exactly `json`. Serving an unchanged staged
+// document as it is costs one sector read; rewriting it is a remove, a create, a
+// data write and the directory and FAT updates, each its own card command.
+bool stagedFileMatches(const char* path, const String& json) {
+  if (!Storage.exists(path)) return false;
+  HalFile in;
+  if (!Storage.openFileForRead("BLE", path, in) || in.fileSize() != json.length()) return false;
+  std::array<uint8_t, 128> buffer = {};
+  size_t pos = 0;
+  while (pos < json.length()) {
+    const int read = in.read(buffer.data(), std::min(buffer.size(), json.length() - pos));
+    if (read <= 0 || memcmp(buffer.data(), json.c_str() + pos, static_cast<size_t>(read)) != 0) return false;
+    pos += static_cast<size_t>(read);
+  }
+  return true;
+}
+
 constexpr const char* PICTURES_ROOT = "/Pictures";
 constexpr const char* CRASH_REPORT_PATH = "/crash_report.txt";
 constexpr const char* CRASH_REPORT_NAME = "crash_report.txt";
@@ -159,9 +183,31 @@ constexpr uint32_t MAX_PROGRESS_ENTRIES = 8192;
 // A book path relative to /Books. Longer than MAX_FILENAME_BYTES because the
 // `library` listing emits sub-folder paths and this must round-trip them.
 constexpr size_t MAX_BOOK_PATH_BYTES = 255;
+// The default chunk, and the most a start_get gets without regard to the link:
+// a request at or under it is used as asked, as it always was.
 constexpr size_t BLE_DOWNLOAD_CHUNK_BYTES = 160;
 constexpr size_t BLE_DOWNLOAD_CHUNK_BYTES_MIN = 20;
-constexpr size_t BLE_DOWNLOAD_CHUNK_BYTES_MAX = BLE_DOWNLOAD_CHUNK_BYTES;
+constexpr size_t BLE_DOWNLOAD_FRAME_HEADER_BYTES = sizeof(uint32_t);
+// Advertised in `about` as download_chunk_max. A frame is an ATT notification of
+// 3 + 4 + chunk bytes inside a 4-byte L2CAP header, so chunk + 11 bytes on the
+// link. With the 251-byte LL data length requested at connect (setDataLen), two
+// LL PDUs carry 502 bytes, so 491 is the largest chunk that costs two PDUs; 510
+// (the 517 MTU ceiling) costs three. 490 keeps a byte of slack under that line
+// and sits well inside the 514-byte ATT payload at MTU 517.
+constexpr size_t BLE_DOWNLOAD_CHUNK_BYTES_MAX = 490;
+// start_get `window`: frames sent past the last acknowledged one.
+constexpr int64_t BLE_DOWNLOAD_WINDOW_MAX = 16;
+// Free msys blocks that must remain before another data frame is handed to
+// NimBLE while earlier frames are still in flight. A frame this size takes three
+// 256-byte blocks, and they stay held on the connection's tx queue while the
+// controller is full (ble_l2cap.c). The headroom leaves room for a status
+// notification and a write response, so a burst cannot starve the get_ack reply.
+constexpr int BLE_NOTIFY_MSYS_RESERVE_BLOCKS = 6;
+// Upload payload is collected to this size before it is written. SdFat sends a
+// full aligned buffer as one writeSectors() call (FatFile::write), which the
+// SDMMC block device issues as 8-sector commands; appended frame by frame, every
+// filled 512-byte sector was its own single-sector command.
+constexpr size_t BLE_UPLOAD_WRITE_BUFFER_BYTES = 16UL * 1024UL;
 constexpr size_t BLE_RESUME_HASH_CHUNK_BYTES = 512;
 constexpr size_t MAX_FILENAME_BYTES = 96;
 constexpr size_t BLE_HOST_ID_MAX_BYTES = 64;
@@ -172,8 +218,14 @@ constexpr size_t BLE_PROGRESS_DISPLAY_INTERVAL_BYTES = 128UL * 1024UL;
 constexpr size_t BLE_FIRMWARE_PROGRESS_DISPLAY_INTERVAL_BYTES = 1024UL * 1024UL;
 constexpr size_t BLE_UPLOAD_ACK_BYTES_MIN = 20;
 constexpr size_t BLE_UPLOAD_ACK_BYTES_MAX = 64UL * 1024UL;
-constexpr size_t MAX_QUEUED_BLE_EVENTS = 64;
-constexpr size_t MAX_QUEUED_BLE_EVENT_BYTES = 8UL * 1024UL;
+// Sized to hold one whole upload credit window, so a client that waits for its
+// `received` ack as it must can never overflow the queue, however long a loop
+// iteration takes: 24000 bytes of payload at the app's ack_bytes, plus a 4-byte
+// header per frame (150 frames at a 160-byte chunk), plus control writes. Each
+// frame is one <=514-byte string; the bytes are only held while the main loop is
+// behind, and overflow drops the link.
+constexpr size_t MAX_QUEUED_BLE_EVENTS = 192;
+constexpr size_t MAX_QUEUED_BLE_EVENT_BYTES = 32UL * 1024UL;
 constexpr size_t EPUB_SUFFIX_LEN = 5;
 constexpr size_t BMP_SUFFIX_LEN = 4;
 constexpr size_t BIN_SUFFIX_LEN = 4;
@@ -246,6 +298,8 @@ static_assert(BLE_STATUS_NOTIFY_MAX_BYTES <= 517 - BLE_ATT_NOTIFY_OVERHEAD,
               "the notify cap must fit the largest MTU this server asks for");
 
 static_assert(BleLink::NO_CONNECTION == BLE_HS_CONN_HANDLE_NONE, "NO_CONNECTION must match NimBLE");
+static_assert(BLE_DOWNLOAD_FRAME_HEADER_BYTES + BLE_DOWNLOAD_CHUNK_BYTES_MAX + BLE_ATT_NOTIFY_OVERHEAD <= 517,
+              "a full download frame must fit the largest MTU this server asks for");
 
 constexpr int BLE_PROTOCOL_VERSION = 2;
 constexpr size_t BLE_CLIENT_NONCE_HEX_CHARS = 32;
@@ -961,20 +1015,25 @@ struct BleLinkRuntime {
     status->notify(reinterpret_cast<const uint8_t*>(notifyJson.data()), notifyJson.size(), handle);
   }
 
-  void notifyData(const uint8_t* data, const size_t length) {
-    if (!dataOut) return;
+  // False when the stack did not take the frame (no buffer, not subscribed, no
+  // secure link); the caller keeps it and tries again.
+  bool notifyData(const uint8_t* data, const size_t length) {
+    if (!dataOut) return false;
     const uint16_t handle = link.boundConnection();
-    if (!link.boundConnectionSecure(handle)) return;
-    const size_t notifyCap = link.notifyCapBytes();
-    // The client picks the chunk size and its resume arithmetic depends on it,
-    // so this is never silently shrunk -- but a frame the link cannot carry is
-    // the same class of bug as an overlong status, and must not be silent.
+    if (!link.boundConnectionSecure(handle)) return false;
+    const size_t notifyCap = link.dataNotifyCapBytes();
+    // start_get sizes chunks above 160 bytes to the link, so only a small chunk on
+    // a link below MTU 167 can land here -- a frame the link cannot carry, which
+    // must not be silent.
     if (length > notifyCap) {
       LOG_DBG("BLE", "data frame %u bytes exceeds notify cap %u", static_cast<unsigned>(length),
               static_cast<unsigned>(notifyCap));
     }
-    dataOut->notify(data, length, handle);
+    return dataOut->notify(data, length, handle);
   }
+
+  // Enough free msys blocks to queue another frame behind ones still in flight.
+  static bool hasNotifyHeadroom() { return os_msys_num_free() >= BLE_NOTIFY_MSYS_RESERVE_BLOCKS; }
 
   void disconnect(const uint16_t handle) const {
     if (server) server->disconnect(handle);
@@ -1070,6 +1129,11 @@ void BleLink::begin() {
       LOG_ERR("BLE", "could not create the BLE event mutex; the link stays down");
       return;
     }
+  }
+  if (!eventSignal_) {
+    // Optional: without it waitForWork() is a plain delay.
+    eventSignal_ = xSemaphoreCreateBinary();
+    if (!eventSignal_) LOG_ERR("BLE", "could not create the BLE wake signal; loop wakes on its timer only");
   }
 
   deviceId_ = makeDeviceId();
@@ -1170,6 +1234,8 @@ void BleLink::tick() {
   if (pendingCommit_) {
     pendingCommit_ = false;
     processCommit();
+    // The outcome goes out now rather than on the next loop.
+    if (statusDirty_) publishStatus();
     return;
   }
   // Only the Store has work of its own to do on a tick -- deadlines, republishes
@@ -1374,9 +1440,21 @@ void BleLink::enqueueBleEvent(BleEvent event) {
     bleEvents_.clear();
   } else {
     queuedBleEventBytes_ += eventBytes;
+    // Data frames are drained on the loop's normal cadence; only a control write
+    // is worth ending the loop's sleep for.
+    const bool wake = event.type != BleEventType::DATA;
     bleEvents_.push_back(std::move(event));
+    if (wake && eventSignal_) xSemaphoreGive(eventSignal_);
   }
   xSemaphoreGive(eventMutex_);
+}
+
+void BleLink::waitForWork(const unsigned long ms) {
+  if (!eventSignal_) {
+    delay(ms);
+    return;
+  }
+  xSemaphoreTake(eventSignal_, pdMS_TO_TICKS(ms));
 }
 
 void BleLink::enqueueBleConnected(const uint16_t connHandle) {
@@ -1400,14 +1478,14 @@ void BleLink::enqueueSecurityResult(const uint16_t connHandle, const bool accept
   enqueueBleEvent(std::move(event));
 }
 
-void BleLink::enqueueControlWrite(const uint16_t connHandle, const std::string& value) {
-  BleEvent event{BleEventType::CONTROL, value};
+void BleLink::enqueueControlWrite(const uint16_t connHandle, std::string value) {
+  BleEvent event{BleEventType::CONTROL, std::move(value)};
   event.connHandle = connHandle;
   enqueueBleEvent(std::move(event));
 }
 
-void BleLink::enqueueDataWrite(const uint16_t connHandle, const std::string& value) {
-  BleEvent event{BleEventType::DATA, value};
+void BleLink::enqueueDataWrite(const uint16_t connHandle, std::string value) {
+  BleEvent event{BleEventType::DATA, std::move(value)};
   event.connHandle = connHandle;
   enqueueBleEvent(std::move(event));
 }
@@ -1729,6 +1807,29 @@ void BleLink::onControlWrite(const std::string& value) {
     return;
   }
 
+  if (op == "set_dark_mode") {
+    // Allowed with a book open: polarity is output-only (ActivityManager's render
+    // task applies it per frame), so the reader holds nothing it would write back.
+    //
+    // Runs on the main loop task (tick() -> processBleEvents()), the same task that
+    // runs activity loops, so the writes below are the ones the Action Centre
+    // tile makes (FrontlightPanelActivity::runTile).
+    if (!doc["dark"].is<bool>()) {
+      setError("invalid dark_mode");
+      return;
+    }
+    const uint8_t inverted = doc["dark"].as<bool>() ? 1 : 0;
+    if (SETTINGS.screenInverted == inverted) return;
+    SETTINGS.screenInverted = inverted;
+    SETTINGS.saveToFile();
+    // Every pixel flips: the clean waveform, so no ghost of the old polarity stays.
+    renderer.promoteNextRefresh(HalDisplay::FULL_REFRESH);
+    // Also inside a book -- the page has to be redrawn in the new polarity.
+    activityManager.requestUpdate();
+    LOG_INF("BLE", "dark mode %s by client", inverted ? "on" : "off");
+    return;
+  }
+
   if (op == "delete_book") {
     // The offline shelf is a two-way mirror: a book removed in the app is
     // removed here. Progress is not lost by doing so -- it lives in kosync, so
@@ -2046,6 +2147,15 @@ void BleLink::onControlWrite(const std::string& value) {
         return;
       }
     }
+    // Never larger than the payload, so a small document does not hold 16 KB.
+    // No buffer (OOM) is not fatal: onDataWrite() then writes each frame straight through.
+    uploadBufferCapacity_ = std::min(expectedSize_, BLE_UPLOAD_WRITE_BUFFER_BYTES);
+    uploadBuffer_ = makeUniqueNoThrow<uint8_t[]>(uploadBufferCapacity_);
+    if (!uploadBuffer_) {
+      LOG_ERR("BLE", "OOM: %u byte upload buffer; writing unbuffered", static_cast<unsigned>(uploadBufferCapacity_));
+      uploadBufferCapacity_ = 0;
+    }
+    uploadBufferUsed_ = 0;
     transferOpen_ = true;
     removePartOnExit_ = true;
     lastProgressStatusBytes_ = receivedBytes_;
@@ -2072,25 +2182,53 @@ void BleLink::onControlWrite(const std::string& value) {
       setError("invalid download chunk size");
       return;
     }
+    int64_t windowValue = 1;
+    if (!doc["window"].isNull()) {
+      if (!doc["window"].is<int64_t>()) {
+        setError("invalid window");
+        return;
+      }
+      windowValue = doc["window"].as<int64_t>();
+      if (windowValue < 1 || windowValue > BLE_DOWNLOAD_WINDOW_MAX) {
+        setError("invalid window");
+        return;
+      }
+    }
+    // A chunk above the old 160-byte ceiling is shrunk to what one notification on
+    // this link can carry, never below 160; 160 and under is used as asked.
+    auto chunkSize = static_cast<size_t>(chunkSizeValue);
+    if (chunkSize > BLE_DOWNLOAD_CHUNK_BYTES) {
+      const size_t cap = dataNotifyCapBytes();
+      const size_t fits = cap > BLE_DOWNLOAD_FRAME_HEADER_BYTES ? cap - BLE_DOWNLOAD_FRAME_HEADER_BYTES : 0;
+      const size_t used = std::max(BLE_DOWNLOAD_CHUNK_BYTES, std::min(chunkSize, fits));
+      if (used != chunkSize) {
+        LOG_DBG("BLE", "start_get chunk %u shrunk to %u (notify cap %u)", static_cast<unsigned>(chunkSize),
+                static_cast<unsigned>(used), static_cast<unsigned>(cap));
+      }
+      chunkSize = used;
+    }
+    // Set after resetTransfer() above and before the kind starts, which reads it.
+    downloadWindow_ = static_cast<uint8_t>(windowValue);
+    const auto offset = static_cast<size_t>(offsetValue);
     const std::string kind = doc["kind"] | "";
     if (kind == "crash_report") {
-      startCrashReportDownload(static_cast<size_t>(offsetValue), static_cast<size_t>(chunkSizeValue));
+      startCrashReportDownload(offset, chunkSize);
       return;
     }
     if (kind == "library") {
-      startLibraryDownload(static_cast<size_t>(offsetValue), static_cast<size_t>(chunkSizeValue));
+      startLibraryDownload(offset, chunkSize);
       return;
     }
     if (kind == "progress_result") {
-      startProgressResultDownload(static_cast<size_t>(offsetValue), static_cast<size_t>(chunkSizeValue));
+      startProgressResultDownload(offset, chunkSize);
       return;
     }
     if (kind == "settings") {
-      startSettingsDownload(static_cast<size_t>(offsetValue), static_cast<size_t>(chunkSizeValue));
+      startSettingsDownload(offset, chunkSize);
       return;
     }
     if (kind == "about") {
-      startAboutDownload(static_cast<size_t>(offsetValue), static_cast<size_t>(chunkSizeValue));
+      startAboutDownload(offset, chunkSize);
       return;
     }
     setError("unsupported transfer kind");
@@ -2098,16 +2236,18 @@ void BleLink::onControlWrite(const std::string& value) {
   }
 
   if (op == "get_ack") {
-    if (!downloadOpen_ || !downloadAwaitingAck_) {
+    if (!downloadOpen_ || downloadUnacked_ == downloadSequence_) {
       setError("no download pending");
       return;
     }
+    // Cumulative: N acknowledges every frame up to and including N. It must name a
+    // frame that is in flight -- with a window of 1 that is exactly the one frame.
     const uint32_t sequence = doc["sequence"] | UINT32_MAX;
-    if (sequence != pendingDownloadAck_) {
+    if (sequence < downloadUnacked_ || sequence >= downloadSequence_) {
       setError("unexpected download ack");
       return;
     }
-    downloadAwaitingAck_ = false;
+    downloadUnacked_ = sequence + 1;
     statusDirty_ = true;
     notifyObserver();
     return;
@@ -2132,6 +2272,17 @@ void BleLink::onControlWrite(const std::string& value) {
   setError("unknown control op");
 }
 
+bool BleLink::flushUploadBuffer() {
+  if (uploadBufferUsed_ == 0) return true;
+  const size_t used = uploadBufferUsed_;
+  uploadBufferUsed_ = 0;
+  if (!uploadFile_ || uploadFile_.write(uploadBuffer_.get(), used) != used) {
+    LOG_ERR("BLE", "upload write of %u bytes failed", static_cast<unsigned>(used));
+    return false;
+  }
+  return true;
+}
+
 void BleLink::onDataWrite(const std::string& value) {
   if (!transferOpen_ || state_ != State::RECEIVING) return;
   if (value.size() <= sizeof(uint32_t)) {
@@ -2154,7 +2305,17 @@ void BleLink::onDataWrite(const std::string& value) {
     resetTransfer(true);
     return;
   }
-  if (uploadFile_.write(payload, payloadSize) != payloadSize) {
+  // Whole frames only go into the buffer, so the part file always ends on a frame
+  // boundary -- which is what a resumed upload's `partialSize % chunk_size` check needs.
+  if (uploadBufferUsed_ + payloadSize > uploadBufferCapacity_ && !flushUploadBuffer()) {
+    setError("transfer write failed");
+    resetTransfer(true);
+    return;
+  }
+  if (payloadSize <= uploadBufferCapacity_) {
+    memcpy(uploadBuffer_.get() + uploadBufferUsed_, payload, payloadSize);
+    uploadBufferUsed_ += payloadSize;
+  } else if (uploadFile_.write(payload, payloadSize) != payloadSize) {
     setError("transfer write failed");
     resetTransfer(true);
     return;
@@ -2182,9 +2343,15 @@ void BleLink::processCommit() {
   if (!transferOpen_) return;
   setState(State::VERIFYING);
 
+  const bool buffered = flushUploadBuffer();
   uploadFile_.flush();
   uploadFile_.close();
   transferOpen_ = false;
+  if (!buffered) {
+    setError("transfer write failed");
+    resetTransfer(true);
+    return;
+  }
 
   if (receivedBytes_ != expectedSize_) {
     setError("size mismatch");
@@ -2391,8 +2558,9 @@ void BleLink::startFileDownload(const char* path, const char* name, const Transf
   }
   sentBytes_ = offset;
   downloadSequence_ = static_cast<uint32_t>(offset / chunkSize);
-  pendingDownloadAck_ = 0;
-  downloadAwaitingAck_ = false;
+  downloadUnacked_ = downloadSequence_;
+  downloadFrameLength_ = 0;
+  downloadEof_ = sentBytes_ >= expectedSize_;
   downloadChunkSize_ = chunkSize;
   lastProgressStatusBytes_ = sentBytes_;
   downloadOpen_ = true;
@@ -2447,23 +2615,26 @@ void BleLink::startSettingsDownload(const size_t offset, const size_t chunkSize)
     }
     JsonDocument doc;
     SETTINGS.toJson(doc);
-    if (Storage.exists(SETTINGS_SNAPSHOT_PATH)) Storage.remove(SETTINGS_SNAPSHOT_PATH);
-    HalFile out;
-    if (!Storage.openFileForWrite("BLE", SETTINGS_SNAPSHOT_PATH, out)) {
-      setError("could not stage settings");
-      return;
-    }
     // Through a String, as BookLibraryIndex does: the settings document is a few
     // KB, so there is nothing to gain from streaming it and a good deal to lose
     // in a half-written file if the write fails partway.
     String json;
     serializeJson(doc, json);
-    const bool ok = json.length() > 0 && out.print(json) == json.length();
-    out.close();
-    if (!ok) {
-      Storage.remove(SETTINGS_SNAPSHOT_PATH);
-      setError("could not serialise settings");
-      return;
+    // Still serialised fresh every time; only an identical file is left as it is.
+    if (!stagedFileMatches(SETTINGS_SNAPSHOT_PATH, json)) {
+      if (Storage.exists(SETTINGS_SNAPSHOT_PATH)) Storage.remove(SETTINGS_SNAPSHOT_PATH);
+      HalFile out;
+      if (!Storage.openFileForWrite("BLE", SETTINGS_SNAPSHOT_PATH, out)) {
+        setError("could not stage settings");
+        return;
+      }
+      const bool ok = json.length() > 0 && out.print(json) == json.length();
+      out.close();
+      if (!ok) {
+        Storage.remove(SETTINGS_SNAPSHOT_PATH);
+        setError("could not serialise settings");
+        return;
+      }
     }
   }
   startFileDownload(SETTINGS_SNAPSHOT_PATH, SETTINGS_SNAPSHOT_NAME, TransferKind::SETTINGS_SNAPSHOT, offset,
@@ -2492,24 +2663,31 @@ void BleLink::startAboutDownload(const size_t offset, const size_t chunkSize) {
     doc["install_at_sleep"] = FIRMWARE_WATCHER.installAtSleep();
     std::string stagedVersion;
     if (firmware_staging::readVersion(stagedVersion)) doc["staged_version"] = stagedVersion;
+    doc["download_chunk_max"] = BLE_DOWNLOAD_CHUNK_BYTES_MAX;
+    doc["dark_mode"] = SETTINGS.screenInverted != 0;
     // Protocol features beyond the upload and download kinds. Here rather than in
     // `status`, whose read already sheds its capability lists to fit 512 bytes.
     JsonArray features = doc["features"].to<JsonArray>();
     features.add("book_position");
-    if (Storage.exists(ABOUT_PATH)) Storage.remove(ABOUT_PATH);
-    HalFile out;
-    if (!Storage.openFileForWrite("BLE", ABOUT_PATH, out)) {
-      setError("could not stage about");
-      return;
-    }
+    features.add("download_window");
+    features.add("dark_mode");
     String json;
     serializeJson(doc, json);
-    const bool ok = json.length() > 0 && out.print(json) == json.length();
-    out.close();
-    if (!ok) {
-      Storage.remove(ABOUT_PATH);
-      setError("could not serialise about");
-      return;
+    // The app reads `about` on every connect and it rarely changes.
+    if (!stagedFileMatches(ABOUT_PATH, json)) {
+      if (Storage.exists(ABOUT_PATH)) Storage.remove(ABOUT_PATH);
+      HalFile out;
+      if (!Storage.openFileForWrite("BLE", ABOUT_PATH, out)) {
+        setError("could not stage about");
+        return;
+      }
+      const bool ok = json.length() > 0 && out.print(json) == json.length();
+      out.close();
+      if (!ok) {
+        Storage.remove(ABOUT_PATH);
+        setError("could not serialise about");
+        return;
+      }
     }
   }
   startFileDownload(ABOUT_PATH, ABOUT_NAME, TransferKind::ABOUT, offset, chunkSize);
@@ -2759,37 +2937,55 @@ void BleLink::processProgressBatch() {
 }
 
 void BleLink::pumpDownload() {
-  if (!downloadOpen_ || downloadAwaitingAck_) return;
+  if (!downloadOpen_) return;
+  static_assert(std::tuple_size<decltype(downloadFrame_)>::value ==
+                    BLE_DOWNLOAD_FRAME_HEADER_BYTES + BLE_DOWNLOAD_CHUNK_BYTES_MAX,
+                "downloadFrame_ must hold one frame of the largest chunk");
 
-  std::array<uint8_t, sizeof(uint32_t) + BLE_DOWNLOAD_CHUNK_BYTES> frame = {};
-  frame[0] = static_cast<uint8_t>(downloadSequence_ & 0xFF);
-  frame[1] = static_cast<uint8_t>((downloadSequence_ >> 8) & 0xFF);
-  frame[2] = static_cast<uint8_t>((downloadSequence_ >> 16) & 0xFF);
-  frame[3] = static_cast<uint8_t>((downloadSequence_ >> 24) & 0xFF);
-
-  const int read = downloadFile_.read(frame.data() + sizeof(uint32_t), downloadChunkSize_);
-  if (read < 0) {
-    downloadFile_.close();
-    downloadOpen_ = false;
-    setError("download read failed");
-    return;
+  // Up to `window` frames past the last acknowledged one, all in this tick. The
+  // first frame of a window always goes (the pre-window behaviour); each further
+  // one waits for msys headroom, so frames still queued in the host cannot starve
+  // the buffer a get_ack write response or a status notification needs.
+  while (downloadSequence_ - downloadUnacked_ < downloadWindow_) {
+    const bool inFlight = downloadSequence_ != downloadUnacked_;
+    if (inFlight && !BleLinkRuntime::hasNotifyHeadroom()) break;
+    if (downloadFrameLength_ == 0) {
+      if (downloadEof_) break;
+      const int read = downloadFile_.read(downloadFrame_.data() + BLE_DOWNLOAD_FRAME_HEADER_BYTES, downloadChunkSize_);
+      if (read < 0) {
+        downloadFile_.close();
+        downloadOpen_ = false;
+        setError("download read failed");
+        return;
+      }
+      if (read == 0) {
+        downloadEof_ = true;
+        break;
+      }
+      downloadFrame_[0] = static_cast<uint8_t>(downloadSequence_ & 0xFF);
+      downloadFrame_[1] = static_cast<uint8_t>((downloadSequence_ >> 8) & 0xFF);
+      downloadFrame_[2] = static_cast<uint8_t>((downloadSequence_ >> 16) & 0xFF);
+      downloadFrame_[3] = static_cast<uint8_t>((downloadSequence_ >> 24) & 0xFF);
+      downloadFrameLength_ = BLE_DOWNLOAD_FRAME_HEADER_BYTES + static_cast<size_t>(read);
+    }
+    // Refused (no buffer, not subscribed): the frame stays built and goes next tick.
+    if (!ble_->notifyData(downloadFrame_.data(), downloadFrameLength_)) break;
+    sentBytes_ += downloadFrameLength_ - BLE_DOWNLOAD_FRAME_HEADER_BYTES;
+    downloadFrameLength_ = 0;
+    downloadSequence_++;
+    if (sentBytes_ >= expectedSize_) downloadEof_ = true;
+    if (sentBytes_ == expectedSize_ || sentBytes_ - lastProgressStatusBytes_ >= BLE_PROGRESS_STATUS_INTERVAL_BYTES) {
+      lastProgressStatusBytes_ = sentBytes_;
+      statusDirty_ = true;
+      notifyObserver();
+    }
   }
-  if (read == 0) {
+
+  // `sent` only once the last frame is acknowledged.
+  if (downloadEof_ && downloadFrameLength_ == 0 && downloadUnacked_ == downloadSequence_) {
     downloadFile_.close();
     downloadOpen_ = false;
     setState(State::SENT);
-    return;
-  }
-
-  ble_->notifyData(frame.data(), sizeof(uint32_t) + static_cast<size_t>(read));
-  sentBytes_ += static_cast<size_t>(read);
-  pendingDownloadAck_ = downloadSequence_;
-  downloadAwaitingAck_ = true;
-  downloadSequence_++;
-  if (sentBytes_ == expectedSize_ || sentBytes_ - lastProgressStatusBytes_ >= BLE_PROGRESS_STATUS_INTERVAL_BYTES) {
-    lastProgressStatusBytes_ = sentBytes_;
-    statusDirty_ = true;
-    notifyObserver();
   }
 }
 
@@ -2808,9 +3004,16 @@ void BleLink::resetTransfer(const bool removePart) {
     mbedtls_sha256_init(&shaContext_);
     shaActive_ = false;
   }
+  const bool deletingPart = removePart && removePartOnExit_ && !partPath_.empty();
+  // A part file that is kept (a resumable upload cut off) gets the held bytes,
+  // which are whole frames; one about to be deleted does not need them.
+  if (uploadFile_ && !deletingPart) flushUploadBuffer();
+  uploadBuffer_.reset();
+  uploadBufferCapacity_ = 0;
+  uploadBufferUsed_ = 0;
   if (uploadFile_) uploadFile_.close();
   if (downloadFile_) downloadFile_.close();
-  if (removePart && removePartOnExit_ && !partPath_.empty() && Storage.exists(partPath_.c_str())) {
+  if (deletingPart && Storage.exists(partPath_.c_str())) {
     Storage.remove(partPath_.c_str());
   }
 
@@ -2830,10 +3033,12 @@ void BleLink::resetTransfer(const bool removePart) {
   downloadChunkSize_ = BLE_DOWNLOAD_CHUNK_BYTES;
   expectedSequence_ = 0;
   downloadSequence_ = 0;
-  pendingDownloadAck_ = 0;
+  downloadUnacked_ = 0;
+  downloadWindow_ = 1;
+  downloadEof_ = false;
+  downloadFrameLength_ = 0;
   transferOpen_ = false;
   downloadOpen_ = false;
-  downloadAwaitingAck_ = false;
   pendingCommit_ = false;
   removePartOnExit_ = false;
   uploadResumable_ = false;
@@ -2895,6 +3100,15 @@ size_t BleLink::notifyCapBytes() const {
   return cap < BLE_STATUS_NOTIFY_MAX_BYTES ? cap : BLE_STATUS_NOTIFY_MAX_BYTES;
 }
 
+size_t BleLink::dataNotifyCapBytes() const {
+  // Same MTU source as notifyCapBytes(), without the status doorbell's 180-byte
+  // cap: a data frame is sized for the link actually in force.
+  uint16_t mtu = ble_ ? ble_->peerMtu() : 0;
+  if (mtu == 0) mtu = negotiatedMtu_.load(std::memory_order_relaxed);
+  if (mtu < BLE_ATT_MTU_MINIMUM) mtu = BLE_ATT_MTU_MINIMUM;
+  return static_cast<size_t>(mtu) - BLE_ATT_NOTIFY_OVERHEAD;
+}
+
 std::string BleLink::buildReadJson() const {
   // Bounded for the same reason the notification is: a value over the ATT
   // ceiling is served truncated, and truncated JSON is indistinguishable to the
@@ -2912,15 +3126,31 @@ std::string BleLink::buildReadJson() const {
       } else if (detail < STATUS_DETAIL_MAX) {
         LOG_DBG("BLE", "status read shed to detail %u (%u bytes)", detail, static_cast<unsigned>(json.size()));
       }
+      appendDownloadChunkSize(json, BLE_ATT_ATTR_MAX_BYTES);
       return json;
     }
   }
 }
 
+void BleLink::appendDownloadChunkSize(std::string& json, const size_t capBytes) const {
+  // Added to the document the shed ladder already chose, and only when it still
+  // fits, so reporting the chunk never pushes out another field. Only beside
+  // `sent`, which the ladder may have dropped.
+  if (state_ != State::SENDING || !downloadOpen_ || json.size() < 2 || json.back() != '}') return;
+  if (json.find("\"sent\":") == std::string::npos) return;
+  char field[32];
+  const int len = snprintf(field, sizeof(field), ",\"chunk_size\":%u", static_cast<unsigned>(downloadChunkSize_));
+  if (len <= 0 || static_cast<size_t>(len) >= sizeof(field) || json.size() + static_cast<size_t>(len) > capBytes) return;
+  json.insert(json.size() - 1, field, static_cast<size_t>(len));
+}
+
 std::string BleLink::buildNotifyJson(const size_t capBytes) const {
   for (unsigned detail = STATUS_DETAIL_MAX;; --detail) {
     std::string json = buildStatusJson(StatusScope::NOTIFY, detail);
-    if (json.size() <= capBytes) return json;
+    if (json.size() <= capBytes) {
+      appendDownloadChunkSize(json, capBytes);
+      return json;
+    }
     if (detail == 0) break;
   }
   // Not even `{"state":"..."}` fits -- a 23-byte MTU with a long state name.

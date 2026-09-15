@@ -258,7 +258,7 @@ void FrontlightPanelActivity::onTileEvent(const fui::ActionEvent& event, void* u
 
 void FrontlightPanelActivity::runTile(const int id) {
   switch (id) {
-    case TILE_NIGHT:  // Night mode (inverted output polarity, applied to the whole UI)
+    case TILE_NIGHT:  // Dark mode (inverted output polarity, applied to the whole UI)
       SETTINGS.screenInverted = SETTINGS.screenInverted ? 0 : 1;
       SETTINGS.saveToFile();
       // Inversion rewrites every pixel; take the clean waveform so the panel
@@ -582,8 +582,8 @@ void FrontlightPanelActivity::buildPanelScreen(UiScreen& screen) {
       bool checked = false;
       switch (id) {
         case TILE_NIGHT:
-          label = tr(STR_NIGHT_MODE);
-          checked = SETTINGS.screenInverted != 0;
+          // Names the mode a tap switches to.
+          label = SETTINGS.screenInverted ? tr(STR_LIGHT_MODE) : tr(STR_NIGHT_MODE);
           break;
         case TILE_REFRESH:
           label = tr(STR_FORCE_REFRESH);

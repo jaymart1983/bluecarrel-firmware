@@ -201,7 +201,8 @@ Supported upload kinds:
   [The Store](#the-store-requests-over-the-notify-channel))
 - `catalog_detail`: one book in full, answering a `catalog_detail` request
 
-Downloads use `start_get`, notifications on `data-out`, and one `get_ack` per frame.
+Downloads use `start_get`, notifications on `data-out`, and `get_ack` from the client. See
+[Download frames and acknowledgement](#download-frames-and-acknowledgement).
 
 Supported download kinds:
 
@@ -212,8 +213,50 @@ Supported download kinds:
 - `about`: which firmware is running and whether an update is staged (see [`about`](#about))
 
 The other control ops are `set_time` (see [Device clock](#device-clock)), `delete_book` (see
-[`delete_book`](#delete_book)), `catalog_error` (the app declining a Store request it cannot answer) and `cancel`.
+[`delete_book`](#delete_book)), `set_dark_mode` (see [`set_dark_mode`](#set_dark_mode)), `catalog_error` (the app
+declining a Store request it cannot answer) and `cancel`.
 `hello` and `pair` are described under [Authentication](#authentication).
+
+## Download frames and acknowledgement
+
+```json
+{"op":"start_get","kind":"library","offset":0,"chunk_size":490,"window":8}
+```
+
+`start_get` fields:
+
+| Field | Type | Meaning |
+| --- | --- | --- |
+| `kind` | string | Download kind, above. Required. |
+| `offset` | integer | Byte offset to start from. Default `0`. Must be a multiple of the chunk size in use unless it equals the document size; otherwise `unaligned download offset`. |
+| `chunk_size` | integer | Payload bytes per frame. Default `160`. Accepted from `20` up to `download_chunk_max` from the [`about`](#about) download (`490`); older firmware accepts at most `160`. Outside that range: `invalid download chunk size`. |
+| `window` | integer | Frames the reader may send past the last acknowledged one, `1`–`16`. Default `1`. Anything else, including a non-integer: `invalid window`. Older firmware ignores it and behaves as `1`. |
+
+**Chunk size.** A `chunk_size` of `160` or less is used as asked. A larger one is shrunk to what one notification on
+the current link can carry, `ATT_MTU - 3 - 4`, but never below `160`; it is not refused. At the MTU of 517 the reader
+asks for, `490` is used as asked; at MTU 185, `178` is used. The chunk in use is reported as `chunk_size` in a
+`sending` status (notification or GATT read) whenever it fits beside `sent` without dropping any other field. A client
+that does not see it can rely on frame lengths: every frame but the last carries exactly one chunk.
+
+`490` is the default maximum because a frame costs `chunk + 11` bytes on the link (4-byte sequence, 3-byte ATT
+header, 4-byte L2CAP header): with the 251-byte LL data length the reader requests, 491 is the largest chunk that fits
+in two LL PDUs, where the 510-byte MTU ceiling needs three.
+
+**Frames.** Each frame is one notification on `data-out`: a little-endian `uint32` sequence number followed by the
+payload. The first sequence number is `offset / chunk_size`.
+
+**Acknowledgement.** `{"op":"get_ack","sequence":N}` is cumulative: it acknowledges every frame up to and including
+`N`. The reader sends up to `window` frames past the last acknowledged sequence and then waits. With `window: 1` that
+is one frame per `get_ack`, which is how older firmware always works. A client using a window acknowledges every
+`window`-th frame and always the final frame. `N` must name a frame that was sent and not yet acknowledged; otherwise
+the reader reports `unexpected download ack` (or `no download pending` when nothing is waiting for an ack).
+
+`state: "sent"` is published only after the final frame has been acknowledged. While sending, `status` carries `sent`
+and `size`, and `chunk_size` as described above.
+
+The reader also paces itself: it holds back frames while NimBLE's buffers run low, so a window is a maximum, not a
+promise that `window` frames arrive back to back. The client must not treat a pause shorter than its stall timeout as
+an error.
 
 ## Opening position
 
@@ -272,13 +315,32 @@ wildcards. Like every other op it requires `hello` first.
   `book open`.
 - Other errors: `unsafe book filename`, `could not delete the book`.
 
+## `set_dark_mode`
+
+```json
+{"op":"set_dark_mode","dark":true}
+```
+
+Switches the reader between dark mode (inverted output) and normal output. Like every other op it requires `hello`
+first. It works with a book open.
+
+- `dark` is required and must be a JSON boolean; anything else fails with `error: "invalid dark_mode"`.
+- If the reader is already in the requested mode, nothing happens: no save, no repaint.
+- Otherwise the setting is saved and whatever is on screen, including an open book, is redrawn once with a clean full
+  refresh so no ghost of the old polarity remains.
+- Success does not change `state` and adds nothing to `status`. Read the result from `dark_mode` in the
+  [`about`](#about) download.
+
+Support is advertised as `dark_mode` in the `features` list of the [`about`](#about) download.
+
 ## `about`
 
 `{"op":"start_get","kind":"about"}` returns one small JSON object:
 
 ```json
 {"firmware_version":"20260913.1914","running_partition":"app1","update_staged":true,
- "install_at_sleep":true,"staged_version":"20260914.0800","features":["book_position"]}
+ "install_at_sleep":true,"staged_version":"20260914.0800","download_chunk_max":490,"dark_mode":false,
+ "features":["book_position","download_window","dark_mode"]}
 ```
 
 | Field | Type | Meaning |
@@ -288,7 +350,9 @@ wildcards. Like every other op it requires `hello` first.
 | `update_staged` | bool | `/firmware/firmware.bin` and its `.sha256` file are both on the card. |
 | `install_at_sleep` | bool | A staged image will be installed the next time the reader sleeps (the user chose Later, or auto-install is on). |
 | `staged_version` | string | Contents of `/firmware/firmware.bin.version`. Absent when there is no such file. |
-| `features` | array of strings | Protocol features beyond the upload and download kinds. `book_position`: a `book` upload accepts `position` (see [Opening position](#opening-position)). Absent on older firmware. |
+| `download_chunk_max` | integer | The largest `start_get` `chunk_size` this firmware accepts (`490`). Absent on older firmware, which accepts at most `160`. See [Download frames and acknowledgement](#download-frames-and-acknowledgement). |
+| `dark_mode` | bool | `true` while the reader draws inverted (dark mode). Set with [`set_dark_mode`](#set_dark_mode). Absent on older firmware. |
+| `features` | array of strings | Protocol features beyond the upload and download kinds. `book_position`: a `book` upload accepts `position` (see [Opening position](#opening-position)). `download_window`: `start_get` accepts `window` and `get_ack` is cumulative (see [Download frames and acknowledgement](#download-frames-and-acknowledgement)). `dark_mode`: the `set_dark_mode` op is supported and `dark_mode` is reported here. Absent on older firmware. |
 
 `about` is not listed in `download_kinds`.
 
@@ -686,7 +750,10 @@ fits. It never truncates: a client always receives parseable JSON.
 | first | `protocol_version`, `store_supported`, `clock_supported`, `device_time` |
 | then | `has_trusted_host`, `trusted_host`, `reader_proof`, `paired`, `name`, `path`, `book` |
 | then | `pending` keeps only `req`, `op` and the `id`/`offset` an answer must quote back |
-| then | the transfer counters (`kind`, `received`, `sent`, `size`, `ack_bytes`, `resumable`, `entries`, `applied`, `position_applied`) and the `error` / `auth_error` text |
+| then | the transfer counters (`kind`, `received`, `sent`, `size`, `chunk_size`, `ack_bytes`, `resumable`, `entries`, `applied`, `position_applied`) and the `error` / `auth_error` text |
+
+`chunk_size` is added to a `sending` status only when it fits the document that was chosen without dropping
+anything more, so it never costs another field.
 | never | `state`, the heartbeat fields `lib_n`, `lib_h`, `pct`, `open`, `sleeping`, and `pending` |
 
 If even the floor does not fit, no notification is sent; the GATT read still carries the session.

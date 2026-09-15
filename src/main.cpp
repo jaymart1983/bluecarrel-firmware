@@ -1217,10 +1217,20 @@ void loop() {
     if (millis() - lastActivityTime >= HalPowerManager::IDLE_POWER_SAVING_MS) {
       // If we've been inactive for a while, increase the delay to save power
       powerManager.setPowerSaving(true);  // Lower CPU frequency after extended inactivity
+#if FREEINK_CAP_BLE_TRANSFER
+      BLE_LINK.waitForWork(50);
+#else
       delay(50);
+#endif
     } else {
       // Short delay to prevent tight loop while still being responsive
+#if FREEINK_CAP_BLE_TRANSFER
+      // Same sleep, but a queued control write (get_ack, commit, start_get) ends
+      // it, so a reply is not held back until the delay runs out.
+      BLE_LINK.waitForWork(10);
+#else
       delay(10);
+#endif
     }
   }
 }

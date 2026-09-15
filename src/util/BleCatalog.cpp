@@ -8,6 +8,7 @@
 #include <array>
 #include <cctype>
 #include <cstdio>
+#include <cstring>
 
 #include "TaskWatchdog.h"
 
@@ -117,6 +118,8 @@ bool readEntry(JsonObjectConst obj, const size_t descriptionCap, const char* boo
   entry.published = clampUtf8(obj["published"] | "", 16);
   entry.language = clampUtf8(obj["language"] | "", 16);
   entry.tags = clampUtf8(obj["tags"] | "", BleCatalog::MAX_TAGS_BYTES);
+  const char* calibreUuid = obj["calibre_uuid"] | "";
+  entry.calibreUuid.assign(calibreUuid, strnlen(calibreUuid, 65));
 
   const std::string filename = obj["filename"] | "";
   // An entry with no usable filename is still listed -- the user can read about

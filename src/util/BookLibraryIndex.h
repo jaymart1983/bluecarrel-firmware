@@ -1,7 +1,9 @@
 #pragma once
 
+#include <cstddef>
 #include <cstdint>
 #include <string>
+#include <string_view>
 #include <vector>
 
 // Builds the on-device library listing that the BLE `library` download serves:
@@ -14,6 +16,12 @@
 // to spare. The BLE download then streams that file through the ordinary
 // frame/ack path, which also gives the transfer a known size and resumability.
 namespace BookLibraryIndex {
+
+constexpr size_t CALIBRE_UUID_MAX_BYTES = 64;
+
+// A Calibre book UUID as the BLE link carries it: 1-64 characters of
+// [0-9A-Za-z-]. Checked wherever one comes from the link or the card.
+bool isValidCalibreUuid(std::string_view value);
 
 struct Stats {
   uint32_t books = 0;         // entries written

@@ -466,6 +466,44 @@ bool isSafeBleBookRelativePath(const std::string& value) {
   return true;
 }
 
+// The calibre_uuid in a book's sidecar, or "" when there is none or it is malformed.
+std::string readSidecarCalibreUuid(const std::string& metaPath) {
+  if (!Storage.exists(metaPath.c_str())) return {};
+  HalFile in;
+  if (!Storage.openFileForRead("BLE", metaPath, in)) return {};
+  JsonDocument doc;
+  if (deserializeJson(doc, in) != DeserializationError::Ok) return {};
+  const std::string uuid = doc["calibre_uuid"] | "";
+  return BookLibraryIndex::isValidCalibreUuid(uuid) ? uuid : std::string();
+}
+
+// Records `uuid` in the book's sidecar, creating the sidecar when there is none
+// and keeping every field already in it.
+bool storeSidecarCalibreUuid(const std::string& fileName, const std::string& uuid) {
+  if (!Storage.ensureDirectoryExists(BOOK_META_DIR)) return false;
+  const std::string metaPath = std::string(BOOK_META_DIR) + "/" + fileName + ".json";
+  JsonDocument doc;
+  if (Storage.exists(metaPath.c_str())) {
+    HalFile in;
+    if (Storage.openFileForRead("BLE", metaPath, in) && deserializeJson(doc, in) != DeserializationError::Ok) {
+      doc.clear();
+    }
+  }
+  if (!doc.is<JsonObject>()) doc.to<JsonObject>();
+  const char* existing = doc["calibre_uuid"] | "";
+  if (uuid == existing) return true;
+  doc["calibre_uuid"] = uuid.c_str();
+  String json;
+  serializeJson(doc, json);
+  if (Storage.exists(metaPath.c_str())) Storage.remove(metaPath.c_str());
+  HalFile out;
+  if (!Storage.openFileForWrite("BLE", metaPath, out)) return false;
+  const bool written = out.print(json) == json.length();
+  out.close();
+  if (!written) Storage.remove(metaPath.c_str());
+  return written;
+}
+
 // The `position` of a book start_put: one `progress` batch entry without
 // `filename`. Unlike a batch entry, anything malformed refuses it outright.
 struct BookPosition {
@@ -1216,6 +1254,8 @@ void BleLink::end() {
   if (Storage.exists(PROGRESS_BATCH_PATH)) Storage.remove(PROGRESS_BATCH_PATH);
   if (Storage.exists(PROGRESS_RESULT_PATH)) Storage.remove(PROGRESS_RESULT_PATH);
   mbedtls_sha256_free(&shaContext_);
+  // No phone can hear an answer now; the prompt, if up, closes itself.
+  clearPendingPair();
   helloAccepted_ = false;
   authHandle_ = NO_CONNECTION;
   hostPaired_ = false;
@@ -1282,6 +1322,11 @@ void BleLink::tick() {
 }
 
 void BleLink::deleteBookNow(const std::string& name, const std::string& path) {
+  // A `book` download reading this file must not go on reading freed clusters.
+  if (downloadOpen_ && transferKind_ == TransferKind::BOOK && finalPath_ == path) {
+    LOG_INF("BLE", "delete_book: stopping the download of %s first", name.c_str());
+    resetTransfer(true);
+  }
   if (!Storage.exists(path.c_str())) {
     // Already absent is the requested state, so this is a success: the app must
     // not have to distinguish "I deleted it" from "it was not there".
@@ -1388,6 +1433,67 @@ bool BleLink::pairingPasskey(uint32_t& passkey) const {
   return true;
 }
 
+bool BleLink::takePairPromptRequest() {
+  if (!pairPromptRequested_ || !pendingPairActive_) return false;
+  pairPromptRequested_ = false;
+  return true;
+}
+
+void BleLink::clearPendingPair() {
+  pendingPair_.secret.fill(0);
+  pendingPair_.hostId.clear();
+  pendingPair_.name.clear();
+  pendingPairActive_ = false;
+  pendingPairLinkAlive_ = false;
+  pairPromptRequested_ = false;
+}
+
+void BleLink::resolvePairPrompt(const bool allow) {
+  if (!pendingPairActive_) return;
+  // Only the connection that sent the request may be authenticated by the answer.
+  const bool sameLink = pendingPairLinkAlive_ && linkSecure_.load() && connHandle_.load() != NO_CONNECTION;
+  if (allow) {
+    LOG_INF("BLE", "pair allowed on the reader ('%s', host %.8s)", pendingPair_.name.c_str(),
+            pendingPair_.hostId.c_str());
+    applyPair(pendingPair_, sameLink);
+  } else {
+    LOG_INF("BLE", "pair denied on the reader ('%s', host %.8s)", pendingPair_.name.c_str(),
+            pendingPair_.hostId.c_str());
+    if (sameLink) setAuthError("pairing denied");
+  }
+  clearPendingPair();
+  // The prompt stood in for the hello deadline; a still-unauthenticated link gets a fresh one.
+  if (sameLink && !sessionAuthenticated()) securedAtMs_ = millis();
+}
+
+bool BleLink::applyPair(const BleTrustedHost& host, const bool authenticateSession) {
+  if (!BLE_TRUSTED_HOSTS.addOrReplaceHost(host)) {
+    LOG_INF("BLE", "pair refused: could not save the pairing");
+    setAuthError("could not save the pairing");
+    return false;
+  }
+  closePairingWindow();
+  if (!authenticateSession) {
+    // The phone's connection went while the reader was asking; its next hello
+    // authenticates against the host saved here.
+    LOG_INF("BLE", "pair saved: '%s' (host %.8s), connection already gone", host.name.c_str(),
+            host.hostId.c_str());
+    notifyObserver();
+    return true;
+  }
+  helloAccepted_ = true;
+  authHandle_ = connHandle_.load();
+  hostPaired_ = true;
+  invalidHellos_ = 0;
+  trustedHostName_ = host.name;
+  readerProof_.clear();
+  authErrorMessage_.clear();
+  LOG_INF("BLE", "pair accepted: '%s' (host %.8s) saved", host.name.c_str(), host.hostId.c_str());
+  setState(State::CONNECTED);
+  if (store_) store_->onAppReady();
+  return true;
+}
+
 bool BleLink::bindConnection(const uint16_t connHandle) {
   uint16_t expected = NO_CONNECTION;
   if (connHandle == NO_CONNECTION || !connHandle_.compare_exchange_strong(expected, connHandle)) return false;
@@ -1434,8 +1540,15 @@ void BleLink::checkConnectionDeadlines() {
     notifyObserver();
   }
 
+  if (pendingPairActive_ && now - pendingPairAtMs_ >= PAIR_PROMPT_TIMEOUT_MS) {
+    LOG_INF("BLE", "pair prompt unanswered for %lu s", PAIR_PROMPT_TIMEOUT_MS / 1000UL);
+    resolvePairPrompt(false);
+  }
+
   if (connHandle_.load() == NO_CONNECTION || sessionAuthenticated() || connectedAtMs_ == 0) return;
   if (linkSecure_.load()) {
+    // A person is answering the pair prompt, which has its own deadline.
+    if (pendingPairActive_ && pendingPairLinkAlive_) return;
     if (securedAtMs_ != 0 && now - securedAtMs_ >= HELLO_TIMEOUT_MS) disconnectPeer("no hello after encryption");
   } else if (now - connectedAtMs_ >= SECURE_LINK_TIMEOUT_MS) {
     disconnectPeer("link not secured in time");
@@ -1590,6 +1703,7 @@ void BleLink::onBleConnected(const uint16_t connHandle) {
   readerProof_.clear();
   authErrorMessage_.clear();
   invalidHellos_ = 0;
+  pendingPairLinkAlive_ = false;
   connectedAtMs_ = millis();
   securedAtMs_ = 0;
   setState(State::CONNECTED);
@@ -1617,6 +1731,7 @@ void BleLink::adoptNewBond(const std::string& peerIdAddress) {
 }
 
 void BleLink::onBleDisconnected(const uint16_t) {
+  pendingPairLinkAlive_ = false;
   // The Store is live or it is nothing: with the link gone there is no
   // catalogue to show, so it drops what it had rather than leaving a page on
   // screen that no longer describes anything reachable.
@@ -1737,13 +1852,20 @@ void BleLink::onControlWrite(const std::string& value) {
   }
 
   if (op == "pair") {
-    // The link is already bonded (onControlWrite only runs on a secure link);
-    // the window is the user's consent to store this phone's secret.
+    // The link is already bonded (onControlWrite only runs on a secure link), but
+    // any app on a bonded phone can send `pair`. Consent to store its secret is
+    // the open window, or with the window closed a person answering the prompt on
+    // the reader; it is never accepted on its own.
     const auto refusePair = [&](const char* reason) {
       LOG_INF("BLE", "pair refused: %s", reason);
       setAuthError(reason);
     };
-    if (!pairingWindowOpen()) {
+    const bool windowOpen = pairingWindowOpen();
+    const unsigned long now = millis();
+    // One prompt at a time, one per PAIR_PROMPT_INTERVAL_MS, none during a lockout.
+    const bool mayPrompt = !windowOpen && pairingLockSecondsLeft() == 0 && !pendingPairActive_ &&
+                           (!pairPromptStarted_ || now - lastPairPromptAtMs_ >= PAIR_PROMPT_INTERVAL_MS);
+    if (!windowOpen && !mayPrompt) {
       refusePair("pairing window closed");
       return;
     }
@@ -1758,21 +1880,22 @@ void BleLink::onControlWrite(const std::string& value) {
     }
     host.hostId = hostId;
     host.name = sanitizeHostName(doc["host_name"] | "");
-    if (!BLE_TRUSTED_HOSTS.addOrReplaceHost(host)) {
-      refusePair("could not save the pairing");
+    if (!windowOpen) {
+      // Held exactly as sent until BlePairPromptActivity answers or the deadline passes.
+      pendingPair_ = host;
+      host.secret.fill(0);
+      pendingPairActive_ = true;
+      pendingPairLinkAlive_ = true;
+      pairPromptRequested_ = true;
+      pairPromptStarted_ = true;
+      pendingPairAtMs_ = now;
+      lastPairPromptAtMs_ = now;
+      LOG_INF("BLE", "pair with the window closed: asking on the reader ('%s', host %.8s)",
+              pendingPair_.name.c_str(), pendingPair_.hostId.c_str());
+      setAuthError("confirm on reader");
       return;
     }
-    closePairingWindow();
-    helloAccepted_ = true;
-    authHandle_ = connHandle_.load();
-    hostPaired_ = true;
-    invalidHellos_ = 0;
-    trustedHostName_ = host.name;
-    readerProof_.clear();
-    authErrorMessage_.clear();
-    LOG_INF("BLE", "pair accepted: '%s' (host %.8s) saved", host.name.c_str(), host.hostId.c_str());
-    setState(State::CONNECTED);
-    if (store_) store_->onAppReady();
+    applyPair(host, true);
     return;
   }
 
@@ -1981,6 +2104,15 @@ void BleLink::onControlWrite(const std::string& value) {
         positionTimestamp_ = position.timestamp;
         positionJump_ = position.jump;
         positionPercentBp_ = position.percentBp;
+      }
+      if (!doc["calibre_uuid"].isNull()) {
+        const std::string uuid =
+            doc["calibre_uuid"].is<const char*>() ? doc["calibre_uuid"].as<const char*>() : "";
+        if (!BookLibraryIndex::isValidCalibreUuid(uuid)) {
+          setError("invalid calibre_uuid");
+          return;
+        }
+        calibreUuid_ = uuid;
       }
     } else if (kind == "bmp") {
       if (!isSafeBleBmpName(fileName_)) {
@@ -2262,6 +2394,10 @@ void BleLink::onControlWrite(const std::string& value) {
       startAboutDownload(offset, chunkSize);
       return;
     }
+    if (kind == "book") {
+      startBookDownload(doc["name"] | "", offset, chunkSize);
+      return;
+    }
     setError("unsupported transfer kind");
     return;
   }
@@ -2459,6 +2595,15 @@ void BleLink::processCommit() {
       clearBookCache(savedPath_);
       restorePositionFiles(positionCache, keptPosition);
       if (!keptPosition.empty()) LOG_INF("BLE", "Book replaced; kept its reading position");
+      if (!calibreUuid_.empty()) {
+        // The book is already saved; a sidecar that cannot be written costs the
+        // listing its calibre_uuid, not the upload.
+        if (storeSidecarCalibreUuid(fileName_, calibreUuid_)) {
+          LOG_INF("BLE", "calibre_uuid stored for %s", fileName_.c_str());
+        } else {
+          LOG_ERR("BLE", "could not store calibre_uuid for %s", fileName_.c_str());
+        }
+      }
       // Before the shelf hears of the book, so nothing can open it first.
       if (positionGiven_) {
         const auto result = BookProgressSync::applyProgress(BOOKS_ROOT, fileName_, positionLocation_,
@@ -2703,6 +2848,9 @@ void BleLink::startAboutDownload(const size_t offset, const size_t chunkSize) {
     features.add("book_position");
     features.add("download_window");
     features.add("dark_mode");
+    features.add("book_uuid");
+    features.add("book_download");
+    features.add("pair_prompt");
     String json;
     serializeJson(doc, json);
     // The app reads `about` on every connect and it rarely changes.
@@ -2723,6 +2871,23 @@ void BleLink::startAboutDownload(const size_t offset, const size_t chunkSize) {
     }
   }
   startFileDownload(ABOUT_PATH, ABOUT_NAME, TransferKind::ABOUT, offset, chunkSize);
+}
+
+void BleLink::startBookDownload(const std::string& name, const size_t offset, const size_t chunkSize) {
+  if (!isSafeBleBookName(name)) {
+    setError("unsafe book filename");
+    return;
+  }
+  const std::string path = std::string(BOOKS_ROOT) + "/" + name;
+  if (!Storage.exists(path.c_str())) {
+    setError("not found");
+    return;
+  }
+  // Read-only, so the open book is no obstacle: the reader keeps its own read
+  // handle, and both handles' reads are serialised by HalStorage's mutex.
+  startFileDownload(path.c_str(), name.c_str(), TransferKind::BOOK, offset, chunkSize);
+  // Lets deleteBookNow() stop this download before removing the file.
+  if (downloadOpen_) finalPath_ = path;
 }
 
 bool BleLink::applyBookMetaDocument() {
@@ -2750,6 +2915,10 @@ bool BleLink::applyBookMetaDocument() {
     setError("book metadata names no usable book");
     return false;
   }
+  if (!entry.calibreUuid.empty() && !BookLibraryIndex::isValidCalibreUuid(entry.calibreUuid)) {
+    setError("invalid calibre_uuid");
+    return false;
+  }
   const std::string stem = std::string(BOOK_META_DIR) + "/" + entry.filename;
 
   // The cover lands wherever parseContainer put it; move it to the stable name
@@ -2771,6 +2940,11 @@ bool BleLink::applyBookMetaDocument() {
   doc["published"] = entry.published.c_str();
   doc["language"] = entry.language.c_str();
   doc["tags"] = entry.tags.c_str();
+  // A book_meta without a uuid keeps the one already stored (a book upload may
+  // have written it first).
+  const std::string calibreUuid =
+      entry.calibreUuid.empty() ? readSidecarCalibreUuid(stem + ".json") : entry.calibreUuid;
+  if (!calibreUuid.empty()) doc["calibre_uuid"] = calibreUuid.c_str();
   String json;
   serializeJson(doc, json);
   const std::string metaPath = stem + ".json";
@@ -3037,6 +3211,7 @@ void BleLink::resetTransfer(const bool removePart) {
   positionGiven_ = false;
   positionApplied_ = false;
   positionLocation_.clear();
+  calibreUuid_.clear();
   positionTimestamp_ = 0;
   positionPercentBp_ = 0;
   positionJump_ = {};
@@ -3359,6 +3534,7 @@ std::string BleLink::buildStatusJson(const StatusScope scope, const unsigned det
     uploadKinds.add("book_meta");
     JsonArray downloadKinds = doc["download_kinds"].to<JsonArray>();
     downloadKinds.add("about");
+    downloadKinds.add("book");
     downloadKinds.add("crash_report");
     downloadKinds.add("library");
     downloadKinds.add("progress_result");

@@ -38,6 +38,10 @@ class Epub {
   CssParser::ParseResult parseCssFiles(CssParser::CacheStatus existingCacheStatus) const;
 
  public:
+  // Beside book.bin in the cache directory: the Calibre book UUID from the OPF,
+  // as plain text, written when the OPF is parsed and the book has one.
+  static constexpr const char* CALIBRE_UUID_FILE = "/calibre_uuid.txt";
+
   explicit Epub(std::string filepath, const std::string& cacheDir) : filepath(std::move(filepath)) {
     // create a cache key based on the filepath
     cachePath = cacheDir + "/epub_" + std::to_string(std::hash<std::string>{}(this->filepath));

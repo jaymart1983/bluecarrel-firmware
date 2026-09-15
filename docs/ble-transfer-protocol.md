@@ -64,12 +64,33 @@ A new bond is accepted only while the pairing window is open:
 - Three failed attempts (wrong passkey, unauthenticated pairing, or disconnecting while the passkey is shown) lock
   pairing for 60 s. The Settings page shows the countdown.
 
+### Pair prompt
+
+A phone that is still bonded can send `pair` while the window is closed, for example after the app was reinstalled
+and lost its secret. Any app on a bonded phone could send it, so the reader never accepts it on its own: it asks the
+person holding the reader. Support is advertised as `pair_prompt` in the `features` list of [`about`](#about).
+
+- When a valid `pair` arrives with the window closed, no lockout running and no prompt in the last 30 s, the reader
+  shows **Pair with <host_name>?** with **Allow** and **Deny** over whatever is on screen. A book that is open stays
+  open underneath. The prompt does not close on an outside tap or Back.
+- While it is up, `status` reports `auth_error: "confirm on reader"`. The 20 s `hello` deadline is paused.
+- **Allow** applies the held request exactly as if the window had been open: the stored host is replaced and
+  `status` reports `"paired":true` and `trusted_host`. The app does not resend `pair`; it follows with `hello` as
+  usual. If the phone disconnected before Allow, the host is still stored and its next `hello` authenticates.
+- **Deny**, leaving the prompt any other way, or no answer within 60 s: `auth_error: "pairing denied"`, and the
+  `hello` deadline starts again.
+- Only one prompt starts per 30 s. A `pair` during that time, or while a prompt is up, is refused with
+  `pairing window closed`. During a pairing lockout every `pair` with the window closed gets `pairing window closed`.
+- A malformed `pair` is refused with `invalid pair request` and shows no prompt.
+- Firmware without `pair_prompt` refuses a closed-window `pair` with `pairing window closed`.
+
 ### Timeouts and limits
 
 | Condition | Result |
 | --- | --- |
 | Link not encrypted, authenticated and bonded within 90 s of connecting | Disconnected |
-| No accepted `hello` or `pair` within 20 s of the link being secured | Disconnected |
+| No accepted `hello` or `pair` within 20 s of the link being secured (paused while a [pair prompt](#pair-prompt) is up) | Disconnected |
+| [Pair prompt](#pair-prompt) not answered within 60 s | `auth_error: "pairing denied"` |
 | Three refused `hello`s on one connection | Disconnected |
 | Three failed pairing attempts | Pairing locked for 60 s |
 
@@ -107,7 +128,8 @@ Field rules used below:
 
 ### `pair`
 
-Sent once, on a freshly bonded link, while the pairing window is open:
+Sent once, on a freshly bonded link, while the pairing window is open. With the window closed the reader asks the
+person holding it first; see [Pair prompt](#pair-prompt).
 
 ```json
 {"op":"pair","version":2,"host_id":"H","host_name":"Pixel 9","secret":"<64 lowercase hex>"}
@@ -119,7 +141,8 @@ pairing window, marks the session authenticated and publishes `status` with `"pa
 `pair` carries no `reader_proof`. The app must follow it with a `hello` on the same connection and check the
 `reader_proof` that hello produces before it trusts the reader.
 
-Refusals, reported as `auth_error`: `pairing window closed`, `invalid pair request`, `could not save the pairing`.
+Refusals, reported as `auth_error`: `pairing window closed`, `invalid pair request`, `could not save the pairing`,
+`pairing denied`. `confirm on reader` is not a refusal: the reader is showing the pair prompt.
 
 ### `hello`
 
@@ -164,8 +187,10 @@ is refused with `auth_error: "hello required"`.
 | `invalid hello` | A field is missing or malformed |
 | `unknown trusted host` | With `has_trusted_host: false`, nobody is paired. With `true`, a different host is paired. |
 | `invalid trusted host auth` | `response` did not verify |
-| `pairing window closed` | `pair` sent while the window is closed |
+| `pairing window closed` | `pair` sent while the window is closed and no pair prompt can start (lockout, or another prompt in the last 30 s) |
 | `invalid pair request` | A `pair` field is missing or malformed |
+| `confirm on reader` | Not a refusal. The reader is asking the user to allow a closed-window `pair`. |
+| `pairing denied` | The user chose Deny, or the pair prompt went unanswered for 60 s |
 
 ### Forgetting
 
@@ -186,6 +211,7 @@ Uploads use `start_put`, binary frames on `data-in`, then `commit`.
 | `sha256` | string | 64 hex characters over the whole payload. Required. |
 | `replace` | bool | `book` only. `true` overwrites an existing `/Books/<name>`; without it an existing file is refused as `exists`. Replacing the book that is open on screen is refused as `book open`. Default `false`. |
 | `position` | object | `book` only, optional. The reading position to open the book at, applied on commit before the book appears on the shelf. See [Opening position](#opening-position). |
+| `calibre_uuid` | string | `book` only, optional. The Calibre book UUID, 1-64 characters of `0-9`, `A-Z`, `a-z` and `-`. Anything else fails `start_put` with `invalid calibre_uuid`. Stored in the book's metadata sidecar on commit (created when there is none; title, author and the other fields are kept) and reported by `library`. Advertised as `book_uuid`. |
 | `version` | string | `firmware` only, required. The image's build stamp, `yyyyMMdd.HHmm` (for example `20260913.1914`). Saved as `firmware.bin.version`. |
 | `signature` | string | `firmware` only, required. The image signature as lowercase hex, even length, at most 256 characters (see [Signatures](#signatures)). Saved as `firmware.bin.sig`. |
 | `req` | number | Only when answering a Store request. |
@@ -202,7 +228,9 @@ Supported upload kinds:
 - `settings`: a settings document to apply. Refused as `book open` while a book is open. `deviceName` is trimmed and
   must then be at most 16 bytes of printable ASCII (`0x20`-`0x7E`); empty means `Bluecarrel`. A name that breaks the
   rule is ignored and the old name kept; the rest of the document still applies
-- `book_meta`: book metadata for the app's library, capped at a small size
+- `book_meta`: book metadata for the app's library, capped at a small size. The entry may carry `calibre_uuid`
+  (same rule as on `start_put`; otherwise `invalid calibre_uuid`). Without one, a `calibre_uuid` already in the
+  sidecar is kept
 - `catalog_page`: one screen of the app's Calibre library, answering a `catalog_page` request (see
   [The Store](#the-store-requests-over-the-notify-channel))
 - `catalog_detail`: one book in full, answering a `catalog_detail` request
@@ -213,6 +241,7 @@ Downloads use `start_get`, notifications on `data-out`, and `get_ack` from the c
 Supported download kinds:
 
 - `crash_report`: reads `/crash_report.txt`
+- `book`: one EPUB from `/Books` (see [`book` download](#book-download))
 - `library`: the on-device book list with reading progress (see below)
 - `progress_result`: the per-entry outcome of the last `progress` upload (see below)
 - `settings`: the device's current settings, serialised fresh on each request at `offset: 0`
@@ -321,6 +350,24 @@ wildcards. Like every other op it requires `hello` first.
   `book open`.
 - Other errors: `unsafe book filename`, `could not delete the book`.
 
+## `book` download
+
+```json
+{"op":"start_get","kind":"book","name":"Dune.epub","offset":0,"chunk_size":490,"window":8}
+```
+
+Sends `/Books/<name>` byte for byte through the ordinary frame/ack path, so `offset`, `chunk_size` and `window`
+behave as for every other download and an interrupted download resumes at an aligned `offset`. `status` reports
+`kind: "book"`, `size`, `sent`, and `name` once `state` is `sent`. Like every other op it requires `hello` first.
+
+- `name` follows the `delete_book` rule: a bare `.epub` file name, no folders.
+- It works while that book is open on screen; the file is only read.
+- A `delete_book` for the same book stops the download before deleting.
+- Errors: `unsafe book filename`, `not found`, plus the download errors every kind has.
+
+Support is advertised as `book_download` in the `features` list of the [`about`](#about) download, and `book` is in
+`download_kinds`.
+
 ## `set_dark_mode`
 
 ```json
@@ -347,7 +394,7 @@ Support is advertised as `dark_mode` in the `features` list of the [`about`](#ab
 {"firmware_version":"20260913.1914","running_partition":"app1","update_staged":true,
  "install_at_sleep":true,"staged_version":"20260914.0800","download_chunk_max":490,"dark_mode":false,
  "device_name":"Bluecarrel",
- "features":["book_position","download_window","dark_mode"]}
+ "features":["book_position","download_window","dark_mode","book_uuid","book_download","pair_prompt"]}
 ```
 
 | Field | Type | Meaning |
@@ -360,7 +407,7 @@ Support is advertised as `dark_mode` in the `features` list of the [`about`](#ab
 | `download_chunk_max` | integer | The largest `start_get` `chunk_size` this firmware accepts (`490`). Absent on older firmware, which accepts at most `160`. See [Download frames and acknowledgement](#download-frames-and-acknowledgement). |
 | `dark_mode` | bool | `true` while the reader draws inverted (dark mode). Set with [`set_dark_mode`](#set_dark_mode). Absent on older firmware. |
 | `device_name` | string | The name the reader advertises: its `deviceName` setting, or `Bluecarrel` when that is blank. Absent on older firmware. |
-| `features` | array of strings | Protocol features beyond the upload and download kinds. `book_position`: a `book` upload accepts `position` (see [Opening position](#opening-position)). `download_window`: `start_get` accepts `window` and `get_ack` is cumulative (see [Download frames and acknowledgement](#download-frames-and-acknowledgement)). `dark_mode`: the `set_dark_mode` op is supported and `dark_mode` is reported here. Absent on older firmware. |
+| `features` | array of strings | Protocol features beyond the upload and download kinds. `book_position`: a `book` upload accepts `position` (see [Opening position](#opening-position)). `download_window`: `start_get` accepts `window` and `get_ack` is cumulative (see [Download frames and acknowledgement](#download-frames-and-acknowledgement)). `dark_mode`: the `set_dark_mode` op is supported and `dark_mode` is reported here. `book_uuid`: `start_put` for `book` and `book_meta` accept `calibre_uuid`, and `library` reports it. `book_download`: the `book` download kind (see [`book` download](#book-download)). `pair_prompt`: a closed-window `pair` asks on the reader (see [Pair prompt](#pair-prompt)). Absent on older firmware. |
 
 `about` is not listed in `download_kinds`.
 
@@ -474,6 +521,8 @@ The payload is a JSON array, one object per book:
 | `percent` | number | Progress through the whole book, `0`–`1`, rounded to four decimals. `0` for a book that was never opened. **Display only** — never sync on this. Always present. |
 | `location` | string | The saved position, exactly as the device stores it, hex-encoded. Absent for a book that was never opened. This is the field to sync on. |
 | `timestamp` | number | UTC epoch seconds at which `location` was saved. **Absent means unknown**, not `0`. |
+| `calibre_uuid` | string | The Calibre book UUID. From the book's sidecar (`calibre_uuid` on a `book` or `book_meta` upload) when it has one; otherwise from the EPUB's OPF identifier, only if the reader already indexed the book with this firmware (see below). Absent when unknown. |
+| `fromApp` | bool | The book has a metadata sidecar, i.e. it arrived from the app. |
 | `lastRead` | number | **Never emitted by this firmware.** Use `timestamp`. See below. |
 
 Notes on the fields:
@@ -499,6 +548,11 @@ Notes on the fields:
   any client has set one (see [Device clock](#device-clock)). It is omitted for a book whose position predates this
   firmware, for one whose sidecar was lost, and on a board with no RTC. Absent means unknown, and unknown loses every
   conflict.
+- `calibre_uuid` from the OPF: when the reader indexes an EPUB (the first time it is opened, or after its cache was
+  cleared) and the OPF has a `dc:identifier` with `opf:scheme="calibre"`, `id="calibre_id"` or `id="uuid_id"`
+  (in that order of preference) whose value is a UUID (a `urn:uuid:` or `calibre:` prefix is dropped; 32 hex digits,
+  hyphens optional), it is saved as `calibre_uuid.txt` in the book's cache directory. The listing reads that file; it
+  never opens a book to find one. Books indexed by older firmware have no such file until they are indexed again.
 - `lastRead` is specified as optional and this firmware still never emits it. It asked a vaguer question ("when was
   this book last read") than the sync path needs; `timestamp` answers the precise one and is what clients should use.
 
@@ -1018,7 +1072,7 @@ Status JSON includes capability fields so clients can hide unsupported controls:
   "firmware_ota_supported": true,
   "resume_supported": true,
   "upload_kinds": ["book", "bmp", "firmware", "progress", "catalog_page", "catalog_detail", "settings", "book_meta"],
-  "download_kinds": ["crash_report", "library", "progress_result", "settings"],
+  "download_kinds": ["about", "book", "crash_report", "library", "progress_result", "settings"],
   "store_supported": true,
   "clock_supported": true,
   "device_time": 1725600000
@@ -1028,10 +1082,10 @@ Status JSON includes capability fields so clients can hide unsupported controls:
 `device_time` is present only when the device knows the time; see [Device clock](#device-clock).
 `store_supported` says this firmware speaks the Store request protocol. There is no `"mode"` field: the link is not a
 screen and has no mode. `firmware_ota_supported` means "this reader accepts the `firmware` upload kind"; what it does
-with it is the file drop described above. `download_kinds` does not list `about`, which is still supported. The
+with it is the file drop described above. The
 firmware version is in the [`about`](#about) download, not in `status`.
 
-Features that are not a kind, such as `book_position`, are listed in the `features` array of the
+Features that are not a kind, such as `book_position` or `pair_prompt`, are listed in the `features` array of the
 [`about`](#about) download, not in `status`. After `hello` the `status` read usually exceeds 512 bytes and drops
 `upload_kinds` / `download_kinds`, so do not treat their absence as "unsupported".
 

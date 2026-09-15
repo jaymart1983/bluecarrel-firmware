@@ -80,7 +80,24 @@ struct BookInfo {
   // The book has a progress.bin on disk at all, i.e. it has been opened and read
   // past the start. True for .txt/.md books too, whose `percent` is always 0.
   bool hasLocation = false;
+  // Calibre's book UUID: the sidecar's, else the one the book's own OPF gave when
+  // it was indexed. Empty when neither is on the card.
+  std::string calibreUuid;
 };
+
+// The UUID Epub::parseContentOpf() left in the book's cache directory. One
+// existence check when there is none; no book is opened.
+std::string readCachedCalibreUuid(const std::string& cachePath) {
+  const std::string idPath = cachePath + Epub::CALIBRE_UUID_FILE;
+  if (!Storage.exists(idPath.c_str())) return {};
+  HalFile in;
+  if (!Storage.openFileForRead(TAG, idPath, in)) return {};
+  char buffer[BookLibraryIndex::CALIBRE_UUID_MAX_BYTES + 1] = {};
+  const int read = in.read(buffer, sizeof(buffer));
+  if (read <= 0 || read > static_cast<int>(BookLibraryIndex::CALIBRE_UUID_MAX_BYTES)) return {};
+  std::string uuid(buffer, static_cast<size_t>(read));
+  return BookLibraryIndex::isValidCalibreUuid(uuid) ? uuid : std::string();
+}
 
 // progress.bin is opaque and format-specific; these two parsers mirror exactly
 // what the reader activities write (EpubReaderActivity::loadProgress and
@@ -110,7 +127,9 @@ bool parseXtcProgressPage(const uint8_t* data, const size_t len, uint32_t& page)
   return true;
 }
 
-BookInfo describeBook(const std::string& path, const std::string& fileName) {
+// `withCalibreUuid` also looks in the cache directory for an OPF-derived UUID;
+// only the BLE listing reports it, so the home shelf skips that lookup.
+BookInfo describeBook(const std::string& path, const std::string& fileName, const bool withCalibreUuid) {
   BookInfo info;
 
   // The position first, and independently of metadata: it is the field the sync
@@ -140,6 +159,7 @@ BookInfo describeBook(const std::string& path, const std::string& fileName) {
   if (FsHelpers::hasEpubExtension(fileName)) {
     std::string metaTitle;
     std::string metaAuthor;
+    std::string metaUuid;
     {
       const std::string metaPath = std::string(BOOK_META_DIR) + "/" + fileName + ".json";
       HalFile meta;
@@ -148,9 +168,15 @@ BookInfo describeBook(const std::string& path, const std::string& fileName) {
         if (deserializeJson(doc, meta) == DeserializationError::Ok) {
           metaTitle = doc["title"] | "";
           metaAuthor = doc["author"] | "";
+          metaUuid = doc["calibre_uuid"] | "";
         }
         meta.close();
       }
+    }
+    if (BookLibraryIndex::isValidCalibreUuid(metaUuid)) {
+      info.calibreUuid = std::move(metaUuid);
+    } else if (withCalibreUuid) {
+      info.calibreUuid = readCachedCalibreUuid(cachePath);
     }
     // No saved position means 0%, which needs no derivation either.
     bool haveSavedPercent = !hasLocation;
@@ -309,6 +335,8 @@ bool writeEntry(HalFile& out, bool& first, const std::string& relPath, const uin
   // the device had no clock. An absent `timestamp` means "unknown", which the
   // conflict rule treats as older than any real one.
   if (info.hasTimestamp) doc["timestamp"] = info.timestamp;
+  // The key the app relinks a book by. Omitted when unknown.
+  if (!info.calibreUuid.empty()) doc["calibre_uuid"] = info.calibreUuid;
   // Did this book arrive from the phone, or was it copied onto the card?
   //
   // The phone writes a metadata sidecar (cover + title) beside every book it
@@ -391,18 +419,25 @@ bool walkShelfDirs(const char* booksRoot, const DirVisitor& visit) {
   return true;
 }
 
-bool walkShelf(const char* booksRoot, const BookVisitor& visit) {
+bool walkShelf(const char* booksRoot, const bool withCalibreUuid, const BookVisitor& visit) {
   const std::string root(booksRoot);
   return walkShelfDirs(booksRoot, [&](const std::string& relPath, const BookEntry& book) {
     // Each book is an SD-bound metadata load; a large shelf would otherwise
     // outlast the watchdog window.
     resetTaskWatchdogIfSubscribed();
-    const BookInfo info = describeBook(root + "/" + relPath, book.name);
+    const BookInfo info = describeBook(root + "/" + relPath, book.name, withCalibreUuid);
     return visit(relPath, book, info);
   });
 }
 
 }  // namespace
+
+bool BookLibraryIndex::isValidCalibreUuid(const std::string_view value) {
+  if (value.empty() || value.size() > CALIBRE_UUID_MAX_BYTES) return false;
+  return std::all_of(value.begin(), value.end(), [](const char c) {
+    return (c >= '0' && c <= '9') || (c >= 'A' && c <= 'Z') || (c >= 'a' && c <= 'z') || c == '-';
+  });
+}
 
 bool BookLibraryIndex::build(const char* booksRoot, const char* outPath, Stats* stats) {
   if (!booksRoot || !outPath) return false;
@@ -418,7 +453,8 @@ bool BookLibraryIndex::build(const char* booksRoot, const char* outPath, Stats* 
   bool first = true;
 
   if (ok) {
-    ok = walkShelf(booksRoot, [&](const std::string& relPath, const BookEntry& book, const BookInfo& info) {
+    ok = walkShelf(booksRoot, /*withCalibreUuid=*/true,
+                   [&](const std::string& relPath, const BookEntry& book, const BookInfo& info) {
       if (!writeEntry(out, first, relPath, book.size, info)) {
         LOG_ERR(TAG, "Short write building library index at %s", relPath.c_str());
         return false;
@@ -468,7 +504,8 @@ bool BookLibraryIndex::collectShelf(const char* booksRoot, const size_t limit, s
   if (!booksRoot || limit == 0) return false;
   out.reserve(limit + 1);
 
-  const bool ok = walkShelf(booksRoot, [&](const std::string& relPath, const BookEntry& book, const BookInfo& info) {
+  const bool ok = walkShelf(booksRoot, /*withCalibreUuid=*/false,
+                            [&](const std::string& relPath, const BookEntry& book, const BookInfo& info) {
     ShelfBook candidate;
     candidate.relPath = relPath;
     candidate.title = info.title;

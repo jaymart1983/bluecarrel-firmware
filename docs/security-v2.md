@@ -32,6 +32,11 @@ able to flash their own builds), and an attacker who dumps internal flash over U
 - **Pairing window.** A new bond is accepted only while `BlePairingActivity` is on screen and either no host is paired
   or the user tapped **Pair new phone** on that screen. `onAuthenticationComplete()` for a peer that was not already
   bonded while the window is closed: delete that bond and disconnect.
+- **Pair prompt.** A `pair` on an already bonded link with the window closed is never accepted on its own, because any
+  app on the bonded phone can send it. `BlePairPromptActivity` asks "Pair with <host_name>?" over whatever is on
+  screen; only Allow stores the held request (host id, name, secret), which is kept in RAM for at most 60 s and wiped
+  on any answer. Deny, timeout, or leaving the prompt refuses it (`pairing denied`). At most one prompt per 30 s, none
+  during a lockout; the answer authenticates only the connection that sent the request.
 - **Attempt limit.** Three failed pairing attempts within one window close the window for 60 s (the screen says so).
   Every attempt gets a new passkey.
 - **One bond.** When a new pairing succeeds, delete every other bond. The trusted-host record stays until `pair`
@@ -39,7 +44,7 @@ able to flash their own builds), and an attacker who dumps internal flash over U
 - **One connection.** At most one central connected (`CONFIG_BT_NIMBLE_MAX_CONNECTIONS=1` or equivalent), and
   authentication state is bound to that connection's handle; events from any other handle are ignored.
 - **Hello timeout.** A connection that has not completed a valid `hello` (or `pair`) within 20 s of encryption is
-  disconnected. Three invalid `hello`s on one connection: disconnect.
+  disconnected. The count pauses while a pair prompt for that connection is on screen and restarts after a refusal. Three invalid `hello`s on one connection: disconnect.
 - **Pre-authentication status** (encrypted but before `hello`/`pair` succeeds) carries only `state`,
   `protocol_version` (2), `device_id`, `device_nonce`, `has_trusted_host`, `pairing_window` (bool) and `auth_error`.
   Everything else (book, progress, library, errors, paths) is added only after authentication.
@@ -53,7 +58,8 @@ the phone with Bluetooth permission can use a bonded link) and lets the app veri
   sent as 64 lowercase hex). Stored in **NVS** on the reader (Preferences namespace `bleauth`). On first boot of v2
   firmware, delete `/.crosspoint/ble_trusted_hosts.json` from the SD card; v1 pairings do not carry over.
 - HMAC-SHA256 key: the **32 raw secret bytes** (not the ASCII hex, which v1 used).
-- **pair** — accepted only on an encrypted+authenticated+bonded connection while the pairing window is open:
+- **pair** — accepted only on an encrypted+authenticated+bonded connection while the pairing window is open, or after
+  the user allows it on the pair prompt:
 
   ```json
   {"op":"pair","version":2,"host_id":"…","host_name":"Pixel 9","secret":"<64 hex>"}

@@ -6,10 +6,43 @@
 #include <XmlParserUtils.h>
 
 #include <cctype>
+#include <cstring>
 
 #include "Epub/BookMetadataCache.h"
 
 namespace {
+bool equalsIgnoreCase(const char* a, const char* b) {
+  for (; *a && *b; ++a, ++b) {
+    if (std::tolower(static_cast<unsigned char>(*a)) != std::tolower(static_cast<unsigned char>(*b))) return false;
+  }
+  return *a == *b;
+}
+
+// Calibre's book id when an identifier holds it as a UUID: surrounding space and
+// a "urn:uuid:" or "calibre:" prefix dropped, then 32 hex digits with or without
+// hyphens. Anything else (Calibre's integer library id, an ISBN) yields "".
+std::string calibreUuidFrom(const std::string& raw) {
+  size_t begin = 0;
+  size_t end = raw.size();
+  while (begin < end && std::isspace(static_cast<unsigned char>(raw[begin]))) begin++;
+  while (end > begin && std::isspace(static_cast<unsigned char>(raw[end - 1]))) end--;
+  std::string value = raw.substr(begin, end - begin);
+  for (const char* prefix : {"urn:uuid:", "calibre:"}) {
+    const size_t len = strlen(prefix);
+    if (value.size() > len && equalsIgnoreCase(value.substr(0, len).c_str(), prefix)) value.erase(0, len);
+  }
+  if (value.size() != 32 && value.size() != 36) return {};
+  size_t hexDigits = 0;
+  for (const char c : value) {
+    if (std::isxdigit(static_cast<unsigned char>(c))) {
+      hexDigits++;
+    } else if (c != '-') {
+      return {};
+    }
+  }
+  return hexDigits == 32 ? value : std::string();
+}
+
 constexpr char MEDIA_TYPE_NCX[] = "application/x-dtbncx+xml";
 constexpr char MEDIA_TYPE_CSS[] = "text/css";
 constexpr char MEDIA_TYPE_IMAGE_PREFIX[] = "image/";
@@ -156,6 +189,25 @@ void XMLCALL ContentOpfParser::startElement(void* userData, const XML_Char* name
     LOG_DBG("COF", "Entering guide state.");
     if (!Storage.openFileForRead("COF", self->cachePath + itemCacheFile, self->tempItemStore)) {
       LOG_ERR("COF", "Couldn't open temp items file for reading. This is probably going to be a fatal error.");
+    }
+    return;
+  }
+
+  if (self->state == IN_METADATA && xmlLocalNameEquals(name, "identifier")) {
+    int rank = 0;
+    for (int i = 0; atts[i]; i += 2) {
+      if (xmlLocalNameEquals(atts[i], "scheme") && equalsIgnoreCase(atts[i + 1], "calibre")) {
+        rank = std::max(rank, 3);
+      } else if (strcmp(atts[i], "id") == 0 && strcmp(atts[i + 1], "calibre_id") == 0) {
+        rank = std::max(rank, 2);
+      } else if (strcmp(atts[i], "id") == 0 && strcmp(atts[i + 1], "uuid_id") == 0) {
+        rank = std::max(rank, 1);
+      }
+    }
+    if (rank > self->calibreUuidRank) {
+      self->identifierRank = rank;
+      self->identifierText.clear();
+      self->state = IN_BOOK_IDENTIFIER;
     }
     return;
   }
@@ -356,6 +408,12 @@ void XMLCALL ContentOpfParser::characterData(void* userData, const XML_Char* s, 
     self->language.append(s, len);
     return;
   }
+
+  if (self->state == IN_BOOK_IDENTIFIER) {
+    // A UUID with a prefix is under 64 bytes; anything much longer is not one.
+    if (self->identifierText.size() + static_cast<size_t>(len) <= 128) self->identifierText.append(s, len);
+    return;
+  }
 }
 
 void XMLCALL ContentOpfParser::endElement(void* userData, const XML_Char* name) {
@@ -386,6 +444,17 @@ void XMLCALL ContentOpfParser::endElement(void* userData, const XML_Char* name) 
   }
 
   if (self->state == IN_BOOK_AUTHOR && xmlLocalNameEquals(name, "creator")) {
+    self->state = IN_METADATA;
+    return;
+  }
+
+  if (self->state == IN_BOOK_IDENTIFIER && xmlLocalNameEquals(name, "identifier")) {
+    std::string uuid = calibreUuidFrom(self->identifierText);
+    if (!uuid.empty()) {
+      self->calibreUuid = std::move(uuid);
+      self->calibreUuidRank = self->identifierRank;
+    }
+    self->identifierText.clear();
     self->state = IN_METADATA;
     return;
   }

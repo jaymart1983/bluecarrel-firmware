@@ -119,6 +119,9 @@ struct Entry {
   std::string published;  ///< year
   std::string language;
   std::string tags;       ///< comma-joined
+  // book_meta only: Calibre's book UUID, as sent (at most 65 bytes kept, so an
+  // over-long value still fails BleLink's check). Empty when absent.
+  std::string calibreUuid;
 };
 
 struct Page {

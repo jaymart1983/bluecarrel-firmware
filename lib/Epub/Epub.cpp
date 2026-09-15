@@ -75,6 +75,20 @@ bool Epub::parseContentOpf(BookMetadataCache::BookMetadata& bookMetadata, const 
     return false;
   }
 
+  // Beside book.bin rather than in it, so the cache version does not change. The
+  // CSS-rebuild re-parse only writes it when it is missing.
+  if (!opfParser.calibreUuid.empty()) {
+    const std::string idPath = cachePath + CALIBRE_UUID_FILE;
+    if (writeSpineEntries || !Storage.exists(idPath.c_str())) {
+      HalFile idFile;
+      if (!Storage.openFileForWrite("EBP", idPath, idFile) ||
+          idFile.write(reinterpret_cast<const uint8_t*>(opfParser.calibreUuid.data()), opfParser.calibreUuid.size()) !=
+              opfParser.calibreUuid.size()) {
+        LOG_ERR("EBP", "Could not write %s", idPath.c_str());
+      }
+    }
+  }
+
   // Grab data from opfParser into epub. Normalize titles to NFC so NFD (combining
   // mark) text renders correctly — the device fonts have no mark positioning.
   bookMetadata.title = utf8ComposeNfc(opfParser.title);

@@ -16,6 +16,7 @@
 #include <memory>
 #include <string>
 
+#include "BleTrustedHostStore.h"
 #include "util/BookProgressSync.h"
 
 class BleStoreController;
@@ -126,6 +127,20 @@ class BleLink {
   // Drops the last refusal, so Settings shows no stale error. Main loop only.
   void clearAuthError();
   bool isPeerConnected() const;
+
+  // --- pairing consent -------------------------------------------------------
+  // A valid `pair` that arrives while the window is closed is held here until the
+  // person holding the reader answers BlePairPromptActivity. Main loop only.
+  //
+  // True once per held request: main.cpp pushes the prompt when it sees it.
+  bool takePairPromptRequest();
+  bool pairPromptPending() const { return pendingPairActive_; }
+  // The sanitised host_name of the held request.
+  const std::string& pairPromptHostName() const { return pendingPair_.name; }
+  // Allow applies the held request as if the window had been open; deny refuses
+  // it with auth_error "pairing denied". Nothing happens when none is held.
+  void resolvePairPrompt(bool allow);
+
   // The gate is open: a phone is connected AND authenticated.
   bool isAuthenticated() const { return sessionAuthenticated(); }
   // Advertises SETTINGS' device name (the default when blank) as the GAP name and
@@ -246,6 +261,25 @@ class BleLink {
   static constexpr unsigned long HELLO_TIMEOUT_MS = 20UL * 1000UL;
   // From connection to a secure link; long enough to type a passkey.
   static constexpr unsigned long SECURE_LINK_TIMEOUT_MS = 90UL * 1000UL;
+  // A held `pair` is refused when nobody answers the prompt within this.
+  static constexpr unsigned long PAIR_PROMPT_TIMEOUT_MS = 60UL * 1000UL;
+  // At most one prompt starts per interval; `pair` in between is refused.
+  static constexpr unsigned long PAIR_PROMPT_INTERVAL_MS = 30UL * 1000UL;
+
+  // The `pair` awaiting consent (secret included). Wiped by clearPendingPair().
+  BleTrustedHost pendingPair_;
+  bool pendingPairActive_ = false;
+  // The connection that sent it is still the one up. Cleared by any connect or
+  // disconnect, so an answer never authenticates a different connection.
+  bool pendingPairLinkAlive_ = false;
+  bool pairPromptRequested_ = false;
+  bool pairPromptStarted_ = false;
+  unsigned long pendingPairAtMs_ = 0;
+  unsigned long lastPairPromptAtMs_ = 0;
+  void clearPendingPair();
+  // Stores `host` as the trusted host and closes the window; with
+  // `authenticateSession`, also marks this connection paired and authenticated.
+  bool applyPair(const BleTrustedHost& host, bool authenticateSession);
 
   // Shared with the NimBLE host task.
   std::atomic<uint16_t> connHandle_{NO_CONNECTION};
@@ -377,6 +411,9 @@ class BleLink {
   bool positionGiven_ = false;
   bool positionApplied_ = false;
   std::string positionLocation_;
+  // The `calibre_uuid` a book start_put carried, stored in the sidecar at commit.
+  // Reset per transfer.
+  std::string calibreUuid_;
   uint32_t positionTimestamp_ = 0;
   uint16_t positionPercentBp_ = 0;
   BookProgressSync::SpineJump positionJump_;
@@ -416,6 +453,8 @@ class BleLink {
   // than holding the document in RAM for the length of a chunked transfer.
   void startSettingsDownload(size_t offset, size_t chunkSize);
   void startAboutDownload(size_t offset, size_t chunkSize);
+  // One EPUB from /Books by bare name, read-only (allowed while it is open).
+  void startBookDownload(const std::string& name, size_t offset, size_t chunkSize);
   // Parses a committed settings document and applies it. Returns false with
   // the error already set when the document is unusable.
   bool applySettingsDocument();

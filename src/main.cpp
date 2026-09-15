@@ -33,6 +33,7 @@
 #include "RecentBooksStore.h"
 #include "SdCardFontSystem.h"
 #include "activities/settings/FirmwareReadyActivity.h"
+#include "activities/settings/BlePairPromptActivity.h"
 #include "activities/Activity.h"
 #include "activities/ActivityManager.h"
 #include "activities/settings/SdFirmwareUpdateActivity.h"
@@ -1178,6 +1179,16 @@ void loop() {
     }
   }
 
+#endif
+
+#if FREEINK_CAP_BLE_TRANSFER
+  // A phone sent `pair` with the pairing window closed. Asked over whatever is on
+  // screen, a book included, the way the firmware offer below is; BleLink refuses
+  // the request itself if nobody answers within its deadline.
+  if (!activityManager.preventAutoSleep() && BLE_LINK.takePairPromptRequest()) {
+    activityManager.pushActivity(std::make_unique<BlePairPromptActivity>(renderer, mappedInputManager));
+    return;
+  }
 #endif
 
   // A verified image is waiting. Offered at once, over whatever is on screen --

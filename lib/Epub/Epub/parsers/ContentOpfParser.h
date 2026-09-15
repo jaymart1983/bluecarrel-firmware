@@ -18,6 +18,7 @@ class ContentOpfParser final : public Print {
     IN_BOOK_TITLE,
     IN_BOOK_AUTHOR,
     IN_BOOK_LANGUAGE,
+    IN_BOOK_IDENTIFIER,
     IN_MANIFEST,
     IN_SPINE,
     IN_GUIDE,
@@ -32,6 +33,11 @@ class ContentOpfParser final : public Print {
   HalFile tempItemStore;
   std::string coverItemId;
   bool hasExplicitStartReference = false;
+  // The dc:identifier being read and how strongly its attributes mark it as
+  // Calibre's (3 opf:scheme="calibre", 2 id="calibre_id", 1 id="uuid_id").
+  std::string identifierText;
+  int identifierRank = 0;
+  int calibreUuidRank = 0;
 
   // Index for fast idref→href lookup (binary search over .items.bin)
   struct ItemIndexEntry {
@@ -60,6 +66,8 @@ class ContentOpfParser final : public Print {
   std::string title;
   std::string author;
   std::string language;
+  // Calibre's book UUID from a dc:identifier, empty when the OPF has none.
+  std::string calibreUuid;
   std::string tocNcxPath;
   std::string tocNavPath;  // EPUB 3 nav document path
   std::string coverItemHref;

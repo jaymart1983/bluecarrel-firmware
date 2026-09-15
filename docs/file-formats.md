@@ -1,6 +1,9 @@
 # File Formats
 
 These formats describe the SD-card cache files under `/.crosspoint/epub_<hash>/`.
+
+`calibre_uuid.txt`, when present, is plain text: the Calibre book UUID taken from the OPF when the book was indexed
+(see `library` in `ble-transfer-protocol.md`). It is not part of `book.bin`, so it has no version of its own.
 All POD fields are written in the ESP32 little-endian representation used by
 `Serialization.h`; strings are length-prefixed UTF-8.
 

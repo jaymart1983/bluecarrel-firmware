@@ -394,6 +394,11 @@ Support is advertised as `dark_mode` in the `features` list of the [`about`](#ab
 {"firmware_version":"20260913.1914","running_partition":"app1","update_staged":true,
  "install_at_sleep":true,"staged_version":"20260914.0800","download_chunk_max":490,"dark_mode":false,
  "device_name":"Bluecarrel",
+ "link":{"interval_ms":15,"latency":0,"timeout_ms":4000,"tx_octets":251,"rx_octets":251,"dl_reported":true,"phy":"2M"},
+ "last_upload":{"kind":"firmware","bytes":4677152,"ms":135800,"frames":9430,"min_msys_free":9,"min_acl_free":6,
+  "max_queue":12,"sd_ms":3100,"sd_max_ms":40,"loop_ms":900,"max_gap_ms":180,"frames_per_s_max":70,
+  "frames_per_s_avg":68,"tick_gap_max_ms":45,"acks":197,"ack_notify_avg_ms":12,"ack_notify_max_ms":60,
+  "ack_queue_max_ms":20,"notify_failed":0,"ack_shed":0,"renders":5,"render_ms":1200},
  "features":["book_position","download_window","dark_mode","book_uuid","book_download","pair_prompt"]}
 ```
 
@@ -407,9 +412,55 @@ Support is advertised as `dark_mode` in the `features` list of the [`about`](#ab
 | `download_chunk_max` | integer | The largest `start_get` `chunk_size` this firmware accepts (`490`). Absent on older firmware, which accepts at most `160`. See [Download frames and acknowledgement](#download-frames-and-acknowledgement). |
 | `dark_mode` | bool | `true` while the reader draws inverted (dark mode). Set with [`set_dark_mode`](#set_dark_mode). Absent on older firmware. |
 | `device_name` | string | The name the reader advertises: its `deviceName` setting, or `Bluecarrel` when that is blank. Absent on older firmware. |
+| `link` | object | The connection as it is now; absent when no phone is connected. See [`link`](#link-and-last_upload). |
+| `last_upload` | object | Measurements of the last `book`, `bmp` or `firmware` upload since boot. Absent before one. See [`last_upload`](#link-and-last_upload). |
 | `features` | array of strings | Protocol features beyond the upload and download kinds. `book_position`: a `book` upload accepts `position` (see [Opening position](#opening-position)). `download_window`: `start_get` accepts `window` and `get_ack` is cumulative (see [Download frames and acknowledgement](#download-frames-and-acknowledgement)). `dark_mode`: the `set_dark_mode` op is supported and `dark_mode` is reported here. `book_uuid`: `start_put` for `book` and `book_meta` accept `calibre_uuid`, and `library` reports it. `book_download`: the `book` download kind (see [`book` download](#book-download)). `pair_prompt`: a closed-window `pair` asks on the reader (see [Pair prompt](#pair-prompt)). Absent on older firmware. |
 
 `about` is not listed in `download_kinds`.
+
+### `link` and `last_upload`
+
+Diagnostics for transfer speed. Both are measurements, not protocol: a client must not change what it sends because
+of them. Older firmware omits both objects.
+
+`link` is recorded on connect and on every connection update, PHY update and LL data length change. The reader also
+logs each change at INFO (`link connected: ...`, `link updated: ...`, `link phy: ...`, `link data length: ...`).
+
+| Field | Type | Meaning |
+| --- | --- | --- |
+| `interval_ms` | number | Connection interval in ms (1.25 ms units, so `7.5`, `11.25`, `15` ...). |
+| `latency` | integer | Peripheral latency, in connection events. |
+| `timeout_ms` | integer | Supervision timeout in ms. |
+| `tx_octets`, `rx_octets` | integer | LL data length in force, reader to phone and phone to reader. |
+| `dl_reported` | bool | `false` until the controller reports an LE Data Length Change; `tx_octets`/`rx_octets` are then the 27-octet LL default. |
+| `phy` | string | `1M`, `2M` or `coded`; `tx/rx` (e.g. `2M/1M`) when the directions differ. |
+
+`last_upload` covers one upload from `start_put` to `commit`. The reader logs the same numbers at INFO in two lines
+(`upload <kind>: ...` and `upload loop: ...`) when the commit starts.
+
+| Field | Type | Meaning |
+| --- | --- | --- |
+| `kind` | string | `book`, `bmp` or `firmware`. |
+| `bytes` | integer | Payload bytes received. |
+| `ms` | integer | `start_put` to `commit`. |
+| `frames` | integer | Data frames that arrived. |
+| `min_msys_free` | integer | Fewest free NimBLE msys blocks, sampled in the data write callback. |
+| `min_acl_free` | integer | Fewest free blocks in the host transport's controller-to-host ACL pool (`transport_pool_acl`). At `0` the transport stalls 10 ms per retry. Absent when the pool is not found. |
+| `max_queue` | integer | Deepest the reader's BLE event queue got (limit 192 events / 32 KB). |
+| `sd_ms` | integer | Main loop time writing the upload to the card: buffered writes plus the commit flush and close. |
+| `sd_max_ms` | integer | Longest single buffered write. |
+| `loop_ms` | integer | Main loop time handling data frames, excluding SD writes (sequence checks, SHA-256, copying). |
+| `max_gap_ms` | integer | Longest gap between two consecutive data frames arriving. |
+| `frames_per_s_max` | integer | Most data frames that arrived in one one-second bucket. |
+| `frames_per_s_avg` | integer | Frames per second from the first frame to the last. |
+| `tick_gap_max_ms` | integer | Longest gap between two main loop link ticks during the upload. |
+| `acks` | integer | Ack boundaries (every `ack_bytes`, and the last byte) whose status notification was sent. |
+| `ack_notify_avg_ms`, `ack_notify_max_ms` | integer | From the frame that crossed an ack boundary arriving to the status notification carrying `received` being handed to the stack. |
+| `ack_queue_max_ms` | integer | The part of that spent waiting in the event queue. |
+| `notify_failed` | integer | Ack notifications the stack did not take (no buffer, or not subscribed). |
+| `ack_shed` | integer | Ack notifications that went out without `received`. |
+| `renders` | integer | Screen renders completed during the upload. |
+| `render_ms` | integer | Their total duration. |
 
 ## Firmware updates
 

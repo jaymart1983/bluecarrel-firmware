@@ -73,6 +73,11 @@ class ActivityManager {
   // This variable must only be set by the main loop, to avoid race conditions
   std::atomic<bool> requestedUpdate{false};
 
+  // Completed renders and their summed duration since boot. Written by the render
+  // task only.
+  std::atomic<uint32_t> completedRenders{0};
+  std::atomic<uint32_t> renderMillis{0};
+
  public:
   explicit ActivityManager(GfxRenderer& renderer, MappedInputManager& mappedInput)
       : renderer(renderer), mappedInput(mappedInput), renderingMutex(xSemaphoreCreateMutex()) {
@@ -83,6 +88,9 @@ class ActivityManager {
 
   void begin();
   void loop();
+
+  uint32_t renderCount() const { return completedRenders.load(std::memory_order_relaxed); }
+  uint32_t renderTotalMs() const { return renderMillis.load(std::memory_order_relaxed); }
 
   // Will replace currentActivity and drop all activities on stack
   void replaceActivity(std::unique_ptr<Activity>&& newActivity);

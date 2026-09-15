@@ -806,6 +806,8 @@ class ServerCallbacks final : public NimBLEServerCallbacks {
     // corrects it a moment later. Recorded either way so a peer that never
     // exchanges is sized for honestly rather than optimistically.
     link_.noteBleMtu(connInfo.getMTU());
+    link_.noteConnParams(handle, connInfo.getConnInterval(), connInfo.getConnLatency(), connInfo.getConnTimeout(),
+                         true);
     link_.enqueueBleConnected(handle);
   }
 
@@ -813,12 +815,11 @@ class ServerCallbacks final : public NimBLEServerCallbacks {
     if (connInfo.getConnHandle() == link_.boundConnection()) link_.noteBleMtu(mtu);
   }
 
-  void onPhyUpdate(NimBLEConnInfo&, const uint8_t txPhy, const uint8_t rxPhy) override {
-    // Logged because it is otherwise invisible: a transfer that runs at half the
-    // expected rate looks like a slow phone rather than a link that quietly
-    // stayed on 1M.
-    LOG_INF("BLE", "PHY now tx=%s rx=%s", txPhy == BLE_GAP_LE_PHY_2M ? "2M" : "1M",
-            rxPhy == BLE_GAP_LE_PHY_2M ? "2M" : "1M");
+  void onPhyUpdate(NimBLEConnInfo& connInfo, const uint8_t txPhy, const uint8_t rxPhy) override {
+    // Logged (by notePhy) because it is otherwise invisible: a transfer that runs
+    // at half the expected rate looks like a slow phone rather than a link that
+    // quietly stayed on 1M.
+    link_.notePhy(connInfo.getConnHandle(), txPhy, rxPhy);
   }
 
   void onDisconnect(NimBLEServer*, NimBLEConnInfo& connInfo, int reason) override {
@@ -922,6 +923,68 @@ class DataCallbacks final : public NimBLECharacteristicCallbacks {
   BleLink& link_;
 };
 
+const char* phyName(const uint8_t phy) {
+  switch (phy) {
+    case BLE_GAP_LE_PHY_1M:
+      return "1M";
+    case BLE_GAP_LE_PHY_2M:
+      return "2M";
+    case BLE_GAP_LE_PHY_CODED:
+      return "coded";
+    default:
+      return "?";
+  }
+}
+
+// The host transport's controller-to-host ACL pool (nimble/transport/src/transport.c).
+// When it is empty, esp_nimble_hci.c ble_hci_rx_acl() waits 10 ms and retries,
+// holding up the controller's delivery of every later packet. Looked up per upload:
+// a stack restart re-creates the pools.
+os_mempool* gAclPool = nullptr;
+
+os_mempool* findAclPool() {
+  os_mempool_info info;
+  for (os_mempool* mp = os_mempool_info_get_next(nullptr, &info); mp != nullptr;
+       mp = os_mempool_info_get_next(mp, &info)) {
+    if (strcmp(info.omi_name, "transport_pool_acl") == 0) return mp;
+  }
+  return nullptr;
+}
+
+// A GAP listener beside NimBLEServer's own handler, for what the server callbacks
+// do not carry: a connection update's status, and the LE Data Length Change event
+// the host leaves undispatched (MYNEWT_VAL_BLE_HS_GAP_UNHANDLED_HCI_EVENT).
+int onGapEventForLink(ble_gap_event* event, void* arg) {
+  auto& link = *static_cast<BleLink*>(arg);
+  switch (event->type) {
+    case BLE_GAP_EVENT_CONN_UPDATE: {
+      if (event->conn_update.status != 0) {
+        LOG_INF("BLE", "link: connection update failed (status %d)", event->conn_update.status);
+        break;
+      }
+      ble_gap_conn_desc desc{};
+      if (ble_gap_conn_find(event->conn_update.conn_handle, &desc) == 0) {
+        link.noteConnParams(desc.conn_handle, desc.conn_itvl, desc.conn_latency, desc.supervision_timeout, false);
+      }
+      break;
+    }
+#if MYNEWT_VAL(BLE_HS_GAP_UNHANDLED_HCI_EVENT)
+    case BLE_GAP_EVENT_UNHANDLED_HCI_EVENT: {
+      ble_hci_ev_le_subev_data_len_chg ev{};
+      if (!event->unhandled_hci.is_le_meta || event->unhandled_hci.length < sizeof(ev)) break;
+      // Packed little-endian HCI fields; the ESP32 targets are little-endian.
+      memcpy(&ev, event->unhandled_hci.ev, sizeof(ev));
+      if (ev.subev_code != BLE_HCI_LE_SUBEV_DATA_LEN_CHG) break;
+      link.noteDataLength(ev.conn_handle, ev.max_tx_octets, ev.max_tx_time, ev.max_rx_octets, ev.max_rx_time);
+      break;
+    }
+#endif
+    default:
+      break;
+  }
+  return 0;
+}
+
 }  // namespace
 
 struct BleLinkRuntime {
@@ -944,6 +1007,9 @@ struct BleLinkRuntime {
   bool begin() {
     const std::string name = SETTINGS.effectiveDeviceName();
     NimBLEDevice::init(name);
+    if (!NimBLEDevice::setCustomGapHandler(onGapEventForLink, &link)) {
+      LOG_ERR("BLE", "link parameter listener not registered");
+    }
     // LE Secure Connections with bonding and MITM protection by passkey entry:
     // the reader displays the passkey, the phone types it.
     NimBLEDevice::setSecurityAuth(true, true, true);
@@ -1017,8 +1083,9 @@ struct BleLinkRuntime {
 
   bool hasPeer() const { return server != nullptr && server->getConnectedCount() > 0; }
 
-  void publish(const std::string& readJson, const std::string& notifyJson) {
-    if (!status) return;
+  // False when no notification went out.
+  bool publish(const std::string& readJson, const std::string& notifyJson) {
+    if (!status) return false;
     // Two different payloads on one characteristic. setValue() is what a GATT
     // read returns; notify(buffer, length) sends *that* buffer instead of the
     // stored value, so the doorbell can be small while the read stays whole.
@@ -1038,7 +1105,7 @@ struct BleLinkRuntime {
       // bonded: treated as not subscribed.
       LOG_DBG("BLE", "status: read %u bytes, no secure peer -- notify skipped",
               static_cast<unsigned>(readJson.size()));
-      return;
+      return false;
     }
     if (notifyJson.empty()) {
       // buildNotifyJson() could not fit even {"state":"..."} in the cap. See the
@@ -1047,12 +1114,12 @@ struct BleLinkRuntime {
       LOG_DBG("BLE", "status: read %u bytes, cap %u (mtu %u) -- too small to notify",
               static_cast<unsigned>(readJson.size()), static_cast<unsigned>(notifyCap),
               static_cast<unsigned>(mtu));
-      return;
+      return false;
     }
     LOG_DBG("BLE", "status: notify %u bytes, read %u bytes, cap %u (mtu %u)",
             static_cast<unsigned>(notifyJson.size()), static_cast<unsigned>(readJson.size()),
             static_cast<unsigned>(notifyCap), static_cast<unsigned>(mtu));
-    status->notify(reinterpret_cast<const uint8_t*>(notifyJson.data()), notifyJson.size(), handle);
+    return status->notify(reinterpret_cast<const uint8_t*>(notifyJson.data()), notifyJson.size(), handle);
   }
 
   // False when the stack did not take the frame (no buffer, not subscribed, no
@@ -1271,6 +1338,13 @@ void BleLink::end() {
 }
 
 void BleLink::tick() {
+  if (transferOpen_) {
+    const unsigned long nowMs = millis();
+    if (uploadLoop_.lastTickMs != 0 && nowMs - uploadLoop_.lastTickMs > uploadLoop_.maxTickGapMs) {
+      uploadLoop_.maxTickGapMs = nowMs - uploadLoop_.lastTickMs;
+    }
+    uploadLoop_.lastTickMs = nowMs;
+  }
   // Heartbeat. Only while a phone is actually listening: notifying into an
   // empty room costs radio and tells nobody anything.
   if (isPeerConnected()) {
@@ -1576,6 +1650,10 @@ void BleLink::publishStatusNow() {
 void BleLink::enqueueBleEvent(BleEvent event) {
   if (!eventMutex_) return;
   const size_t eventBytes = event.value.size();
+  const bool isData = event.type == BleEventType::DATA;
+  const int msysFree = isData ? os_msys_num_free() : 0;
+  const unsigned long nowMs = millis();
+  event.atMs = nowMs;
   xSemaphoreTake(eventMutex_, portMAX_DELAY);
   if (bleEventOverflow_ || bleEvents_.size() >= MAX_QUEUED_BLE_EVENTS ||
       queuedBleEventBytes_ + eventBytes > MAX_QUEUED_BLE_EVENT_BYTES) {
@@ -1586,8 +1664,27 @@ void BleLink::enqueueBleEvent(BleEvent event) {
     queuedBleEventBytes_ += eventBytes;
     // Data frames are drained on the loop's normal cadence; only a control write
     // is worth ending the loop's sleep for.
-    const bool wake = event.type != BleEventType::DATA;
+    const bool wake = !isData;
     bleEvents_.push_back(std::move(event));
+    if (isData && uploadArrivals_.active) {
+      UploadArrivals& a = uploadArrivals_;
+      if (a.frames == 0) {
+        a.firstMs = nowMs;
+        a.bucketStartMs = nowMs;
+      } else if (nowMs - a.lastMs > a.maxGapMs) {
+        a.maxGapMs = nowMs - a.lastMs;
+      }
+      if (nowMs - a.bucketStartMs >= 1000UL) {
+        a.bucketMaxFrames = std::max(a.bucketMaxFrames, a.bucketFrames);
+        a.bucketFrames = 0;
+        a.bucketStartMs += (nowMs - a.bucketStartMs) / 1000UL * 1000UL;
+      }
+      a.bucketFrames++;
+      a.frames++;
+      a.lastMs = nowMs;
+      if (a.minMsysFree < 0 || msysFree < a.minMsysFree) a.minMsysFree = msysFree;
+      a.maxQueue = std::max(a.maxQueue, bleEvents_.size());
+    }
     if (wake && eventSignal_) xSemaphoreGive(eventSignal_);
   }
   xSemaphoreGive(eventMutex_);
@@ -1687,7 +1784,11 @@ void BleLink::processBleEvents() {
         if (fromSecureLink) onControlWrite(event.value);
         break;
       case BleEventType::DATA:
-        if (fromSecureLink) onDataWrite(event.value);
+        if (fromSecureLink) {
+          const unsigned long startUs = micros();
+          onDataWrite(event.value, event.atMs);
+          uploadLoop_.dataUs += micros() - startUs;
+        }
         break;
     }
   }
@@ -2323,6 +2424,7 @@ void BleLink::onControlWrite(const std::string& value) {
     removePartOnExit_ = true;
     lastProgressStatusBytes_ = receivedBytes_;
     lastDisplayProgressBytes_ = receivedBytes_;
+    beginUploadStats();
     setState(State::RECEIVING);
     // The store's own deadline ends here: from now on the transfer path reports
     // progress and owns the failure, so the screen shows bytes rather than a
@@ -2443,14 +2545,19 @@ bool BleLink::flushUploadBuffer() {
   if (uploadBufferUsed_ == 0) return true;
   const size_t used = uploadBufferUsed_;
   uploadBufferUsed_ = 0;
-  if (!uploadFile_ || uploadFile_.write(uploadBuffer_.get(), used) != used) {
+  const unsigned long startUs = micros();
+  const bool written = uploadFile_ && uploadFile_.write(uploadBuffer_.get(), used) == used;
+  const unsigned long elapsedUs = micros() - startUs;
+  uploadLoop_.sdUs += elapsedUs;
+  if (elapsedUs > uploadLoop_.sdMaxUs) uploadLoop_.sdMaxUs = elapsedUs;
+  if (!written) {
     LOG_ERR("BLE", "upload write of %u bytes failed", static_cast<unsigned>(used));
     return false;
   }
   return true;
 }
 
-void BleLink::onDataWrite(const std::string& value) {
+void BleLink::onDataWrite(const std::string& value, const unsigned long arrivalMs) {
   if (!transferOpen_ || state_ != State::RECEIVING) return;
   if (value.size() <= sizeof(uint32_t)) {
     setError("invalid data frame");
@@ -2494,6 +2601,12 @@ void BleLink::onDataWrite(const std::string& value) {
   if (receivedBytes_ == expectedSize_ || receivedBytes_ - lastProgressStatusBytes_ >= uploadAckBytes_) {
     lastProgressStatusBytes_ = receivedBytes_;
     statusDirty_ = true;
+    // The earliest boundary not yet notified; publishStatus() closes it.
+    if (!uploadLoop_.ackPending) {
+      uploadLoop_.ackPending = true;
+      uploadLoop_.ackArrivalMs = arrivalMs;
+      uploadLoop_.ackTakenMs = millis();
+    }
   }
   const size_t displayInterval = transferKind_ == TransferKind::FIRMWARE ? BLE_FIRMWARE_PROGRESS_DISPLAY_INTERVAL_BYTES
                                                                          : BLE_PROGRESS_DISPLAY_INTERVAL_BYTES;
@@ -2506,14 +2619,160 @@ void BleLink::onDataWrite(const std::string& value) {
   }
 }
 
+void BleLink::noteConnParams(const uint16_t connHandle, const uint16_t intervalUnits, const uint16_t latency,
+                             const uint16_t timeoutUnits, const bool connected) {
+  if (!eventMutex_ || connHandle != connHandle_.load()) return;
+  xSemaphoreTake(eventMutex_, portMAX_DELAY);
+  if (connected) {
+    linkParams_ = LinkParams{};
+    // A connection made from legacy advertising starts on LE 1M.
+    linkParams_.txPhy = BLE_GAP_LE_PHY_1M;
+    linkParams_.rxPhy = BLE_GAP_LE_PHY_1M;
+  }
+  linkParams_.valid = true;
+  linkParams_.intervalUnits = intervalUnits;
+  linkParams_.latency = latency;
+  linkParams_.timeoutUnits = timeoutUnits;
+  const LinkParams params = linkParams_;
+  xSemaphoreGive(eventMutex_);
+  logLinkParams(params, connected ? "connected" : "updated");
+}
+
+void BleLink::notePhy(const uint16_t connHandle, const uint8_t txPhy, const uint8_t rxPhy) {
+  if (!eventMutex_ || connHandle != connHandle_.load()) return;
+  xSemaphoreTake(eventMutex_, portMAX_DELAY);
+  linkParams_.txPhy = txPhy;
+  linkParams_.rxPhy = rxPhy;
+  const LinkParams params = linkParams_;
+  xSemaphoreGive(eventMutex_);
+  logLinkParams(params, "phy");
+}
+
+void BleLink::noteDataLength(const uint16_t connHandle, const uint16_t txOctets, const uint16_t txTimeUs,
+                             const uint16_t rxOctets, const uint16_t rxTimeUs) {
+  if (!eventMutex_ || connHandle != connHandle_.load()) return;
+  xSemaphoreTake(eventMutex_, portMAX_DELAY);
+  linkParams_.dataLengthReported = true;
+  linkParams_.txOctets = txOctets;
+  linkParams_.txTimeUs = txTimeUs;
+  linkParams_.rxOctets = rxOctets;
+  linkParams_.rxTimeUs = rxTimeUs;
+  const LinkParams params = linkParams_;
+  xSemaphoreGive(eventMutex_);
+  logLinkParams(params, "data length");
+}
+
+void BleLink::logLinkParams(const LinkParams& params, const char* cause) const {
+  const unsigned intervalCentiMs = static_cast<unsigned>(params.intervalUnits) * 125U;
+  LOG_INF("BLE", "link %s: interval %u (%u.%02u ms), latency %u, timeout %u (%u ms), phy tx %s rx %s, "
+          "data length tx %u/%u us rx %u/%u us%s",
+          cause, static_cast<unsigned>(params.intervalUnits), intervalCentiMs / 100U, intervalCentiMs % 100U,
+          static_cast<unsigned>(params.latency), static_cast<unsigned>(params.timeoutUnits),
+          static_cast<unsigned>(params.timeoutUnits) * 10U, phyName(params.txPhy), phyName(params.rxPhy),
+          static_cast<unsigned>(params.txOctets), static_cast<unsigned>(params.txTimeUs),
+          static_cast<unsigned>(params.rxOctets), static_cast<unsigned>(params.rxTimeUs),
+          params.dataLengthReported ? "" : " (LL default)");
+}
+
+void BleLink::beginUploadStats() {
+  uploadLoop_ = UploadLoopStats{};
+  uploadLoop_.startMs = millis();
+  uploadLoop_.renderCountAtStart = activityManager.renderCount();
+  uploadLoop_.renderMsAtStart = activityManager.renderTotalMs();
+  gAclPool = findAclPool();
+  // Restart the pool's low-water mark for this upload. The transport updates it
+  // inside its own critical section; racing that costs at most one sample.
+  if (gAclPool) gAclPool->mp_min_free = gAclPool->mp_num_free;
+  if (!eventMutex_) return;
+  xSemaphoreTake(eventMutex_, portMAX_DELAY);
+  uploadArrivals_ = UploadArrivals{};
+  uploadArrivals_.active = true;
+  xSemaphoreGive(eventMutex_);
+}
+
+void BleLink::finishUploadStats(const uint64_t dataSdUs) {
+  UploadArrivals arrivals;
+  if (eventMutex_) {
+    xSemaphoreTake(eventMutex_, portMAX_DELAY);
+    arrivals = uploadArrivals_;
+    uploadArrivals_.active = false;
+    xSemaphoreGive(eventMutex_);
+  }
+  if (transferKind_ != TransferKind::BOOK && transferKind_ != TransferKind::BMP &&
+      transferKind_ != TransferKind::FIRMWARE) {
+    return;
+  }
+  const UploadLoopStats& stats = uploadLoop_;
+  LastUpload u;
+  u.valid = true;
+  u.kind = transferKind_;
+  u.bytes = receivedBytes_;
+  u.ms = millis() - stats.startMs;
+  u.frames = arrivals.frames;
+  u.minMsysFree = arrivals.minMsysFree;
+  u.minAclFree = gAclPool ? static_cast<int>(gAclPool->mp_min_free) : -1;
+  u.maxQueue = arrivals.maxQueue;
+  u.sdMs = static_cast<unsigned long>(stats.sdUs / 1000U);
+  u.sdMaxMs = stats.sdMaxUs / 1000UL;
+  u.loopMs = static_cast<unsigned long>((stats.dataUs > dataSdUs ? stats.dataUs - dataSdUs : 0) / 1000U);
+  u.maxGapMs = arrivals.maxGapMs;
+  u.maxTickGapMs = stats.maxTickGapMs;
+  // The last bucket is partial, so it can only lower the maximum's claim, never inflate it.
+  u.framesPerSecMax = std::max(arrivals.bucketMaxFrames, arrivals.bucketFrames);
+  const unsigned long spanMs = arrivals.lastMs - arrivals.firstMs;
+  u.framesPerSecAvg = arrivals.frames > 1 && spanMs > 0
+                          ? static_cast<uint32_t>((arrivals.frames - 1) * 1000ULL / spanMs)
+                          : arrivals.frames;
+  u.acks = stats.acks;
+  u.ackAvgMs = stats.acks > 0 ? static_cast<unsigned long>(stats.ackSumMs / stats.acks) : 0;
+  u.ackMaxMs = stats.ackMaxMs;
+  u.ackQueueMaxMs = stats.ackQueueMaxMs;
+  u.notifyFailed = stats.notifyFailed;
+  u.ackShed = stats.ackShed;
+  u.renders = activityManager.renderCount() - stats.renderCountAtStart;
+  u.renderMs = activityManager.renderTotalMs() - stats.renderMsAtStart;
+  lastUpload_ = u;
+  // Two lines: a log entry is capped at 256 bytes (lib/Logging/Logging.cpp).
+  LOG_INF("BLE", "upload %s: %u B, %u frames, %lu ms; arrivals %u/s avg %u/s max, gap max %lu ms; msys min %d, "
+          "acl min %d, queue max %u",
+          transferKindName(u.kind).c_str(), static_cast<unsigned>(u.bytes), static_cast<unsigned>(u.frames), u.ms,
+          static_cast<unsigned>(u.framesPerSecAvg), static_cast<unsigned>(u.framesPerSecMax), u.maxGapMs,
+          u.minMsysFree, u.minAclFree, static_cast<unsigned>(u.maxQueue));
+  LOG_INF("BLE", "upload loop: %lu ms + sd %lu ms (max %lu ms), tick gap max %lu ms, renders %u (%lu ms); acks %u, "
+          "ack to notify avg %lu max %lu ms (queued max %lu ms), notify failed %u, shed %u",
+          u.loopMs, u.sdMs, u.sdMaxMs, u.maxTickGapMs, static_cast<unsigned>(u.renders), u.renderMs,
+          static_cast<unsigned>(u.acks), u.ackAvgMs, u.ackMaxMs, u.ackQueueMaxMs,
+          static_cast<unsigned>(u.notifyFailed), static_cast<unsigned>(u.ackShed));
+}
+
+void BleLink::noteAckPublished(const bool notified, const std::string& notifyJson) {
+  UploadLoopStats& stats = uploadLoop_;
+  stats.ackPending = false;
+  const unsigned long latencyMs = millis() - stats.ackArrivalMs;
+  const unsigned long queuedMs = stats.ackTakenMs - stats.ackArrivalMs;
+  stats.acks++;
+  stats.ackSumMs += latencyMs;
+  if (latencyMs > stats.ackMaxMs) stats.ackMaxMs = latencyMs;
+  if (queuedMs > stats.ackQueueMaxMs) stats.ackQueueMaxMs = queuedMs;
+  if (!notified) {
+    stats.notifyFailed++;
+  } else if (notifyJson.find("\"received\":") == std::string::npos) {
+    stats.ackShed++;
+  }
+}
+
 void BleLink::processCommit() {
   if (!transferOpen_) return;
   setState(State::VERIFYING);
 
+  const uint64_t dataSdUs = uploadLoop_.sdUs;
   const bool buffered = flushUploadBuffer();
+  const unsigned long closeStartUs = micros();
   uploadFile_.flush();
   uploadFile_.close();
+  uploadLoop_.sdUs += micros() - closeStartUs;
   transferOpen_ = false;
+  finishUploadStats(dataSdUs);
   if (!buffered) {
     setError("transfer write failed");
     resetTransfer(true);
@@ -2842,6 +3101,51 @@ void BleLink::startAboutDownload(const size_t offset, const size_t chunkSize) {
     doc["download_chunk_max"] = BLE_DOWNLOAD_CHUNK_BYTES_MAX;
     doc["dark_mode"] = SETTINGS.screenInverted != 0;
     doc["device_name"] = SETTINGS.effectiveDeviceName();
+    // Transfer measurements: the link in force and the last payload upload.
+    LinkParams link;
+    if (eventMutex_) {
+      xSemaphoreTake(eventMutex_, portMAX_DELAY);
+      link = linkParams_;
+      xSemaphoreGive(eventMutex_);
+    }
+    if (link.valid && isPeerConnected()) {
+      JsonObject l = doc["link"].to<JsonObject>();
+      l["interval_ms"] = link.intervalUnits * 1.25f;
+      l["latency"] = link.latency;
+      l["timeout_ms"] = static_cast<unsigned>(link.timeoutUnits) * 10U;
+      l["tx_octets"] = link.txOctets;
+      l["rx_octets"] = link.rxOctets;
+      l["dl_reported"] = link.dataLengthReported;
+      std::string phy = phyName(link.txPhy);
+      if (link.rxPhy != link.txPhy) phy += std::string("/") + phyName(link.rxPhy);
+      l["phy"] = phy;
+    }
+    if (lastUpload_.valid) {
+      const LastUpload& u = lastUpload_;
+      JsonObject j = doc["last_upload"].to<JsonObject>();
+      j["kind"] = transferKindName(u.kind);
+      j["bytes"] = u.bytes;
+      j["ms"] = u.ms;
+      j["frames"] = u.frames;
+      j["min_msys_free"] = u.minMsysFree;
+      if (u.minAclFree >= 0) j["min_acl_free"] = u.minAclFree;
+      j["max_queue"] = u.maxQueue;
+      j["sd_ms"] = u.sdMs;
+      j["sd_max_ms"] = u.sdMaxMs;
+      j["loop_ms"] = u.loopMs;
+      j["max_gap_ms"] = u.maxGapMs;
+      j["frames_per_s_max"] = u.framesPerSecMax;
+      j["frames_per_s_avg"] = u.framesPerSecAvg;
+      j["tick_gap_max_ms"] = u.maxTickGapMs;
+      j["acks"] = u.acks;
+      j["ack_notify_avg_ms"] = u.ackAvgMs;
+      j["ack_notify_max_ms"] = u.ackMaxMs;
+      j["ack_queue_max_ms"] = u.ackQueueMaxMs;
+      j["notify_failed"] = u.notifyFailed;
+      j["ack_shed"] = u.ackShed;
+      j["renders"] = u.renders;
+      j["render_ms"] = u.renderMs;
+    }
     // Protocol features beyond the upload and download kinds. Here rather than in
     // `status`, whose read already sheds its capability lists to fit 512 bytes.
     JsonArray features = doc["features"].to<JsonArray>();
@@ -3434,7 +3738,9 @@ void BleLink::notifySleeping() {
 void BleLink::publishStatus() {
   statusDirty_ = false;
   if (!ble_) return;
-  ble_->publish(buildReadJson(), buildNotifyJson(notifyCapBytes()));
+  const std::string notifyJson = buildNotifyJson(notifyCapBytes());
+  const bool notified = ble_->publish(buildReadJson(), notifyJson);
+  if (uploadLoop_.ackPending) noteAckPublished(notified, notifyJson);
 
   // Repaint whatever is on screen when the BLE indicator would change. Every
   // header draws that indicator, but observers are single-slot and the Store or

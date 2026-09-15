@@ -75,7 +75,10 @@ void ActivityManager::renderTaskLoop() {
       // Night mode is a global output polarity applied to every activity.
       // The sleep screen forces normal polarity itself (SleepActivity).
       display.setInverted(SETTINGS.screenInverted != 0);
+      const unsigned long renderStartMs = millis();
       currentActivity->render(std::move(lock));
+      renderMillis.fetch_add(static_cast<uint32_t>(millis() - renderStartMs), std::memory_order_relaxed);
+      completedRenders.fetch_add(1, std::memory_order_relaxed);
     }
     // Notify any task blocked in requestUpdateAndWait() that the render is done.
     TaskHandle_t waiter = nullptr;

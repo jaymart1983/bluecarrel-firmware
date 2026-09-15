@@ -224,6 +224,15 @@ class BleLink {
   // the live connection what the MTU actually is and uses this when there is no
   // connection to ask.
   void noteBleMtu(uint16_t mtu);
+  // Link parameters in force, from the NimBLE host task: on connect (`connected`,
+  // which also resets PHY and data length to their LL defaults) and on every
+  // connection update, PHY update and data length change. Each is logged and
+  // reported as `link` in `about`. Ignored for any handle but the bound one.
+  void noteConnParams(uint16_t connHandle, uint16_t intervalUnits, uint16_t latency, uint16_t timeoutUnits,
+                      bool connected);
+  void notePhy(uint16_t connHandle, uint8_t txPhy, uint8_t rxPhy);
+  void noteDataLength(uint16_t connHandle, uint16_t txOctets, uint16_t txTimeUs, uint16_t rxOctets,
+                      uint16_t rxTimeUs);
   // The most a notification may carry right now: ATT_MTU-3, never more than
   // BLE_STATUS_NOTIFY_MAX_BYTES. Public because the runtime sizes frames by it.
   size_t notifyCapBytes() const;
@@ -252,6 +261,7 @@ class BleLink {
     uint16_t connHandle = NO_CONNECTION;
     bool accepted = false;
     bool newBond = false;
+    unsigned long atMs = 0;  ///< millis() when the host task queued it
   };
 
   static constexpr uint8_t MAX_FAILED_PAIRINGS = 3;
@@ -386,6 +396,98 @@ class BleLink {
   bool pendingCommit_ = false;
   bool statusDirty_ = true;
 
+  // --- transfer measurements (`about` link and last_upload) -----------------
+  // LL data length before any Data Length Change event (Core Vol 6 Part B 4.5.10).
+  static constexpr uint16_t LL_DEFAULT_OCTETS = 27;
+  static constexpr uint16_t LL_DEFAULT_TIME_US = 328;
+  struct LinkParams {
+    bool valid = false;
+    // A Data Length Change event arrived; until then the octets are the LL default.
+    bool dataLengthReported = false;
+    uint16_t intervalUnits = 0;  ///< 1.25 ms units
+    uint16_t latency = 0;
+    uint16_t timeoutUnits = 0;  ///< 10 ms units
+    uint8_t txPhy = 0;          ///< BLE_GAP_LE_PHY_1M / _2M / _CODED; 0 until known
+    uint8_t rxPhy = 0;
+    uint16_t txOctets = LL_DEFAULT_OCTETS;
+    uint16_t txTimeUs = LL_DEFAULT_TIME_US;
+    uint16_t rxOctets = LL_DEFAULT_OCTETS;
+    uint16_t rxTimeUs = LL_DEFAULT_TIME_US;
+  };
+  // Written by the host task, read by the main loop; both under eventMutex_.
+  LinkParams linkParams_;
+  void logLinkParams(const LinkParams& params, const char* cause) const;
+
+  // Data frames of the upload in progress as they arrive, counted in the data
+  // write callback under eventMutex_.
+  struct UploadArrivals {
+    bool active = false;
+    uint32_t frames = 0;
+    unsigned long firstMs = 0;
+    unsigned long lastMs = 0;
+    unsigned long maxGapMs = 0;
+    unsigned long bucketStartMs = 0;  ///< start of the current one-second bucket
+    uint32_t bucketFrames = 0;
+    uint32_t bucketMaxFrames = 0;
+    int minMsysFree = -1;  ///< -1 until the first frame
+    size_t maxQueue = 0;
+  };
+  UploadArrivals uploadArrivals_;
+  // The same upload as the main loop handles it. Main loop only.
+  struct UploadLoopStats {
+    unsigned long startMs = 0;
+    uint64_t dataUs = 0;  ///< in onDataWrite, SD writes included
+    uint64_t sdUs = 0;    ///< in flushUploadBuffer, plus the commit flush and close
+    unsigned long sdMaxUs = 0;
+    unsigned long lastTickMs = 0;
+    unsigned long maxTickGapMs = 0;
+    // The frame that crossed an ack boundary and is not yet notified: when the
+    // host task queued it and when onDataWrite took it off the queue.
+    bool ackPending = false;
+    unsigned long ackArrivalMs = 0;
+    unsigned long ackTakenMs = 0;
+    uint32_t acks = 0;
+    uint64_t ackSumMs = 0;
+    unsigned long ackMaxMs = 0;
+    unsigned long ackQueueMaxMs = 0;
+    uint32_t notifyFailed = 0;  ///< the ack's status notify did not go out
+    uint32_t ackShed = 0;       ///< it went out without `received`
+    uint32_t renderCountAtStart = 0;
+    uint32_t renderMsAtStart = 0;
+  };
+  UploadLoopStats uploadLoop_;
+  // The last book, bmp or firmware upload, reported as `last_upload` in `about`.
+  struct LastUpload {
+    bool valid = false;
+    TransferKind kind = TransferKind::NONE;
+    size_t bytes = 0;
+    unsigned long ms = 0;
+    uint32_t frames = 0;
+    int minMsysFree = -1;
+    int minAclFree = -1;
+    size_t maxQueue = 0;
+    unsigned long sdMs = 0;
+    unsigned long sdMaxMs = 0;
+    unsigned long loopMs = 0;
+    unsigned long maxGapMs = 0;
+    unsigned long maxTickGapMs = 0;
+    uint32_t framesPerSecMax = 0;
+    uint32_t framesPerSecAvg = 0;
+    uint32_t acks = 0;
+    unsigned long ackAvgMs = 0;
+    unsigned long ackMaxMs = 0;
+    unsigned long ackQueueMaxMs = 0;
+    uint32_t notifyFailed = 0;
+    uint32_t ackShed = 0;
+    uint32_t renders = 0;
+    unsigned long renderMs = 0;
+  };
+  LastUpload lastUpload_;
+  void beginUploadStats();
+  // `dataSdUs`: the part of uploadLoop_.sdUs spent inside onDataWrite.
+  void finishUploadStats(uint64_t dataSdUs);
+  void noteAckPublished(bool notified, const std::string& notifyJson);
+
   // Cached answers to "what is this reader holding, and where is it?", so the
   // status can carry them without doing the work on every publish. The library
   // fingerprint is a directory walk (tens of ms for hundreds of books) and is
@@ -443,7 +545,8 @@ class BleLink {
   void checkConnectionDeadlines();
   void disconnectPeer(const char* reason);
   void onControlWrite(const std::string& value);
-  void onDataWrite(const std::string& value);
+  // `arrivalMs`: when the host task queued the frame.
+  void onDataWrite(const std::string& value, unsigned long arrivalMs);
   void processCommit();
   void startFileDownload(const char* path, const char* name, TransferKind kind, size_t offset, size_t chunkSize);
   void startCrashReportDownload(size_t offset, size_t chunkSize);

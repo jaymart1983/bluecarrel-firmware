@@ -394,11 +394,13 @@ Support is advertised as `dark_mode` in the `features` list of the [`about`](#ab
 {"firmware_version":"20260913.1914","running_partition":"app1","update_staged":true,
  "install_at_sleep":true,"staged_version":"20260914.0800","download_chunk_max":490,"dark_mode":false,
  "device_name":"Bluecarrel",
- "link":{"interval_ms":15,"latency":0,"timeout_ms":4000,"tx_octets":251,"rx_octets":251,"dl_reported":true,"phy":"2M"},
+ "link":{"interval_ms":7.5,"latency":0,"timeout_ms":4000,"tx_octets":251,"rx_octets":251,"dl_reported":true,"phy":"2M",
+  "requested":{"min_ms":7.5,"max_ms":7.5,"result":"accepted"}},
  "last_upload":{"kind":"firmware","bytes":4677152,"ms":135800,"frames":9430,"min_msys_free":9,"min_acl_free":6,
   "max_queue":12,"sd_ms":3100,"sd_max_ms":40,"loop_ms":900,"max_gap_ms":180,"frames_per_s_max":70,
   "frames_per_s_avg":68,"tick_gap_max_ms":45,"acks":197,"ack_notify_avg_ms":12,"ack_notify_max_ms":60,
-  "ack_queue_max_ms":20,"notify_failed":0,"ack_shed":0,"renders":5,"render_ms":1200},
+  "ack_queue_max_ms":20,"notify_failed":0,"ack_shed":0,"renders":5,"render_ms":1200,
+  "itvl_min_ms":7.5,"itvl_max_ms":15,"requested":{"min_ms":7.5,"max_ms":7.5,"result":"accepted"}},
  "features":["book_position","download_window","dark_mode","book_uuid","book_download","pair_prompt"]}
 ```
 
@@ -434,6 +436,24 @@ logs each change at INFO (`link connected: ...`, `link updated: ...`, `link phy:
 | `tx_octets`, `rx_octets` | integer | LL data length in force, reader to phone and phone to reader. |
 | `dl_reported` | bool | `false` until the controller reports an LE Data Length Change; `tx_octets`/`rx_octets` are then the 27-octet LL default. |
 | `phy` | string | `1M`, `2M` or `coded`; `tx/rx` (e.g. `2M/1M`) when the directions differ. |
+| `requested` | object | The reader's last connection parameter request: `min_ms`, `max_ms`, `result` and, for `refused` or `not_sent`, `status` (NimBLE host error code). Absent before the first request. |
+
+`result` is `pending` (no connection update event yet), `accepted` (an update completed inside the requested range),
+`other` (an update completed outside it: the phone chose its own interval), `refused` (the update event failed, e.g.
+a link layer collision with the phone's own update or an L2CAP rejection), `not_sent` (the host refused the request,
+e.g. another update still pending) or `no_answer` (no update event within 10 s).
+
+The reader asks for its own interval (latency 0, 4 s supervision timeout):
+
+- On connect: 7.5 ms.
+- When a bulk transfer is running (a `book`, `bmp` or `firmware` upload, or a `book` or `library` download) and the
+  interval is above 7.5 ms: 7.5 ms. If the phone refuses or picks another interval, the next attempt widens the maximum
+  to 11.25 ms, then 15 ms; a link layer collision repeats the same request. At most four attempts per transfer period.
+- 3 s after the last bulk transfer ends (10 s after connecting when none has run), if the interval is below 30 ms:
+  30-50 ms, at most twice.
+- Never while a request is pending, and at least 2 s after the previous request.
+
+Each request and its outcome are logged at INFO (`link request <n> (<why>): ...`, `link request <n>: <result> ...`).
 
 `last_upload` covers one upload from `start_put` to `commit`. The reader logs the same numbers at INFO in two lines
 (`upload <kind>: ...` and `upload loop: ...`) when the commit starts.
@@ -459,6 +479,8 @@ logs each change at INFO (`link connected: ...`, `link updated: ...`, `link phy:
 | `ack_queue_max_ms` | integer | The part of that spent waiting in the event queue. |
 | `notify_failed` | integer | Ack notifications the stack did not take (no buffer, or not subscribed). |
 | `ack_shed` | integer | Ack notifications that went out without `received`. |
+| `itvl_min_ms`, `itvl_max_ms` | number | Shortest and longest connection interval in force at any point during the upload. |
+| `requested` | object | The reader's last connection parameter request when the upload finished, as in `link`. |
 | `renders` | integer | Screen renders completed during the upload. |
 | `render_ms` | integer | Their total duration. |
 

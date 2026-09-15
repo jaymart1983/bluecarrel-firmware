@@ -8,6 +8,7 @@
 #include <Memory.h>
 #include <NimBLEDevice.h>
 #include <esp_mac.h>
+#include <nimble/nimble/transport/include/nimble/transport.h>
 #include <nimble/porting/nimble/include/os/os_mbuf.h>
 #include <esp_ota_ops.h>
 #include <esp_random.h>
@@ -777,7 +778,9 @@ class ServerCallbacks final : public NimBLEServerCallbacks {
     }
     LOG_INF("BLE", "connected (handle=%u encrypted=%d bonded=%d)", static_cast<unsigned>(handle),
             connInfo.isEncrypted(), connInfo.isBonded());
-    // 7.5-15 ms interval, no slave latency, 4 s supervision timeout.
+    // 7.5 ms interval, no slave latency, 4 s supervision timeout, so discovery,
+    // security and the first sync run fast. BleLink::updateLinkInterval() relaxes it
+    // once no transfer runs and asks again for 7.5 ms when one starts.
     //
     // The timeout was 1.2 s (120 units). That is legal but tight: it is the
     // window in which the link layer's own heartbeat -- a packet every
@@ -790,7 +793,7 @@ class ServerCallbacks final : public NimBLEServerCallbacks {
     // Latency stays 0: the peripheral answers every event, which is what keeps
     // a notification prompt and a transfer fast. The cost is the modem floor
     // while awake, which is already the price of the radio being always on.
-    server->updateConnParams(handle, 6, 12, 0, 400);
+    link_.requestLinkInterval(handle, BleLink::LINK_FAST_ITVL_UNITS, BleLink::LINK_FAST_ITVL_UNITS, "connect");
     server->setDataLen(handle, 251);
     // BLE 5.0 2M PHY: double the symbol rate, which is the only throughput lever
     // left on this link. The interval is already at the 7.5 ms spec minimum and
@@ -938,17 +941,21 @@ const char* phyName(const uint8_t phy) {
 
 // The host transport's controller-to-host ACL pool (nimble/transport/src/transport.c).
 // When it is empty, esp_nimble_hci.c ble_hci_rx_acl() waits 10 ms and retries,
-// holding up the controller's delivery of every later packet. Looked up per upload:
-// a stack restart re-creates the pools.
+// holding up the controller's delivery of every later packet. The pool object is
+// static in transport.c, so once found it stays valid.
 os_mempool* gAclPool = nullptr;
 
+// Not found by name: esp_nimble_hci_init() registers the pool, then nimble_port_init()
+// re-initialises the mempool list (os_mempool_module_init), which drops it. An mbuf
+// borrowed from the pool names it instead.
 os_mempool* findAclPool() {
-  os_mempool_info info;
-  for (os_mempool* mp = os_mempool_info_get_next(nullptr, &info); mp != nullptr;
-       mp = os_mempool_info_get_next(mp, &info)) {
-    if (strcmp(info.omi_name, "transport_pool_acl") == 0) return mp;
-  }
-  return nullptr;
+  os_mbuf* om = ble_transport_alloc_acl_from_ll();
+  if (!om) return nullptr;
+  os_mempool* pool = om->om_omp ? om->om_omp->omp_pool : nullptr;
+  // Freed as a host block: an LL-flagged free is reported to host flow control.
+  OS_MBUF_PKTHDR(om)->omp_flags = 0;
+  os_mbuf_free_chain(om);
+  return pool;
 }
 
 // A GAP listener beside NimBLEServer's own handler, for what the server callbacks
@@ -958,13 +965,16 @@ int onGapEventForLink(ble_gap_event* event, void* arg) {
   auto& link = *static_cast<BleLink*>(arg);
   switch (event->type) {
     case BLE_GAP_EVENT_CONN_UPDATE: {
+      const uint16_t handle = event->conn_update.conn_handle;
       if (event->conn_update.status != 0) {
         LOG_INF("BLE", "link: connection update failed (status %d)", event->conn_update.status);
+        link.noteConnUpdate(handle, event->conn_update.status, 0);
         break;
       }
       ble_gap_conn_desc desc{};
-      if (ble_gap_conn_find(event->conn_update.conn_handle, &desc) == 0) {
+      if (ble_gap_conn_find(handle, &desc) == 0) {
         link.noteConnParams(desc.conn_handle, desc.conn_itvl, desc.conn_latency, desc.supervision_timeout, false);
+        link.noteConnUpdate(desc.conn_handle, 0, desc.conn_itvl);
       }
       break;
     }
@@ -1360,6 +1370,7 @@ void BleLink::tick() {
 
   processBleEvents();
   checkConnectionDeadlines();
+  updateLinkInterval();
 
   // A delete waiting on its book to close (delete_book with close:true).
   if (!pendingDeletePath_.empty()) {
@@ -1807,6 +1818,12 @@ void BleLink::onBleConnected(const uint16_t connHandle) {
   pendingPairLinkAlive_ = false;
   connectedAtMs_ = millis();
   securedAtMs_ = 0;
+  // The connect callback already asked for the fast interval.
+  linkMode_ = LinkMode::FAST;
+  linkAttempts_ = 1;
+  linkFastStep_ = 0;
+  linkLastBulkMs_ = connectedAtMs_;
+  linkConnectHold_ = true;
   setState(State::CONNECTED);
 }
 
@@ -1833,6 +1850,7 @@ void BleLink::adoptNewBond(const std::string& peerIdAddress) {
 
 void BleLink::onBleDisconnected(const uint16_t) {
   pendingPairLinkAlive_ = false;
+  linkMode_ = LinkMode::NONE;
   // The Store is live or it is nothing: with the link gone there is no
   // catalogue to show, so it drops what it had rather than leaving a page on
   // screen that no longer describes anything reachable.
@@ -2633,9 +2651,160 @@ void BleLink::noteConnParams(const uint16_t connHandle, const uint16_t intervalU
   linkParams_.intervalUnits = intervalUnits;
   linkParams_.latency = latency;
   linkParams_.timeoutUnits = timeoutUnits;
+  if (uploadArrivals_.active) {
+    if (uploadArrivals_.itvlMinUnits == 0 || intervalUnits < uploadArrivals_.itvlMinUnits) {
+      uploadArrivals_.itvlMinUnits = intervalUnits;
+    }
+    if (intervalUnits > uploadArrivals_.itvlMaxUnits) uploadArrivals_.itvlMaxUnits = intervalUnits;
+  }
   const LinkParams params = linkParams_;
   xSemaphoreGive(eventMutex_);
   logLinkParams(params, connected ? "connected" : "updated");
+}
+
+void BleLink::requestLinkInterval(const uint16_t connHandle, const uint16_t minUnits, const uint16_t maxUnits,
+                                  const char* why) {
+  if (!eventMutex_ || connHandle == NO_CONNECTION) return;
+  // Pending before the call: the host task can settle it before the call returns.
+  xSemaphoreTake(eventMutex_, portMAX_DELAY);
+  const uint32_t seq = ++linkRequestSeq_;
+  linkRequest_.seq = seq;
+  linkRequest_.minUnits = minUnits;
+  linkRequest_.maxUnits = maxUnits;
+  linkRequest_.result = LinkRequestResult::PENDING;
+  linkRequest_.status = 0;
+  linkRequest_.atMs = millis();
+  xSemaphoreGive(eventMutex_);
+
+  ble_gap_upd_params params{};
+  params.itvl_min = minUnits;
+  params.itvl_max = maxUnits;
+  params.latency = 0;
+  params.supervision_timeout = LINK_TIMEOUT_UNITS;
+  params.min_ce_len = BLE_GAP_INITIAL_CONN_MIN_CE_LEN;
+  params.max_ce_len = BLE_GAP_INITIAL_CONN_MAX_CE_LEN;
+  // BLE_HS_EALREADY while the stack still holds an earlier update for this connection.
+  const int rc = ble_gap_update_params(connHandle, &params);
+  if (rc != 0) {
+    xSemaphoreTake(eventMutex_, portMAX_DELAY);
+    if (linkRequest_.seq == seq && linkRequest_.result == LinkRequestResult::PENDING) {
+      linkRequest_.result = LinkRequestResult::NOT_SENT;
+      linkRequest_.status = rc;
+    }
+    xSemaphoreGive(eventMutex_);
+  }
+  const unsigned minCentiMs = static_cast<unsigned>(minUnits) * 125U;
+  const unsigned maxCentiMs = static_cast<unsigned>(maxUnits) * 125U;
+  LOG_INF("BLE", "link request %u (%s): interval %u.%02u-%u.%02u ms, rc %d", static_cast<unsigned>(seq), why,
+          minCentiMs / 100U, minCentiMs % 100U, maxCentiMs / 100U, maxCentiMs % 100U, rc);
+}
+
+void BleLink::noteConnUpdate(const uint16_t connHandle, const int status, const uint16_t intervalUnits) {
+  if (!eventMutex_ || connHandle != connHandle_.load()) return;
+  xSemaphoreTake(eventMutex_, portMAX_DELAY);
+  // ble_gap_rx_update_complete() closes NimBLE's own pending update on any update
+  // complete event, so the first event after a request settles it -- even one the
+  // phone started; the interval check then says whose parameters won.
+  const bool settles = linkRequest_.seq != 0 && linkRequest_.result == LinkRequestResult::PENDING;
+  if (settles) {
+    if (status != 0) {
+      linkRequest_.result = LinkRequestResult::REFUSED;
+      linkRequest_.status = status;
+    } else {
+      linkRequest_.result = intervalUnits >= linkRequest_.minUnits && intervalUnits <= linkRequest_.maxUnits
+                                ? LinkRequestResult::ACCEPTED
+                                : LinkRequestResult::OTHER;
+    }
+  }
+  const LinkRequest request = linkRequest_;
+  xSemaphoreGive(eventMutex_);
+  if (settles) {
+    LOG_INF("BLE", "link request %u: %s (status %d, interval %u)", static_cast<unsigned>(request.seq),
+            linkRequestResultName(request.result), status, static_cast<unsigned>(intervalUnits));
+  }
+}
+
+const char* BleLink::linkRequestResultName(const LinkRequestResult result) {
+  switch (result) {
+    case LinkRequestResult::PENDING:
+      return "pending";
+    case LinkRequestResult::ACCEPTED:
+      return "accepted";
+    case LinkRequestResult::OTHER:
+      return "other";
+    case LinkRequestResult::REFUSED:
+      return "refused";
+    case LinkRequestResult::NOT_SENT:
+      return "not_sent";
+    case LinkRequestResult::NO_ANSWER:
+      return "no_answer";
+  }
+  return "?";
+}
+
+// Fast while a bulk transfer runs, idle LINK_IDLE_AFTER_MS after the last one. At most
+// one request per LINK_REQUEST_GAP_MS, never while one is pending, and a bounded
+// number per period, so a phone that keeps its own interval is not asked forever.
+void BleLink::updateLinkInterval() {
+  const uint16_t handle = connHandle_.load();
+  if (handle == NO_CONNECTION || !linkSecure_.load() || !eventMutex_ || linkMode_ == LinkMode::NONE) return;
+  const unsigned long nowMs = millis();
+  const bool bulk = ((transferOpen_ || pendingCommit_) &&
+                     (transferKind_ == TransferKind::BOOK || transferKind_ == TransferKind::BMP ||
+                      transferKind_ == TransferKind::FIRMWARE)) ||
+                    (downloadOpen_ && (transferKind_ == TransferKind::BOOK || transferKind_ == TransferKind::LIBRARY));
+  if (bulk) {
+    linkLastBulkMs_ = nowMs;
+    linkConnectHold_ = false;
+  }
+  const unsigned long holdMs = linkConnectHold_ ? LINK_CONNECT_HOLD_MS : LINK_IDLE_AFTER_MS;
+  const LinkMode wanted = bulk || nowMs - linkLastBulkMs_ < holdMs ? LinkMode::FAST : LinkMode::IDLE;
+
+  xSemaphoreTake(eventMutex_, portMAX_DELAY);
+  if (linkRequest_.result == LinkRequestResult::PENDING && linkRequest_.seq != 0 &&
+      nowMs - linkRequest_.atMs >= LINK_REQUEST_STALE_MS) {
+    linkRequest_.result = LinkRequestResult::NO_ANSWER;
+  }
+  const LinkRequest request = linkRequest_;
+  const uint16_t intervalUnits = linkParams_.valid ? linkParams_.intervalUnits : 0;
+  xSemaphoreGive(eventMutex_);
+  if ((request.seq != 0 && request.result == LinkRequestResult::PENDING) || intervalUnits == 0) return;
+
+  if (wanted != linkMode_) {
+    linkMode_ = wanted;
+    linkAttempts_ = 0;
+    linkFastStep_ = 0;
+    // An outcome of the other mode's request says nothing about this one.
+    linkOutcomeSeq_ = request.seq;
+  }
+  if (request.seq != linkOutcomeSeq_) {
+    linkOutcomeSeq_ = request.seq;
+    // LL Procedure Collision (0x23) or Different Transaction Collision (0x2A): the
+    // phone's own update was in progress. The same request is worth repeating.
+    const bool collision = request.result == LinkRequestResult::REFUSED &&
+                           (request.status == BLE_HS_ERR_HCI_BASE + 0x23 || request.status == BLE_HS_ERR_HCI_BASE + 0x2A);
+    if (request.result != LinkRequestResult::ACCEPTED && !collision) {
+      if (linkMode_ == LinkMode::IDLE) {
+        linkAttempts_ = LINK_IDLE_ATTEMPTS_MAX;
+      } else if (linkFastStep_ + 1U < LINK_FAST_MAX_UNITS.size()) {
+        linkFastStep_++;
+      } else {
+        linkAttempts_ = LINK_FAST_ATTEMPTS_MAX;
+      }
+    }
+  }
+  if (nowMs - request.atMs < LINK_REQUEST_GAP_MS) return;
+
+  if (linkMode_ == LinkMode::FAST) {
+    const uint16_t maxUnits = LINK_FAST_MAX_UNITS[linkFastStep_];
+    if (intervalUnits <= maxUnits || linkAttempts_ >= LINK_FAST_ATTEMPTS_MAX) return;
+    linkAttempts_++;
+    requestLinkInterval(handle, LINK_FAST_ITVL_UNITS, maxUnits, bulk ? "transfer" : "hold");
+  } else {
+    if (intervalUnits >= LINK_IDLE_MIN_UNITS || linkAttempts_ >= LINK_IDLE_ATTEMPTS_MAX) return;
+    linkAttempts_++;
+    requestLinkInterval(handle, LINK_IDLE_MIN_UNITS, LINK_IDLE_MAX_UNITS, "idle");
+  }
 }
 
 void BleLink::notePhy(const uint16_t connHandle, const uint8_t txPhy, const uint8_t rxPhy) {
@@ -2679,7 +2848,7 @@ void BleLink::beginUploadStats() {
   uploadLoop_.startMs = millis();
   uploadLoop_.renderCountAtStart = activityManager.renderCount();
   uploadLoop_.renderMsAtStart = activityManager.renderTotalMs();
-  gAclPool = findAclPool();
+  if (!gAclPool) gAclPool = findAclPool();
   // Restart the pool's low-water mark for this upload. The transport updates it
   // inside its own critical section; racing that costs at most one sample.
   if (gAclPool) gAclPool->mp_min_free = gAclPool->mp_num_free;
@@ -2687,15 +2856,19 @@ void BleLink::beginUploadStats() {
   xSemaphoreTake(eventMutex_, portMAX_DELAY);
   uploadArrivals_ = UploadArrivals{};
   uploadArrivals_.active = true;
+  uploadArrivals_.itvlMinUnits = linkParams_.intervalUnits;
+  uploadArrivals_.itvlMaxUnits = linkParams_.intervalUnits;
   xSemaphoreGive(eventMutex_);
 }
 
 void BleLink::finishUploadStats(const uint64_t dataSdUs) {
   UploadArrivals arrivals;
+  LinkRequest request;
   if (eventMutex_) {
     xSemaphoreTake(eventMutex_, portMAX_DELAY);
     arrivals = uploadArrivals_;
     uploadArrivals_.active = false;
+    request = linkRequest_;
     xSemaphoreGive(eventMutex_);
   }
   if (transferKind_ != TransferKind::BOOK && transferKind_ != TransferKind::BMP &&
@@ -2712,6 +2885,9 @@ void BleLink::finishUploadStats(const uint64_t dataSdUs) {
   u.minMsysFree = arrivals.minMsysFree;
   u.minAclFree = gAclPool ? static_cast<int>(gAclPool->mp_min_free) : -1;
   u.maxQueue = arrivals.maxQueue;
+  u.itvlMinUnits = arrivals.itvlMinUnits;
+  u.itvlMaxUnits = arrivals.itvlMaxUnits;
+  u.request = request;
   u.sdMs = static_cast<unsigned long>(stats.sdUs / 1000U);
   u.sdMaxMs = stats.sdMaxUs / 1000UL;
   u.loopMs = static_cast<unsigned long>((stats.dataUs > dataSdUs ? stats.dataUs - dataSdUs : 0) / 1000U);
@@ -2743,6 +2919,10 @@ void BleLink::finishUploadStats(const uint64_t dataSdUs) {
           u.loopMs, u.sdMs, u.sdMaxMs, u.maxTickGapMs, static_cast<unsigned>(u.renders), u.renderMs,
           static_cast<unsigned>(u.acks), u.ackAvgMs, u.ackMaxMs, u.ackQueueMaxMs,
           static_cast<unsigned>(u.notifyFailed), static_cast<unsigned>(u.ackShed));
+  LOG_INF("BLE", "upload link: interval %u-%u units; request %u: %u-%u units %s", static_cast<unsigned>(u.itvlMinUnits),
+          static_cast<unsigned>(u.itvlMaxUnits), static_cast<unsigned>(request.seq),
+          static_cast<unsigned>(request.minUnits), static_cast<unsigned>(request.maxUnits),
+          linkRequestResultName(request.result));
 }
 
 void BleLink::noteAckPublished(const bool notified, const std::string& notifyJson) {
@@ -3103,11 +3283,19 @@ void BleLink::startAboutDownload(const size_t offset, const size_t chunkSize) {
     doc["device_name"] = SETTINGS.effectiveDeviceName();
     // Transfer measurements: the link in force and the last payload upload.
     LinkParams link;
+    LinkRequest request;
     if (eventMutex_) {
       xSemaphoreTake(eventMutex_, portMAX_DELAY);
       link = linkParams_;
+      request = linkRequest_;
       xSemaphoreGive(eventMutex_);
     }
+    const auto putRequest = [](JsonObject o, const LinkRequest& r) {
+      o["min_ms"] = r.minUnits * 1.25f;
+      o["max_ms"] = r.maxUnits * 1.25f;
+      o["result"] = linkRequestResultName(r.result);
+      if (r.status != 0) o["status"] = r.status;
+    };
     if (link.valid && isPeerConnected()) {
       JsonObject l = doc["link"].to<JsonObject>();
       l["interval_ms"] = link.intervalUnits * 1.25f;
@@ -3119,6 +3307,7 @@ void BleLink::startAboutDownload(const size_t offset, const size_t chunkSize) {
       std::string phy = phyName(link.txPhy);
       if (link.rxPhy != link.txPhy) phy += std::string("/") + phyName(link.rxPhy);
       l["phy"] = phy;
+      if (request.seq != 0) putRequest(l["requested"].to<JsonObject>(), request);
     }
     if (lastUpload_.valid) {
       const LastUpload& u = lastUpload_;
@@ -3145,6 +3334,11 @@ void BleLink::startAboutDownload(const size_t offset, const size_t chunkSize) {
       j["ack_shed"] = u.ackShed;
       j["renders"] = u.renders;
       j["render_ms"] = u.renderMs;
+      if (u.itvlMaxUnits != 0) {
+        j["itvl_min_ms"] = u.itvlMinUnits * 1.25f;
+        j["itvl_max_ms"] = u.itvlMaxUnits * 1.25f;
+      }
+      if (u.request.seq != 0) putRequest(j["requested"].to<JsonObject>(), u.request);
     }
     // Protocol features beyond the upload and download kinds. Here rather than in
     // `status`, whose read already sheds its capability lists to fit 512 bytes.

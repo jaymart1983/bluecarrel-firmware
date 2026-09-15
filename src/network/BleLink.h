@@ -193,6 +193,14 @@ class BleLink {
 
   // --- NimBLE host-task entry points ----------------------------------------
   static constexpr uint16_t NO_CONNECTION = 0xFFFF;  // BLE_HS_CONN_HANDLE_NONE
+  // Connection interval requests, in 1.25 ms units (see updateLinkInterval()).
+  // Fast: min 7.5 ms, the spec minimum; the max widens a step only when the phone
+  // will not grant the narrower window.
+  static constexpr uint16_t LINK_FAST_ITVL_UNITS = 6;
+  static constexpr std::array<uint16_t, 3> LINK_FAST_MAX_UNITS = {6, 9, 12};
+  static constexpr uint16_t LINK_IDLE_MIN_UNITS = 24;  ///< 30 ms
+  static constexpr uint16_t LINK_IDLE_MAX_UNITS = 40;  ///< 50 ms
+  static constexpr uint16_t LINK_TIMEOUT_UNITS = 400;  ///< 10 ms units: 4 s
 
   // Binds the link to `connHandle`. False when another connection is bound.
   bool bindConnection(uint16_t connHandle);
@@ -230,6 +238,12 @@ class BleLink {
   // reported as `link` in `about`. Ignored for any handle but the bound one.
   void noteConnParams(uint16_t connHandle, uint16_t intervalUnits, uint16_t latency, uint16_t timeoutUnits,
                       bool connected);
+  // Asks the phone for an interval in [minUnits, maxUnits], latency 0 and a 4 s
+  // supervision timeout, and records the request for `about`. Host task or main loop.
+  void requestLinkInterval(uint16_t connHandle, uint16_t minUnits, uint16_t maxUnits, const char* why);
+  // A connection update event from the host task: `status` 0 with the interval now in
+  // force, or the failure status. Settles a pending requestLinkInterval().
+  void noteConnUpdate(uint16_t connHandle, int status, uint16_t intervalUnits);
   void notePhy(uint16_t connHandle, uint8_t txPhy, uint8_t rxPhy);
   void noteDataLength(uint16_t connHandle, uint16_t txOctets, uint16_t txTimeUs, uint16_t rxOctets,
                       uint16_t rxTimeUs);
@@ -418,6 +432,42 @@ class BleLink {
   LinkParams linkParams_;
   void logLinkParams(const LinkParams& params, const char* cause) const;
 
+  // --- connection interval policy (updateLinkInterval) ----------------------
+  // A bulk transfer (book/bmp/firmware upload, book/library download) wants the fast
+  // interval; this long after the last one ends the link asks for the idle interval.
+  static constexpr unsigned long LINK_IDLE_AFTER_MS = 3000;
+  // From connecting to the first idle request when no bulk transfer has run.
+  static constexpr unsigned long LINK_CONNECT_HOLD_MS = 10000;
+  static constexpr unsigned long LINK_REQUEST_GAP_MS = 2000;
+  // NimBLE drops an unanswered update after 40 s without an event (ble_gap_update_timer).
+  static constexpr unsigned long LINK_REQUEST_STALE_MS = 10000;
+  static constexpr uint8_t LINK_FAST_ATTEMPTS_MAX = 4;  ///< per fast period
+  static constexpr uint8_t LINK_IDLE_ATTEMPTS_MAX = 2;  ///< per idle period
+  // OTHER: the update completed with an interval outside the request (the phone chose).
+  // REFUSED: the update event failed. NOT_SENT: ble_gap_update_params() refused it.
+  enum class LinkRequestResult : uint8_t { PENDING, ACCEPTED, OTHER, REFUSED, NOT_SENT, NO_ANSWER };
+  struct LinkRequest {
+    uint32_t seq = 0;  ///< 0: no request since boot
+    uint16_t minUnits = 0;
+    uint16_t maxUnits = 0;
+    LinkRequestResult result = LinkRequestResult::PENDING;
+    int status = 0;  ///< the rc (NOT_SENT) or event status (REFUSED)
+    unsigned long atMs = 0;
+  };
+  // Both tasks, under eventMutex_.
+  LinkRequest linkRequest_;
+  uint32_t linkRequestSeq_ = 0;
+  static const char* linkRequestResultName(LinkRequestResult result);
+  // Main loop only.
+  enum class LinkMode : uint8_t { NONE, FAST, IDLE };
+  LinkMode linkMode_ = LinkMode::NONE;
+  uint8_t linkAttempts_ = 0;
+  uint8_t linkFastStep_ = 0;     ///< index into LINK_FAST_MAX_UNITS
+  uint32_t linkOutcomeSeq_ = 0;  ///< the request whose outcome has been acted on
+  unsigned long linkLastBulkMs_ = 0;
+  bool linkConnectHold_ = false;
+  void updateLinkInterval();
+
   // Data frames of the upload in progress as they arrive, counted in the data
   // write callback under eventMutex_.
   struct UploadArrivals {
@@ -431,6 +481,8 @@ class BleLink {
     uint32_t bucketMaxFrames = 0;
     int minMsysFree = -1;  ///< -1 until the first frame
     size_t maxQueue = 0;
+    uint16_t itvlMinUnits = 0;  ///< connection interval range while the upload ran
+    uint16_t itvlMaxUnits = 0;
   };
   UploadArrivals uploadArrivals_;
   // The same upload as the main loop handles it. Main loop only.
@@ -481,6 +533,9 @@ class BleLink {
     uint32_t ackShed = 0;
     uint32_t renders = 0;
     unsigned long renderMs = 0;
+    uint16_t itvlMinUnits = 0;
+    uint16_t itvlMaxUnits = 0;
+    LinkRequest request;  ///< the last interval request when the upload finished
   };
   LastUpload lastUpload_;
   void beginUploadStats();

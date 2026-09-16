@@ -1,27 +1,37 @@
 name: Release X4 Pro firmware
 
-# Push a tag named x4pro-<yyyyMMdd.HHmm> (the build stamp the reader will show and
-# report to the app) to build the X4 Pro release image and publish a GitHub release:
+# Releases are published from a clean checkout of the tag built on the maintainer's
+# build host and signed there (release-x4pro.sh), because a second cold build here
+# added ~11 minutes before the firmware could be tested.
+#
+# On a tag push this workflow is the INDEPENDENT CHECK of that release: it rebuilds
+# the same tag from a clean checkout and refuses if the image it produces does not
+# match the published firmware.json (same SHA-256, same stamp, features present).
+#
+# Run it manually (workflow_dispatch) with publish=true to build AND publish here
+# instead -- the fallback when the build host is unavailable.
 #
 #   bluecarrel-x4pro-<stamp>.bin       app image: Bluetooth updates, or USB at 0x10000
-#   bluecarrel-x4pro-<stamp>.bin.sig   its signature (hex), for copying to /firmware/firmware.bin.sig
-#   bluecarrel-x4pro-<stamp>-full.bin  bootloader + partition table + app from 0x0,
-#                                      for a first install over USB
-#   firmware.json                      {version, file, size, sha256, signature} for an update page
+#   bluecarrel-x4pro-<stamp>.bin.sig   its signature (hex), for /firmware/firmware.bin.sig
+#   bluecarrel-x4pro-<stamp>-full.bin  bootloader + partition table + app from 0x0
+#   firmware.json                      {version, file, size, sha256, signature}
 #
-# Images are signed with the FIRMWARE_SIGNING_KEY secret (PEM EC P-256 private key
-# matching src/network/FirmwareSigningKey.h).
-#
-#   git tag x4pro-$(date -u +%Y%m%d.%H%M) && git push origin --tags
-#
-# A tag ending in -test (x4pro-<stamp>-test) publishes a pre-release instead. The app's
-# default update page (releases/latest) skips pre-releases, so only a device pointed at
-# that release's download URL picks it up.
+# A tag ending in -test (x4pro-<stamp>-test) is a pre-release. The app's default
+# update page (releases/latest) skips pre-releases.
 
 on:
   push:
     tags:
       - 'x4pro-*'
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: 'Tag to build (x4pro-yyyyMMdd.HHmm[-test])'
+        required: true
+      publish:
+        description: 'Publish the release from here instead of only checking it'
+        type: boolean
+        default: false
 
 permissions:
   contents: read
@@ -33,21 +43,24 @@ jobs:
       contents: write
     env:
       PIO_ENV: x4pro-gh_release
+      TAG: ${{ inputs.tag || github.ref_name }}
+      PUBLISH: ${{ inputs.publish || false }}
     steps:
       - uses: actions/checkout@v6
         with:
+          ref: ${{ inputs.tag || github.ref_name }}
           submodules: recursive
 
       - name: Build stamp from tag
         run: |
-          rest="${GITHUB_REF_NAME#x4pro-}"
+          rest="${TAG#x4pro-}"
           prerelease=false
           if [[ "$rest" == *-test ]]; then
             rest="${rest%-test}"
             prerelease=true
           fi
           if ! [[ "$rest" =~ ^[0-9]{8}\.[0-9]{4}$ ]]; then
-            echo "Tag must be x4pro-yyyyMMdd.HHmm or x4pro-yyyyMMdd.HHmm-test, got $GITHUB_REF_NAME" >&2
+            echo "Tag must be x4pro-yyyyMMdd.HHmm or x4pro-yyyyMMdd.HHmm-test, got $TAG" >&2
             exit 1
           fi
           echo "X4_BUILD_STAMP=$rest" >> "$GITHUB_ENV"
@@ -88,6 +101,7 @@ jobs:
       - name: Check the image has the X4 Pro features
         run: |
           image=".pio/build/$PIO_ENV/firmware.bin"
+          grep -q "\"$X4_BUILD_STAMP\"" src/network/BuildStamp.h
           for marker in "X4AUTH2|host|" "X4FW1|" "Bluecarrel"; do
             if ! grep -aqF "$marker" "$image"; then
               echo "::error::$image is missing '$marker'; the release env does not match env:x4pro"
@@ -95,8 +109,43 @@ jobs:
             fi
           done
 
+      # The published release was built and signed elsewhere. This is what makes that
+      # safe: the same tag, rebuilt from a clean checkout here, must produce the same
+      # image bytes as the one being served to readers.
+      - name: Check the published release matches this build
+        if: env.PUBLISH != 'true'
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          built=$(sha256sum ".pio/build/$PIO_ENV/firmware.bin" | cut -d' ' -f1)
+          # The release is created right after the tag is pushed, so allow for it landing late.
+          for attempt in $(seq 1 30); do
+            if gh release download "$TAG" -R "$GITHUB_REPOSITORY" -p firmware.json -D published -O firmware.json 2>/dev/null; then
+              break
+            fi
+            if [ "$attempt" = 30 ]; then
+              echo "::error::No release for $TAG after 5 minutes. Publish it (release-x4pro.sh), or re-run this workflow with publish=true."
+              exit 1
+            fi
+            sleep 10
+          done
+          published=$(python -c 'import json;print(json.load(open("published/firmware.json"))["sha256"])')
+          version=$(python -c 'import json;print(json.load(open("published/firmware.json"))["version"])')
+          echo "published $version $published"
+          echo "rebuilt   $X4_BUILD_STAMP $built"
+          if [ "$version" != "$X4_BUILD_STAMP" ]; then
+            echo "::error::firmware.json says version $version, this tag is $X4_BUILD_STAMP"
+            exit 1
+          fi
+          if [ "$published" != "$built" ]; then
+            echo "::error::The published image does not match a clean rebuild of $TAG. Do not install it."
+            exit 1
+          fi
+          echo "The published image matches a clean rebuild of $TAG."
+
       # Written after the build so no build script runs while the key is on disk.
       - name: Write signing key
+        if: env.PUBLISH == 'true'
         env:
           FIRMWARE_SIGNING_KEY: ${{ secrets.FIRMWARE_SIGNING_KEY }}
         run: |
@@ -110,11 +159,11 @@ jobs:
           chmod 600 "$key"
 
       - name: Package
+        if: env.PUBLISH == 'true'
         env:
           FIRMWARE_SIGNING_KEY_FILE: ${{ runner.temp }}/firmware-signing-key.pem
         run: |
           build=".pio/build/$PIO_ENV"
-          grep -q "\"$X4_BUILD_STAMP\"" src/network/BuildStamp.h
           scripts/make_firmware_json.sh dist "$build/firmware.bin"
           test -s "dist/bluecarrel-x4pro-$X4_BUILD_STAMP.bin.sig"
           grep -q '"signature":"' dist/firmware.json
@@ -129,6 +178,7 @@ jobs:
         run: rm -f "$RUNNER_TEMP/firmware-signing-key.pem"
 
       - name: Publish release
+        if: env.PUBLISH == 'true'
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
@@ -138,6 +188,6 @@ jobs:
             flags+=(--prerelease)
             title="$title (test)"
           fi
-          gh release create "$GITHUB_REF_NAME" dist/* "${flags[@]}" \
+          gh release create "$TAG" dist/* "${flags[@]}" \
             --title "$title" \
             --notes "Install over Bluetooth from the Bluecarrel app (https://github.com/jaymart1983/bluecarrel-app), or over USB: see the README (First install over USB). \`firmware.json\` can be served from your own update page."

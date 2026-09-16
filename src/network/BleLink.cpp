@@ -10,6 +10,9 @@
 #include <esp_mac.h>
 #include <nimble/nimble/transport/include/nimble/transport.h>
 #include <nimble/porting/nimble/include/os/os_mbuf.h>
+#include <nimble/nimble/host/include/host/ble_l2cap.h>
+#include <nimble/porting/nimble/include/mem/mem.h>
+#include <esp_heap_caps.h>
 #include <esp_ota_ops.h>
 #include <esp_random.h>
 #include <freertos/task.h>
@@ -218,6 +221,32 @@ constexpr size_t BLE_PROGRESS_DISPLAY_INTERVAL_BYTES = 128UL * 1024UL;
 constexpr size_t BLE_FIRMWARE_PROGRESS_DISPLAY_INTERVAL_BYTES = 1024UL * 1024UL;
 constexpr size_t BLE_UPLOAD_ACK_BYTES_MIN = 20;
 constexpr size_t BLE_UPLOAD_ACK_BYTES_MAX = 64UL * 1024UL;
+// --- L2CAP connection-oriented channel --------------------------------------
+// The channel's own mbuf pool. NimBLE appends each arriving LE frame into the
+// SDU buffer the channel was armed with and ASSERTS if that append fails
+// (ble_l2cap_coc.c:249, 271), so the pool must always be able to hold a whole
+// SDU. Three SDUs are alive at the busiest moment -- two queued for the main
+// loop and one armed for the frame already on its way -- and a 4096-byte SDU
+// chains nine of these blocks, so 32 covers that with margin to spare.
+constexpr size_t BLE_L2CAP_POOL_BLOCK_BYTES = 512;
+constexpr size_t BLE_L2CAP_POOL_BLOCKS = 32;
+// SDUs held for the main loop. Two, so the next SDU is already arriving into
+// the armed buffer while this one goes to the card; the third is what the
+// credits withhold. This is deliberately NOT the 32 KB control event queue: a
+// byte budget there would either overflow (dropping the link) or need the
+// client to pace itself, and the whole point of the channel is that the
+// receiver's credits do the pacing with no round trip per frame.
+constexpr size_t BLE_L2CAP_RX_QUEUE_MAX = 2;
+// A download hands the stack one SDU at a time, and only while this many msys
+// blocks are free. CoC transmission draws its LE frames from msys
+// (ble_l2cap_coc.c:489), which is the same pool a status notification needs, so
+// without this a download would starve its own progress reports.
+constexpr int BLE_L2CAP_TX_MSYS_RESERVE_BLOCKS = 12;
+// An l2cap upload may ask for a far larger credit window than a GATT one. Over
+// GATT `ack_bytes` is what stops the event queue overflowing, so it is capped
+// tightly; on the channel the credits do that frame by frame and `ack_bytes` is
+// only how often the reader reports progress.
+constexpr size_t BLE_UPLOAD_ACK_BYTES_MAX_L2CAP = 256UL * 1024UL;
 // Sized to hold one whole upload credit window, so a client that waits for its
 // `received` ack as it must can never overflow the queue, however long a loop
 // iteration takes: 24000 bytes of payload at the app's ack_bytes, plus a 4-byte
@@ -723,13 +752,6 @@ std::string stateName(BleLink::State state) {
   return "unknown";
 }
 
-uint32_t readLe32(const std::string& value) {
-  assert(value.size() >= sizeof(uint32_t));
-  const auto* b = reinterpret_cast<const uint8_t*>(value.data());
-  return static_cast<uint32_t>(b[0]) | (static_cast<uint32_t>(b[1]) << 8) | (static_cast<uint32_t>(b[2]) << 16) |
-         (static_cast<uint32_t>(b[3]) << 24);
-}
-
 bool constantTimeEquals(const std::string& left, const std::string& right) {
   if (left.size() != right.size()) return false;
   uint8_t diff = 0;
@@ -995,6 +1017,12 @@ int onGapEventForLink(ble_gap_event* event, void* arg) {
   return 0;
 }
 
+// Every L2CAP event, straight to the link. NimBLE calls this on the host task,
+// and what it returns for an ACCEPT is the refusal the peer is given.
+int l2capEventTrampoline(ble_l2cap_event* event, void* arg) {
+  return static_cast<BleLink*>(arg)->onL2capEvent(event);
+}
+
 }  // namespace
 
 struct BleLinkRuntime {
@@ -1013,6 +1041,83 @@ struct BleLinkRuntime {
   DataCallbacks dataCallbacks;
   // What setAdvertisedName() last put on the air.
   std::string advertisedName;
+
+  // --- L2CAP connection-oriented channel ------------------------------------
+  //
+  // All of it lives here rather than in BleLink so the NimBLE types stay out of
+  // BleLink.h, which screens include.
+  //
+  // The pool is in PSRAM and is NOT msys. msys is internal RAM shared with the
+  // controller's transmit path, and parking a 4 KB SDU there would crowd out the
+  // blocks GATT notifications come from. Nothing the controller DMAs from lands
+  // here: the host task copies an arriving frame in with the CPU
+  // (ble_l2cap_coc.c:242) and copies an outgoing one back out into an msys
+  // buffer (:510), so PSRAM is safe for both directions.
+  os_mempool l2capMempool = {};
+  os_mbuf_pool l2capPool = {};
+  uint8_t* l2capPoolMem = nullptr;
+  // One SDU, copied out of its mbuf chain so the shared receive path sees a flat
+  // buffer. PSRAM, allocated once with the pool: 4 KB is far over the 256-byte
+  // local rule and a per-transfer allocation would churn the heap on every sync.
+  uint8_t* l2capFrame = nullptr;
+  bool l2capServerRegistered = false;
+
+  // Written by the host task, read by the main loop; both under the link's
+  // eventMutex_.
+  ble_l2cap_chan* l2capChan = nullptr;
+  // A receive buffer is armed on the channel. While false the peer has no
+  // credits and its writes block, which is exactly the back pressure wanted.
+  bool l2capArmed = false;
+  // ble_l2cap_send() answered ESTALLED: the stack holds the SDU and finishes it
+  // when the peer grants credits. Nothing more may be sent until TX_UNSTALLED.
+  bool l2capTxStalled = false;
+  // The channel went away and the main loop has not yet been told.
+  bool l2capClosedPending = false;
+  struct L2capSdu {
+    os_mbuf* sdu = nullptr;
+    unsigned long atMs = 0;  ///< millis() when the host task took it
+  };
+  std::deque<L2capSdu> l2capRx;
+
+  ~BleLinkRuntime() {
+    // The stack is down by the time this runs (BleLink::end() closes the channel
+    // and deinitialises NimBLE first), so nothing can still be holding a block.
+    if (l2capPoolMem) heap_caps_free(l2capPoolMem);
+    if (l2capFrame) heap_caps_free(l2capFrame);
+  }
+
+  // Best effort: a link with no channel still works, over GATT.
+  void beginL2cap() {
+    const size_t poolBytes = OS_MEMPOOL_BYTES(BLE_L2CAP_POOL_BLOCKS, BLE_L2CAP_POOL_BLOCK_BYTES);
+    // Raw allocation rather than makeUniqueNoThrow: this has to come from PSRAM,
+    // and the block is handed to NimBLE's mempool, which holds it for the life
+    // of the pool. The destructor above is what frees it.
+    l2capPoolMem = static_cast<uint8_t*>(heap_caps_malloc(poolBytes, MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT));
+    l2capFrame = static_cast<uint8_t*>(heap_caps_malloc(BleLink::L2CAP_SDU_BYTES, MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT));
+    if (!l2capPoolMem || !l2capFrame) {
+      LOG_ERR("BLE", "OOM: %u byte L2CAP pool; the channel stays off", static_cast<unsigned>(poolBytes));
+      return;
+    }
+    if (mem_init_mbuf_pool(l2capPoolMem, &l2capMempool, &l2capPool, BLE_L2CAP_POOL_BLOCKS,
+                           BLE_L2CAP_POOL_BLOCK_BYTES, "ble_l2cap_sdu") != 0) {
+      LOG_ERR("BLE", "the L2CAP pool would not initialise; the channel stays off");
+      return;
+    }
+    // ble_hs_init() runs ble_l2cap_init() on every NimBLEDevice::init()
+    // (ble_hs.c:759), and that clears the server registry
+    // (ble_l2cap_coc.c:694), so this is a fresh registration on every begin()
+    // rather than the EALREADY a second one would get.
+    const int rc = ble_l2cap_create_server(BleLink::L2CAP_PSM, BleLink::L2CAP_SDU_BYTES, &l2capEventTrampoline, &link);
+    if (rc != 0) {
+      LOG_ERR("BLE", "L2CAP server on PSM 0x%04x refused (rc %d)", static_cast<unsigned>(BleLink::L2CAP_PSM), rc);
+      return;
+    }
+    l2capServerRegistered = true;
+    LOG_INF("BLE", "L2CAP server on PSM 0x%04x: SDU %u B, MPS %u, pool %u x %u B in PSRAM",
+            static_cast<unsigned>(BleLink::L2CAP_PSM), static_cast<unsigned>(BleLink::L2CAP_SDU_BYTES),
+            static_cast<unsigned>(MYNEWT_VAL(BLE_L2CAP_COC_MPS)), static_cast<unsigned>(BLE_L2CAP_POOL_BLOCKS),
+            static_cast<unsigned>(BLE_L2CAP_POOL_BLOCK_BYTES));
+  }
 
   bool begin() {
     const std::string name = SETTINGS.effectiveDeviceName();
@@ -1062,6 +1167,10 @@ struct BleLinkRuntime {
     // client that reads before it ever sees a notification still gets the whole
     // truth.
     status->setValue(link.buildReadJson());
+
+    // After the service is up and before anything can connect. Registering a
+    // server is only a registry insert, so it costs nothing until a phone asks.
+    beginL2cap();
 
     NimBLEAdvertising* advertising = NimBLEDevice::getAdvertising();
     advertising->addServiceUUID(BLE_SERVICE_UUID);
@@ -1321,6 +1430,9 @@ void BleLink::end() {
   // and its callbacks still pointing at state on its way out. Nothing may arrive
   // over the air after this point.
   resetTransfer(true);
+  // Before the stack goes down and the runtime -- which owns the channel's
+  // receive pool -- is freed: any queued SDU points into that pool.
+  closeL2capChannel("link stopped");
   ble_->end();
   ble_.reset();
   // Scratch for one wake only. The Store's own thumbnails are cleared by the
@@ -1369,6 +1481,8 @@ void BleLink::tick() {
   if (!ble_) return;
 
   processBleEvents();
+  // The channel's own queue, drained on the same tick as the GATT events.
+  drainL2capRx();
   checkConnectionDeadlines();
   updateLinkInterval();
 
@@ -1473,6 +1587,7 @@ bool BleLink::forgetTrustedHost() {
   hostPaired_ = false;
   authErrorMessage_.clear();
   deviceNonce_ = makeNonceHex();
+  noteSessionAuth();
   LOG_INF("BLE", "forgot the trusted host and every bond");
   setState(isPeerConnected() ? State::CONNECTED : State::ADVERTISING);
   publishStatus();
@@ -1574,6 +1689,7 @@ bool BleLink::applyPair(const BleTrustedHost& host, const bool authenticateSessi
   readerProof_.clear();
   authErrorMessage_.clear();
   LOG_INF("BLE", "pair accepted: '%s' (host %.8s) saved", host.name.c_str(), host.hostId.c_str());
+  noteSessionAuth();
   setState(State::CONNECTED);
   if (store_) store_->onAppReady();
   return true;
@@ -1770,6 +1886,7 @@ void BleLink::processBleEvents() {
       helloAccepted_ = false;
       authHandle_ = NO_CONNECTION;
       readerProof_.clear();
+      noteSessionAuth();
       setError("BLE event queue overflow");
       disconnectPeer("event queue overflow");
       return;
@@ -1824,6 +1941,7 @@ void BleLink::onBleConnected(const uint16_t connHandle) {
   linkFastStep_ = 0;
   linkLastBulkMs_ = connectedAtMs_;
   linkConnectHold_ = true;
+  noteSessionAuth();
   setState(State::CONNECTED);
 }
 
@@ -1868,6 +1986,7 @@ void BleLink::onBleDisconnected(const uint16_t) {
       connectedAtMs_ = 0;
       securedAtMs_ = 0;
       deviceNonce_ = makeNonceHex();
+      noteSessionAuth();
       setState(State::ADVERTISING);
       if (ble_) ble_->startAdvertising();
       return;
@@ -1887,6 +2006,7 @@ void BleLink::onBleDisconnected(const uint16_t) {
   connectedAtMs_ = 0;
   securedAtMs_ = 0;
   deviceNonce_ = makeNonceHex();
+  noteSessionAuth();
   setState(State::ADVERTISING);
   if (ble_) ble_->startAdvertising();
   // The header carries the BLE mark; with the peer gone it must stop saying so.
@@ -1964,6 +2084,7 @@ void BleLink::onControlWrite(const std::string& value) {
     authErrorMessage_.clear();
     deviceNonce_ = makeNonceHex();
     LOG_INF("BLE", "trusted host '%s' accepted", trustedHostName_.c_str());
+    noteSessionAuth();
     setState(State::CONNECTED);
     // The gate is the only thing the Store was waiting for: ask for page one.
     if (store_) store_->onAppReady();
@@ -2154,6 +2275,19 @@ void BleLink::onControlWrite(const std::string& value) {
     uploadResumable_ = doc["resume"] | false;
     uploadChunkSize_ = doc["chunk_size"] | 0;
     uploadAckBytes_ = doc["ack_bytes"] | BLE_PROGRESS_STATUS_INTERVAL_BYTES;
+    // Absent means GATT, which is what every older client sends.
+    const std::string transport = doc["transport"] | "";
+    transportL2cap_ = transport == "l2cap";
+    if (!transport.empty() && !transportL2cap_ && transport != "gatt") {
+      setError("unsupported transport");
+      return;
+    }
+    // The channel is opened by the app after hello. Without one there is
+    // nothing to receive on, and this is the answer it falls back to GATT on.
+    if (transportL2cap_ && !l2capChannelOpen()) {
+      setError("no channel");
+      return;
+    }
     transferKind_ = TransferKind::NONE;
 
     if (!isHexSha256(expectedSha256_)) {
@@ -2164,7 +2298,11 @@ void BleLink::onControlWrite(const std::string& value) {
       setError("invalid resume chunk size");
       return;
     }
-    if (uploadAckBytes_ < BLE_UPLOAD_ACK_BYTES_MIN || uploadAckBytes_ > BLE_UPLOAD_ACK_BYTES_MAX) {
+    // Over GATT the ack window is what stops the event queue overflowing, so it
+    // is capped tightly. On the channel the credits do that frame by frame and
+    // `ack_bytes` only decides how often progress is reported.
+    const size_t ackBytesMax = transportL2cap_ ? BLE_UPLOAD_ACK_BYTES_MAX_L2CAP : BLE_UPLOAD_ACK_BYTES_MAX;
+    if (uploadAckBytes_ < BLE_UPLOAD_ACK_BYTES_MIN || uploadAckBytes_ > ackBytesMax) {
       setError("invalid ack window");
       return;
     }
@@ -2453,6 +2591,17 @@ void BleLink::onControlWrite(const std::string& value) {
 
   if (op == "start_get") {
     resetTransfer(true);
+    // Absent means GATT, which is what every older client sends.
+    const std::string transport = doc["transport"] | "";
+    transportL2cap_ = transport == "l2cap";
+    if (!transport.empty() && !transportL2cap_ && transport != "gatt") {
+      setError("unsupported transport");
+      return;
+    }
+    if (transportL2cap_ && !l2capChannelOpen()) {
+      setError("no channel");
+      return;
+    }
     const int64_t offsetValue = doc["offset"] | 0;
     const int64_t chunkSizeValue = doc["chunk_size"] | static_cast<int64_t>(BLE_DOWNLOAD_CHUNK_BYTES);
     if (offsetValue < 0 ||
@@ -2460,8 +2609,11 @@ void BleLink::onControlWrite(const std::string& value) {
       setError("invalid download offset");
       return;
     }
-    if (chunkSizeValue < static_cast<int64_t>(BLE_DOWNLOAD_CHUNK_BYTES_MIN) ||
-        chunkSizeValue > static_cast<int64_t>(BLE_DOWNLOAD_CHUNK_BYTES_MAX)) {
+    // A frame on the channel is one SDU, so it is bounded by the SDU size
+    // rather than by what a single notification can carry.
+    const int64_t chunkSizeMax =
+        transportL2cap_ ? static_cast<int64_t>(L2CAP_FRAME_PAYLOAD_MAX) : static_cast<int64_t>(BLE_DOWNLOAD_CHUNK_BYTES_MAX);
+    if (chunkSizeValue < static_cast<int64_t>(BLE_DOWNLOAD_CHUNK_BYTES_MIN) || chunkSizeValue > chunkSizeMax) {
       setError("invalid download chunk size");
       return;
     }
@@ -2480,7 +2632,7 @@ void BleLink::onControlWrite(const std::string& value) {
     // A chunk above the old 160-byte ceiling is shrunk to what one notification on
     // this link can carry, never below 160; 160 and under is used as asked.
     auto chunkSize = static_cast<size_t>(chunkSizeValue);
-    if (chunkSize > BLE_DOWNLOAD_CHUNK_BYTES) {
+    if (!transportL2cap_ && chunkSize > BLE_DOWNLOAD_CHUNK_BYTES) {
       const size_t cap = dataNotifyCapBytes();
       const size_t fits = cap > BLE_DOWNLOAD_FRAME_HEADER_BYTES ? cap - BLE_DOWNLOAD_FRAME_HEADER_BYTES : 0;
       const size_t used = std::max(BLE_DOWNLOAD_CHUNK_BYTES, std::min(chunkSize, fits));
@@ -2576,22 +2728,33 @@ bool BleLink::flushUploadBuffer() {
 }
 
 void BleLink::onDataWrite(const std::string& value, const unsigned long arrivalMs) {
+  // A GATT data-in write. Ignored while the transfer is running on the channel:
+  // one transfer has one transport, and taking frames from both would break the
+  // sequence the receive path checks.
+  if (transportL2cap_) return;
+  onDataFrame(reinterpret_cast<const uint8_t*>(value.data()), value.size(), arrivalMs);
+}
+
+void BleLink::onDataFrame(const uint8_t* data, const size_t length, const unsigned long arrivalMs) {
   if (!transferOpen_ || state_ != State::RECEIVING) return;
-  if (value.size() <= sizeof(uint32_t)) {
+  if (length <= sizeof(uint32_t)) {
     setError("invalid data frame");
     resetTransfer(true);
     return;
   }
 
-  const uint32_t sequence = readLe32(value);
+  // memcpy, not a cast: the frame buffer carries no alignment guarantee and a
+  // wide load off an odd address faults on RISC-V (see CLAUDE.md).
+  uint32_t sequence = 0;
+  memcpy(&sequence, data, sizeof(sequence));
   if (sequence != expectedSequence_) {
     setError("unexpected data sequence");
     resetTransfer(true);
     return;
   }
 
-  const uint8_t* payload = reinterpret_cast<const uint8_t*>(value.data() + sizeof(uint32_t));
-  const size_t payloadSize = value.size() - sizeof(uint32_t);
+  const uint8_t* payload = data + sizeof(uint32_t);
+  const size_t payloadSize = length - sizeof(uint32_t);
   if (receivedBytes_ + payloadSize > expectedSize_) {
     setError("transfer too large");
     resetTransfer(true);
@@ -2635,6 +2798,292 @@ void BleLink::onDataWrite(const std::string& value, const unsigned long arrivalM
     if (store_ && transferKind_ == TransferKind::BOOK) store_->onFetchProgress(receivedBytes_, expectedSize_);
     notifyObserver();
   }
+}
+
+// --- L2CAP connection-oriented channel --------------------------------------
+
+bool BleLink::l2capServerUp() const { return ble_ && ble_->l2capServerRegistered; }
+
+bool BleLink::l2capChannelOpen() const {
+  if (!ble_ || !eventMutex_ || !sessionAuthenticated()) return false;
+  xSemaphoreTake(eventMutex_, portMAX_DELAY);
+  const bool open = ble_->l2capChan != nullptr;
+  xSemaphoreGive(eventMutex_);
+  return open;
+}
+
+void BleLink::noteSessionAuth() {
+  const bool authenticated = sessionAuthenticated();
+  sessionAuthMirror_.store(authenticated);
+  // The channel belongs to the authenticated session and to nothing else. The
+  // moment hello is reset, the peer changes, or the host is forgotten, it goes.
+  if (!authenticated) closeL2capChannel("session not authenticated");
+}
+
+void BleLink::closeL2capChannel(const char* why) {
+  if (!ble_ || !eventMutex_) return;
+  xSemaphoreTake(eventMutex_, portMAX_DELAY);
+  ble_l2cap_chan* chan = ble_->l2capChan;
+  ble_->l2capChan = nullptr;
+  ble_->l2capArmed = false;
+  ble_->l2capTxStalled = false;
+  // SDUs the main loop never reached. The stack frees whatever it still holds
+  // (ble_l2cap_coc.c:425-428); these are the ones it already handed over.
+  for (auto& queued : ble_->l2capRx) os_mbuf_free_chain(queued.sdu);
+  ble_->l2capRx.clear();
+  xSemaphoreGive(eventMutex_);
+  if (!chan) return;
+  LOG_INF("BLE", "L2CAP channel closed: %s", why);
+  ble_l2cap_disconnect(chan);
+}
+
+int BleLink::onL2capEvent(ble_l2cap_event* event) {
+  if (!event || !ble_ || !eventMutex_) return BLE_HS_EAUTHEN;
+  switch (event->type) {
+    case BLE_L2CAP_EVENT_COC_ACCEPT: {
+      // THIS IS THE GATE. NimBLE has no per-PSM security of its own: a server
+      // record is a psm, an mtu and a callback (ble_l2cap_coc_priv.h:51-57) and
+      // channel creation checks nothing (ble_l2cap_coc.c:373-391), so every
+      // condition security v2 relies on is checked here or nowhere.
+      const uint16_t handle = event->accept.conn_handle;
+      ble_gap_conn_desc desc{};
+      const bool bound = handle != NO_CONNECTION && handle == connHandle_.load();
+      const bool secure = bound && linkSecure_.load() && ble_gap_conn_find(handle, &desc) == 0 &&
+                          desc.sec_state.encrypted && desc.sec_state.authenticated && desc.sec_state.bonded;
+      const bool authenticated = sessionAuthMirror_.load();
+      if (!secure || !authenticated) {
+        // BLE_HS_EAUTHEN becomes "insufficient authentication" on the wire
+        // (ble_l2cap_sig.c:686-687). That, and not "no resources", is what the
+        // phone has to be told: one says the link is not trusted, the other
+        // says to try again in a moment.
+        LOG_INF("BLE", "L2CAP refused (bound=%d secure=%d hello=%d)", static_cast<int>(bound),
+                static_cast<int>(secure), static_cast<int>(authenticated));
+        return BLE_HS_EAUTHEN;
+      }
+      // create_srv_chan hands the channel over with NO receive buffer
+      // (ble_l2cap_coc.c:388), and the first frame to arrive without one trips
+      // the assert at :204. So the first buffer is armed here or not at all.
+      os_mbuf* sdu = os_mbuf_get_pkthdr(&ble_->l2capPool, 0);
+      if (!sdu) {
+        LOG_ERR("BLE", "OOM: L2CAP receive buffer; channel refused");
+        return BLE_HS_ENOMEM;
+      }
+      if (ble_l2cap_recv_ready(event->accept.chan, sdu) != 0) {
+        os_mbuf_free_chain(sdu);
+        return BLE_HS_ENOMEM;
+      }
+      xSemaphoreTake(eventMutex_, portMAX_DELAY);
+      ble_->l2capArmed = true;
+      ble_->l2capTxStalled = false;
+      xSemaphoreGive(eventMutex_);
+      LOG_INF("BLE", "L2CAP channel accepted (peer SDU %u B)", static_cast<unsigned>(event->accept.peer_sdu_size));
+      return 0;
+    }
+
+    case BLE_L2CAP_EVENT_COC_CONNECTED: {
+      // Not in ACCEPT: if the response cannot be sent the stack deletes the
+      // channel and fires no disconnect (ble_l2cap_sig.c:1303-1308), so a
+      // pointer taken there could outlive the channel it names.
+      if (event->connect.status != 0) {
+        LOG_INF("BLE", "L2CAP channel did not open (status %d)", event->connect.status);
+        xSemaphoreTake(eventMutex_, portMAX_DELAY);
+        ble_->l2capArmed = false;
+        xSemaphoreGive(eventMutex_);
+        return 0;
+      }
+      ble_l2cap_chan_info info{};
+      const bool haveInfo = ble_l2cap_get_chan_info(event->connect.chan, &info) == 0;
+      xSemaphoreTake(eventMutex_, portMAX_DELAY);
+      ble_->l2capChan = event->connect.chan;
+      xSemaphoreGive(eventMutex_);
+      if (haveInfo) {
+        LOG_INF("BLE", "L2CAP channel open: our SDU %u B, peer SDU %u B", static_cast<unsigned>(info.our_coc_mtu),
+                static_cast<unsigned>(info.peer_coc_mtu));
+      }
+      statusDirty_ = true;
+      return 0;
+    }
+
+    case BLE_L2CAP_EVENT_COC_DISCONNECTED: {
+      xSemaphoreTake(eventMutex_, portMAX_DELAY);
+      ble_->l2capChan = nullptr;
+      ble_->l2capArmed = false;
+      ble_->l2capTxStalled = false;
+      ble_->l2capClosedPending = true;
+      for (auto& queued : ble_->l2capRx) os_mbuf_free_chain(queued.sdu);
+      ble_->l2capRx.clear();
+      xSemaphoreGive(eventMutex_);
+      if (eventSignal_) xSemaphoreGive(eventSignal_);
+      LOG_INF("BLE", "L2CAP channel disconnected");
+      return 0;
+    }
+
+    case BLE_L2CAP_EVENT_COC_DATA_RECEIVED: {
+      os_mbuf* sdu = event->receive.sdu_rx;
+      if (!sdu) return 0;
+      const unsigned long nowMs = millis();
+      // The channel has no receive buffer now: NimBLE handed this one up and
+      // cleared the slot (ble_l2cap_coc.c:289-290). Arming a fresh one is what
+      // returns credits, so it happens here while the queue still has room, and
+      // otherwise in drainL2capRx() once the main loop has taken an SDU. That
+      // is the whole flow control: no credits, no writes, and nothing dropped.
+      os_mbuf* next = nullptr;
+      xSemaphoreTake(eventMutex_, portMAX_DELAY);
+      ble_->l2capArmed = false;
+      if (ble_->l2capRx.size() < BLE_L2CAP_RX_QUEUE_MAX) {
+        ble_->l2capRx.push_back({sdu, nowMs});
+        sdu = nullptr;
+        if (ble_->l2capRx.size() < BLE_L2CAP_RX_QUEUE_MAX) {
+          next = os_mbuf_get_pkthdr(&ble_->l2capPool, 0);
+          if (next) ble_->l2capArmed = true;
+        }
+      }
+      // Arrival accounting, as enqueueBleEvent() does for a GATT data frame, so
+      // last_upload describes an l2cap upload the same way.
+      if (uploadArrivals_.active) {
+        UploadArrivals& a = uploadArrivals_;
+        if (a.frames == 0) {
+          a.firstMs = nowMs;
+          a.bucketStartMs = nowMs;
+        } else if (nowMs - a.lastMs > a.maxGapMs) {
+          a.maxGapMs = nowMs - a.lastMs;
+        }
+        if (nowMs - a.bucketStartMs >= 1000UL) {
+          a.bucketMaxFrames = std::max(a.bucketMaxFrames, a.bucketFrames);
+          a.bucketFrames = 0;
+          a.bucketStartMs += (nowMs - a.bucketStartMs) / 1000UL * 1000UL;
+        }
+        a.bucketFrames++;
+        a.frames++;
+        a.lastMs = nowMs;
+        const int msysFree = os_msys_num_free();
+        if (a.minMsysFree < 0 || msysFree < a.minMsysFree) a.minMsysFree = msysFree;
+        a.maxQueue = std::max(a.maxQueue, ble_->l2capRx.size());
+      }
+      xSemaphoreGive(eventMutex_);
+      // Only reachable if the peer sent without credits, which it cannot.
+      if (sdu) os_mbuf_free_chain(sdu);
+      // Outside the mutex: recv_ready takes the host lock.
+      if (next && ble_l2cap_recv_ready(event->receive.chan, next) != 0) {
+        os_mbuf_free_chain(next);
+        xSemaphoreTake(eventMutex_, portMAX_DELAY);
+        ble_->l2capArmed = false;
+        xSemaphoreGive(eventMutex_);
+      }
+      // End the main loop's idle sleep now rather than in up to 50 ms: a whole
+      // SDU of work is waiting on it.
+      if (eventSignal_) xSemaphoreGive(eventSignal_);
+      return 0;
+    }
+
+    case BLE_L2CAP_EVENT_COC_TX_UNSTALLED: {
+      xSemaphoreTake(eventMutex_, portMAX_DELAY);
+      ble_->l2capTxStalled = false;
+      xSemaphoreGive(eventMutex_);
+      if (eventSignal_) xSemaphoreGive(eventSignal_);
+      return 0;
+    }
+
+    default:
+      return 0;
+  }
+}
+
+void BleLink::drainL2capRx() {
+  if (!ble_ || !eventMutex_) return;
+  while (true) {
+    os_mbuf* sdu = nullptr;
+    unsigned long atMs = 0;
+    xSemaphoreTake(eventMutex_, portMAX_DELAY);
+    const bool closed = ble_->l2capClosedPending;
+    ble_->l2capClosedPending = false;
+    if (!ble_->l2capRx.empty()) {
+      sdu = ble_->l2capRx.front().sdu;
+      atMs = ble_->l2capRx.front().atMs;
+      ble_->l2capRx.pop_front();
+    }
+    xSemaphoreGive(eventMutex_);
+
+    // A transfer riding the channel cannot survive the channel. Reported rather
+    // than left to the client's stall timeout, so the next sync simply retries.
+    if (closed && transportL2cap_ && (transferOpen_ || downloadOpen_)) {
+      setError("l2cap channel closed");
+      resetTransfer(true);
+    }
+    if (!sdu) return;
+
+    const size_t length = OS_MBUF_PKTLEN(sdu);
+    const bool copied = length > 0 && length <= L2CAP_SDU_BYTES &&
+                        os_mbuf_copydata(sdu, 0, static_cast<int>(length), ble_->l2capFrame) == 0;
+    os_mbuf_free_chain(sdu);
+
+    // Credits go back BEFORE the frame is handled, so the phone spends the SD
+    // write sending the next SDU rather than waiting on this one.
+    xSemaphoreTake(eventMutex_, portMAX_DELAY);
+    ble_l2cap_chan* chan = ble_->l2capChan;
+    os_mbuf* next = (chan && !ble_->l2capArmed) ? os_mbuf_get_pkthdr(&ble_->l2capPool, 0) : nullptr;
+    if (next) ble_->l2capArmed = true;
+    xSemaphoreGive(eventMutex_);
+    if (next && ble_l2cap_recv_ready(chan, next) != 0) {
+      os_mbuf_free_chain(next);
+      xSemaphoreTake(eventMutex_, portMAX_DELAY);
+      ble_->l2capArmed = false;
+      xSemaphoreGive(eventMutex_);
+    }
+
+    if (!copied) {
+      setError("invalid l2cap frame");
+      resetTransfer(true);
+      continue;
+    }
+    // Only ever for the transfer the authenticated session opened with
+    // "transport":"l2cap". Anything else arriving on the channel is dropped.
+    if (!sessionAuthenticated() || !transportL2cap_ || !transferOpen_) continue;
+    const unsigned long startUs = micros();
+    onDataFrame(ble_->l2capFrame, length, atMs);
+    uploadLoop_.dataUs += micros() - startUs;
+  }
+}
+
+bool BleLink::sendL2capFrame(const uint8_t* data, const size_t length) {
+  if (!ble_ || !eventMutex_ || !data || length == 0 || length > L2CAP_SDU_BYTES) return false;
+  xSemaphoreTake(eventMutex_, portMAX_DELAY);
+  ble_l2cap_chan* chan = ble_->l2capChan;
+  const bool stalled = ble_->l2capTxStalled;
+  xSemaphoreGive(eventMutex_);
+  if (!chan || stalled) return false;
+  // CoC transmission draws every LE frame from msys (ble_l2cap_coc.c:489), the
+  // same pool a status notification comes from. Below the reserve the frame
+  // waits a tick, so a download cannot starve its own progress reports.
+  if (os_msys_num_free() < BLE_L2CAP_TX_MSYS_RESERVE_BLOCKS) return false;
+
+  os_mbuf* sdu = os_mbuf_get_pkthdr(&ble_->l2capPool, 0);
+  if (!sdu) return false;
+  if (os_mbuf_append(sdu, data, static_cast<uint16_t>(length)) != 0) {
+    os_mbuf_free_chain(sdu);
+    return false;
+  }
+  const int rc = ble_l2cap_send(chan, sdu);
+  // Ownership, from ble_l2cap_coc.c:667-690. EBADDATA (over the peer's SDU) and
+  // EBUSY (one still going out) are refused before the stack takes the mbuf, so
+  // those two are ours to free. Nothing else is: 0 and the internal failure
+  // path free it themselves (:568), and ESTALLED means the stack is still
+  // holding it and will finish it when credits arrive.
+  if (rc == BLE_HS_EBADDATA || rc == BLE_HS_EBUSY) {
+    os_mbuf_free_chain(sdu);
+    return false;
+  }
+  if (rc == BLE_HS_ESTALLED) {
+    xSemaphoreTake(eventMutex_, portMAX_DELAY);
+    ble_->l2capTxStalled = true;
+    xSemaphoreGive(eventMutex_);
+    return true;
+  }
+  if (rc != 0) {
+    LOG_ERR("BLE", "L2CAP send failed (rc %d)", rc);
+    return false;
+  }
+  return true;
 }
 
 void BleLink::noteConnParams(const uint16_t connHandle, const uint16_t intervalUnits, const uint16_t latency,
@@ -2879,6 +3328,7 @@ void BleLink::finishUploadStats(const uint64_t dataSdUs) {
   LastUpload u;
   u.valid = true;
   u.kind = transferKind_;
+  u.l2cap = transportL2cap_;
   u.bytes = receivedBytes_;
   u.ms = millis() - stats.startMs;
   u.frames = arrivals.frames;
@@ -3279,6 +3729,13 @@ void BleLink::startAboutDownload(const size_t offset, const size_t chunkSize) {
     std::string stagedVersion;
     if (firmware_staging::readVersion(stagedVersion)) doc["staged_version"] = stagedVersion;
     doc["download_chunk_max"] = BLE_DOWNLOAD_CHUNK_BYTES_MAX;
+    // Only when the server is actually registered: the receive pool may have
+    // failed to allocate, and a client must not open a channel that is not there.
+    if (l2capServerUp()) {
+      JsonObject l2cap = doc["l2cap"].to<JsonObject>();
+      l2cap["psm"] = L2CAP_PSM;
+      l2cap["mtu"] = L2CAP_SDU_BYTES;
+    }
     doc["dark_mode"] = SETTINGS.screenInverted != 0;
     doc["device_name"] = SETTINGS.effectiveDeviceName();
     // Transfer measurements: the link in force and the last payload upload.
@@ -3313,6 +3770,7 @@ void BleLink::startAboutDownload(const size_t offset, const size_t chunkSize) {
       const LastUpload& u = lastUpload_;
       JsonObject j = doc["last_upload"].to<JsonObject>();
       j["kind"] = transferKindName(u.kind);
+      j["transport"] = u.l2cap ? "l2cap" : "gatt";
       j["bytes"] = u.bytes;
       j["ms"] = u.ms;
       j["frames"] = u.frames;
@@ -3349,6 +3807,7 @@ void BleLink::startAboutDownload(const size_t offset, const size_t chunkSize) {
     features.add("book_uuid");
     features.add("book_download");
     features.add("pair_prompt");
+    if (l2capServerUp()) features.add("l2cap_coc");
     String json;
     serializeJson(doc, json);
     // The app reads `about` on every connect and it rarely changes.
@@ -3657,16 +4116,26 @@ void BleLink::pumpDownload() {
                     BLE_DOWNLOAD_FRAME_HEADER_BYTES + BLE_DOWNLOAD_CHUNK_BYTES_MAX,
                 "downloadFrame_ must hold one frame of the largest chunk");
 
-  // Up to `window` frames past the last acknowledged one, all in this tick. The
-  // first frame of a window always goes (the pre-window behaviour); each further
-  // one waits for msys headroom, so frames still queued in the host cannot starve
-  // the buffer a get_ack write response or a status notification needs.
-  while (downloadSequence_ - downloadUnacked_ < downloadWindow_) {
+  // Over GATT a frame is an ATT notification and the client's `window` is what
+  // paces it: the first frame of a window always goes (the pre-window
+  // behaviour) and each further one waits for msys headroom, so frames still
+  // queued in the host cannot starve the buffer a get_ack write response or a
+  // status notification needs. Over the channel a frame is one SDU and the
+  // peer's credits pace it, so the loop simply runs until the stack stops
+  // taking frames.
+  uint8_t* frame = transportL2cap_ ? ble_->l2capFrame : downloadFrame_.data();
+  if (!frame) {
+    downloadFile_.close();
+    downloadOpen_ = false;
+    setError("no download buffer");
+    return;
+  }
+  while (transportL2cap_ || downloadSequence_ - downloadUnacked_ < downloadWindow_) {
     const bool inFlight = downloadSequence_ != downloadUnacked_;
-    if (inFlight && !BleLinkRuntime::hasNotifyHeadroom()) break;
+    if (!transportL2cap_ && inFlight && !BleLinkRuntime::hasNotifyHeadroom()) break;
     if (downloadFrameLength_ == 0) {
       if (downloadEof_) break;
-      const int read = downloadFile_.read(downloadFrame_.data() + BLE_DOWNLOAD_FRAME_HEADER_BYTES, downloadChunkSize_);
+      const int read = downloadFile_.read(frame + BLE_DOWNLOAD_FRAME_HEADER_BYTES, downloadChunkSize_);
       if (read < 0) {
         downloadFile_.close();
         downloadOpen_ = false;
@@ -3677,17 +4146,23 @@ void BleLink::pumpDownload() {
         downloadEof_ = true;
         break;
       }
-      downloadFrame_[0] = static_cast<uint8_t>(downloadSequence_ & 0xFF);
-      downloadFrame_[1] = static_cast<uint8_t>((downloadSequence_ >> 8) & 0xFF);
-      downloadFrame_[2] = static_cast<uint8_t>((downloadSequence_ >> 16) & 0xFF);
-      downloadFrame_[3] = static_cast<uint8_t>((downloadSequence_ >> 24) & 0xFF);
+      frame[0] = static_cast<uint8_t>(downloadSequence_ & 0xFF);
+      frame[1] = static_cast<uint8_t>((downloadSequence_ >> 8) & 0xFF);
+      frame[2] = static_cast<uint8_t>((downloadSequence_ >> 16) & 0xFF);
+      frame[3] = static_cast<uint8_t>((downloadSequence_ >> 24) & 0xFF);
       downloadFrameLength_ = BLE_DOWNLOAD_FRAME_HEADER_BYTES + static_cast<size_t>(read);
     }
-    // Refused (no buffer, not subscribed): the frame stays built and goes next tick.
-    if (!ble_->notifyData(downloadFrame_.data(), downloadFrameLength_)) break;
+    // Refused (no buffer, not subscribed, no credits): the frame stays built and
+    // goes out next tick, or when TX_UNSTALLED says there is room again.
+    const bool handedOver = transportL2cap_ ? sendL2capFrame(frame, downloadFrameLength_)
+                                            : ble_->notifyData(frame, downloadFrameLength_);
+    if (!handedOver) break;
     sentBytes_ += downloadFrameLength_ - BLE_DOWNLOAD_FRAME_HEADER_BYTES;
     downloadFrameLength_ = 0;
     downloadSequence_++;
+    // The channel is reliable and ordered, so a frame the stack has taken needs
+    // no get_ack to count as delivered: its credits are the acknowledgement.
+    if (transportL2cap_) downloadUnacked_ = downloadSequence_;
     if (sentBytes_ >= expectedSize_) downloadEof_ = true;
     if (sentBytes_ == expectedSize_ || sentBytes_ - lastProgressStatusBytes_ >= BLE_PROGRESS_STATUS_INTERVAL_BYTES) {
       lastProgressStatusBytes_ = sentBytes_;
@@ -3758,6 +4233,7 @@ void BleLink::resetTransfer(const bool removePart) {
   pendingCommit_ = false;
   removePartOnExit_ = false;
   uploadResumable_ = false;
+  transportL2cap_ = false;
 }
 
 void BleLink::setState(const State state) {
@@ -3789,6 +4265,7 @@ void BleLink::setAuthError(const std::string& error) {
   authHandle_ = NO_CONNECTION;
   trustedHostName_.clear();
   readerProof_.clear();
+  noteSessionAuth();
   statusDirty_ = true;
   publishStatus();
   notifyObserver();

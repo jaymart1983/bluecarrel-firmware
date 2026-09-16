@@ -43,6 +43,17 @@ able to flash their own builds), and an attacker who dumps internal flash over U
   replaces it; **Forget** clears the host record and every bond.
 - **One connection.** At most one central connected (`CONFIG_BT_NIMBLE_MAX_CONNECTIONS=1` or equivalent), and
   authentication state is bound to that connection's handle; events from any other handle are ignored.
+- **L2CAP channel.** Bulk transfers may use an LE connection-oriented channel on PSM `0x0080`
+  (`docs/ble-transfer-protocol.md`). NimBLE has no per-PSM security of its own — a server record is a PSM, an MTU and a
+  callback, and channel creation checks nothing — so the accept callback **is** the gate. A channel is admitted only
+  when it is being opened on the bound connection, that connection reports encrypted + authenticated + bonded, **and**
+  the GATT session has already passed `hello`; anything else is refused with `BLE_HS_EAUTHEN`, which the phone sees as
+  "insufficient authentication". Because `hello` state is main-loop-only and the accept callback runs on the NimBLE
+  host task, it is mirrored into an atomic that the host task reads. The channel is closed on disconnect, on a `hello`
+  reset or refusal, on **Forget**, on any pairing change, and whenever the session otherwise stops being
+  authenticated. The main loop accepts data from the channel only for a transfer the authenticated session itself
+  opened with `"transport":"l2cap"`. The app opens the channel with Android's **secure** `createL2capChannel`, never
+  `createInsecureL2capChannel`, so the phone's own stack enforces the same bar before the channel is even offered.
 - **Hello timeout.** A connection that has not completed a valid `hello` (or `pair`) within 20 s of encryption is
   disconnected. The count pauses while a pair prompt for that connection is on screen and restarts after a refusal. Three invalid `hello`s on one connection: disconnect.
 - **Pre-authentication status** (encrypted but before `hello`/`pair` succeeds) carries only `state`,

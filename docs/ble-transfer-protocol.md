@@ -215,7 +215,8 @@ Uploads use `start_put`, binary frames on `data-in`, then `commit`.
 | `version` | string | `firmware` only, required. The image's build stamp, `yyyyMMdd.HHmm` (for example `20260913.1914`). Saved as `firmware.bin.version`. |
 | `signature` | string | `firmware` only, required. The image signature as lowercase hex, even length, at most 256 characters (see [Signatures](#signatures)). Saved as `firmware.bin.sig`. |
 | `req` | number | Only when answering a Store request. |
-| `resume`, `chunk_size`, `ack_bytes` | bool, number, number | Resumable upload and credit flow-control options. |
+| `transport` | string | `l2cap` to send the frames on the [L2CAP channel](#the-l2cap-channel) instead of `data-in`, or `gatt`. Absent means `gatt`. `l2cap` without an open channel fails with `no channel`; any other value fails with `unsupported transport`. |
+| `resume`, `chunk_size`, `ack_bytes` | bool, number, number | Resumable upload and credit flow-control options. `ack_bytes` may be up to 64 KB over GATT and up to 256 KB with `"transport":"l2cap"`. |
 
 Supported upload kinds:
 
@@ -265,7 +266,8 @@ declining a Store request it cannot answer) and `cancel`.
 | `kind` | string | Download kind, above. Required. |
 | `offset` | integer | Byte offset to start from. Default `0`. Must be a multiple of the chunk size in use unless it equals the document size; otherwise `unaligned download offset`. |
 | `chunk_size` | integer | Payload bytes per frame. Default `160`. Accepted from `20` up to `download_chunk_max` from the [`about`](#about) download (`490`); older firmware accepts at most `160`. Outside that range: `invalid download chunk size`. |
-| `window` | integer | Frames the reader may send past the last acknowledged one, `1`–`16`. Default `1`. Anything else, including a non-integer: `invalid window`. Older firmware ignores it and behaves as `1`. |
+| `window` | integer | Frames the reader may send past the last acknowledged one, `1`–`16`. Default `1`. Anything else, including a non-integer: `invalid window`. Older firmware ignores it and behaves as `1`. Ignored with `"transport":"l2cap"`, where credits pace the reader instead. |
+| `transport` | string | `l2cap` to receive the frames on the [L2CAP channel](#the-l2cap-channel) instead of `data-out`, or `gatt`. Absent means `gatt`. `l2cap` without an open channel fails with `no channel`; any other value fails with `unsupported transport`. With `l2cap`, `chunk_size` may be up to 4092 and is used as asked. |
 
 **Chunk size.** A `chunk_size` of `160` or less is used as asked. A larger one is shrunk to what one notification on
 the current link can carry, `ATT_MTU - 3 - 4`, but never below `160`; it is not refused. At the MTU of 517 the reader
@@ -292,6 +294,47 @@ and `size`, and `chunk_size` as described above.
 The reader also paces itself: it holds back frames while NimBLE's buffers run low, so a window is a maximum, not a
 promise that `window` frames arrive back to back. The client must not treat a pause shorter than its stall timeout as
 an error.
+
+## The L2CAP channel
+
+Books and firmware images can move on an **LE L2CAP connection-oriented channel** instead of on `data-in` /
+`data-out`. Everything else about a transfer is unchanged: the same `start_put` / `commit`, the same `start_get`, the
+same 4-byte sequence on every frame, the same SHA-256 and the same status documents. Only the pipe is different.
+
+**Why.** A GATT frame is an ATT write the phone issues one at a time, waiting for the stack's write callback before
+the next: at a 7.5 ms connection interval that ceiling is about 24 KB/s however large the frames are. A channel is a
+credit-windowed byte stream, so the phone writes into a socket and the link layer keeps the pipe full.
+
+| | |
+| --- | --- |
+| PSM | `0x0080` (128), fixed. Advertised as `l2cap.psm` in [`about`](#about) |
+| SDU size | 4096 bytes, advertised as `l2cap.mtu` |
+| Frame | one SDU is exactly one frame: a little-endian `uint32` sequence then up to 4092 payload bytes |
+| Feature flag | `l2cap_coc` in the [`about`](#about) `features` array |
+
+**Security.** The channel is admitted only when *all* of these hold, and is refused with **insufficient
+authentication** otherwise:
+
+- it is being opened on the connection the link is already bound to;
+- that connection is encrypted, authenticated (MITM) and bonded;
+- that connection's GATT session has already passed [`hello`](#hello).
+
+So the channel never widens what a peer can reach: it is opened after authentication and closed again the moment the
+session stops being authenticated — on disconnect, on a refused or reset `hello`, on **Forget**, and on any pairing
+change. A client must call Android's **secure** `createL2capChannel`; the insecure variant gets as far as the
+refusal and no further. See [security-v2.md](./security-v2.md).
+
+**Flow control.** The reader grants the peer enough credits for exactly one SDU and returns them only once the main
+loop has taken that SDU off the channel, so a blocking socket write on the phone blocks precisely when the reader is
+behind — there is no window to tune and no acknowledgement per frame. Uploads keep their `received` status acks, but
+because the credits already do the pacing, `ack_bytes` is only how often progress is reported and may be up to 256 KB.
+Downloads send no `get_ack` at all: the channel is reliable and ordered, so a frame the stack has taken is delivered,
+and `state: "sent"` follows the last frame rather than its acknowledgement.
+
+**Falling back.** A `start_put` or `start_get` naming `"transport":"l2cap"` without an open channel is refused with
+`no channel`, and the client is expected to send it again over GATT. A client that loses the channel *mid*-transfer
+should fail that transfer and retry it later rather than splicing the two transports together: the reader ignores
+`data-in` writes while a transfer is running on the channel, and vice versa.
 
 ## Opening position
 
@@ -393,7 +436,7 @@ Support is advertised as `dark_mode` in the `features` list of the [`about`](#ab
 ```json
 {"firmware_version":"20260913.1914","running_partition":"app1","update_staged":true,
  "install_at_sleep":true,"staged_version":"20260914.0800","download_chunk_max":490,"dark_mode":false,
- "device_name":"Bluecarrel",
+ "device_name":"Bluecarrel","l2cap":{"psm":128,"mtu":4096},
  "link":{"interval_ms":7.5,"latency":0,"timeout_ms":4000,"tx_octets":251,"rx_octets":251,"dl_reported":true,"phy":"2M",
   "requested":{"min_ms":7.5,"max_ms":7.5,"result":"accepted"}},
  "last_upload":{"kind":"firmware","bytes":4677152,"ms":135800,"frames":9430,"min_msys_free":9,"min_acl_free":6,
@@ -414,9 +457,10 @@ Support is advertised as `dark_mode` in the `features` list of the [`about`](#ab
 | `download_chunk_max` | integer | The largest `start_get` `chunk_size` this firmware accepts (`490`). Absent on older firmware, which accepts at most `160`. See [Download frames and acknowledgement](#download-frames-and-acknowledgement). |
 | `dark_mode` | bool | `true` while the reader draws inverted (dark mode). Set with [`set_dark_mode`](#set_dark_mode). Absent on older firmware. |
 | `device_name` | string | The name the reader advertises: its `deviceName` setting, or `Bluecarrel` when that is blank. Absent on older firmware. |
+| `l2cap` | object | The [L2CAP channel](#the-l2cap-channel): `psm` (128) and `mtu` (the 4096-byte SDU size). Present only when the channel's server is actually registered, so a client must not open a channel without it. Absent on older firmware. |
 | `link` | object | The connection as it is now; absent when no phone is connected. See [`link`](#link-and-last_upload). |
 | `last_upload` | object | Measurements of the last `book`, `bmp` or `firmware` upload since boot. Absent before one. See [`last_upload`](#link-and-last_upload). |
-| `features` | array of strings | Protocol features beyond the upload and download kinds. `book_position`: a `book` upload accepts `position` (see [Opening position](#opening-position)). `download_window`: `start_get` accepts `window` and `get_ack` is cumulative (see [Download frames and acknowledgement](#download-frames-and-acknowledgement)). `dark_mode`: the `set_dark_mode` op is supported and `dark_mode` is reported here. `book_uuid`: `start_put` for `book` and `book_meta` accept `calibre_uuid`, and `library` reports it. `book_download`: the `book` download kind (see [`book` download](#book-download)). `pair_prompt`: a closed-window `pair` asks on the reader (see [Pair prompt](#pair-prompt)). Absent on older firmware. |
+| `features` | array of strings | Protocol features beyond the upload and download kinds. `book_position`: a `book` upload accepts `position` (see [Opening position](#opening-position)). `download_window`: `start_get` accepts `window` and `get_ack` is cumulative (see [Download frames and acknowledgement](#download-frames-and-acknowledgement)). `dark_mode`: the `set_dark_mode` op is supported and `dark_mode` is reported here. `book_uuid`: `start_put` for `book` and `book_meta` accept `calibre_uuid`, and `library` reports it. `book_download`: the `book` download kind (see [`book` download](#book-download)). `pair_prompt`: a closed-window `pair` asks on the reader (see [Pair prompt](#pair-prompt)). `l2cap_coc`: `start_put` and `start_get` accept `"transport":"l2cap"` and the `l2cap` object above says where (see [The L2CAP channel](#the-l2cap-channel)). Absent on older firmware. |
 
 `about` is not listed in `download_kinds`.
 
@@ -461,6 +505,7 @@ Each request and its outcome are logged at INFO (`link request <n> (<why>): ...`
 | Field | Type | Meaning |
 | --- | --- | --- |
 | `kind` | string | `book`, `bmp` or `firmware`. |
+| `transport` | string | `l2cap` or `gatt`: which transport carried the frames (see [The L2CAP channel](#the-l2cap-channel)). |
 | `bytes` | integer | Payload bytes received. |
 | `ms` | integer | `start_put` to `commit`. |
 | `frames` | integer | Data frames that arrived. |

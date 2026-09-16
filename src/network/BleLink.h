@@ -21,6 +21,10 @@
 
 class BleStoreController;
 struct BleLinkRuntime;
+// NimBLE's L2CAP event, passed straight through to the host-task handler below.
+// Declared rather than included: this header is pulled in by screens that must
+// not take a dependency on the BLE stack's headers.
+struct ble_l2cap_event;
 
 // The reader's Bluetooth link. One NimBLE peripheral, one hello/HMAC gate, one
 // framed upload path with credit flow control and SHA-256, one download path.
@@ -254,6 +258,32 @@ class BleLink {
   // cap. Download chunks are sized from it.
   size_t dataNotifyCapBytes() const;
 
+  // --- L2CAP connection-oriented channel ------------------------------------
+  //
+  // The bulk transport for books and firmware (docs/ble-transfer-protocol.md).
+  // One server on a fixed dynamic PSM; at most one channel, and only ever for
+  // the connection that owns the authenticated GATT session.
+  //
+  // WHY A SECOND TRANSPORT. A GATT frame is an ATT write the phone must issue
+  // one at a time, waiting for each write's callback: at a 7.5 ms interval that
+  // is what held a book to ~24 KB/s. A CoC channel is a credit-windowed byte
+  // stream, so the phone writes into a socket and the link layer keeps the pipe
+  // full without a round trip per frame.
+  static constexpr uint16_t L2CAP_PSM = 0x0080;
+  static constexpr uint16_t L2CAP_SDU_BYTES = 4096;
+  // One SDU is one frame: the same 4-byte little-endian sequence a GATT data
+  // frame carries, then the payload.
+  static constexpr size_t L2CAP_FRAME_HEADER_BYTES = sizeof(uint32_t);
+  static constexpr size_t L2CAP_FRAME_PAYLOAD_MAX = L2CAP_SDU_BYTES - L2CAP_FRAME_HEADER_BYTES;
+  // Every CoC event, from the NimBLE host task. What this returns for an ACCEPT
+  // is the refusal the peer sees: 0 admits the channel, BLE_HS_EAUTHEN reports
+  // insufficient authentication (ble_l2cap_sig.c:686-687).
+  int onL2capEvent(ble_l2cap_event* event);
+  // The server is registered, so `about` may advertise the channel.
+  bool l2capServerUp() const;
+  // A channel is open and belongs to the authenticated session.
+  bool l2capChannelOpen() const;
+
   // READ is the authoritative document a GATT read returns -- everything the
   // session knows. NOTIFY is the doorbell: the same document with the fields a
   // client can re-read dropped, so it fits an ATT payload without truncation.
@@ -319,6 +349,15 @@ class BleLink {
   // The connection an accepted hello or pair belongs to.
   uint16_t authHandle_ = NO_CONNECTION;
   bool sessionAuthenticated() const { return helloAccepted_ && authHandle_ == connHandle_.load(); }
+  // sessionAuthenticated() as the NimBLE host task can read it.
+  //
+  // The accept gate runs on that task, and the state above is main-loop-only:
+  // helloAccepted_ and authHandle_ are written by hello, pair, disconnect and
+  // forget, none of which the host task can see. So every one of those goes
+  // through noteSessionAuth(), which republishes this mirror and closes the
+  // channel the moment the session stops being authenticated.
+  std::atomic<bool> sessionAuthMirror_{false};
+  void noteSessionAuth();
   uint8_t invalidHellos_ = 0;
   unsigned long connectedAtMs_ = 0;
   unsigned long securedAtMs_ = 0;
@@ -376,6 +415,11 @@ class BleLink {
   uint32_t progressApplied_ = 0;
   size_t uploadChunkSize_ = 0;
   size_t uploadAckBytes_ = 0;
+  // This transfer carries its frames on the L2CAP channel rather than on GATT.
+  // Set by a start_put or start_get naming "transport":"l2cap"; frames arriving
+  // on the channel are accepted only while it is true, and only for the
+  // transfer the authenticated session opened.
+  bool transportL2cap_ = false;
   size_t downloadChunkSize_ = 0;
   uint32_t expectedSequence_ = 0;
   // Next sequence to send, and the first one not yet acknowledged; frames in
@@ -512,6 +556,8 @@ class BleLink {
   struct LastUpload {
     bool valid = false;
     TransferKind kind = TransferKind::NONE;
+    // The transport the upload actually ran on, reported as `transport`.
+    bool l2cap = false;
     size_t bytes = 0;
     unsigned long ms = 0;
     uint32_t frames = 0;
@@ -602,6 +648,17 @@ class BleLink {
   void onControlWrite(const std::string& value);
   // `arrivalMs`: when the host task queued the frame.
   void onDataWrite(const std::string& value, unsigned long arrivalMs);
+  // The body of one data frame, whichever transport carried it, so the sequence
+  // check, SHA-256, write buffer and ack accounting have one definition.
+  void onDataFrame(const uint8_t* data, size_t length, unsigned long arrivalMs);
+  // Hands the SDUs the host task queued to onDataFrame(). A receive buffer goes
+  // back to the channel BEFORE the frame is processed, so the phone's credits
+  // are never held for the length of an SD write.
+  void drainL2capRx();
+  void closeL2capChannel(const char* why);
+  // One frame of a download. False when the stack would not take it; the caller
+  // keeps the frame and sends it again when TX_UNSTALLED says there is room.
+  bool sendL2capFrame(const uint8_t* data, size_t length);
   void processCommit();
   void startFileDownload(const char* path, const char* name, TransferKind kind, size_t offset, size_t chunkSize);
   void startCrashReportDownload(size_t offset, size_t chunkSize);

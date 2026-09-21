@@ -805,25 +805,28 @@ The role of the side buttons can be swapped in the **[Controls Settings](#363-co
 
 If the **Short Power Button Click** setting is set to "Page Turn", you can also turn to the next page by briefly pressing the Power button.
 
-**Touch page turns (touch devices such as the X4 Pro).** Think of the page as a 4 x 4 grid:
+**Touch page turns (touch devices such as the X4 Pro).** The page is split into three bands:
 
 ```
-+----+----+----+----+
-|    |    |    |    |
-+----+----+----+----+
-|back|    |    |next|
-+----+----+----+----+
-|back|    |    |next|
-+----+----+----+----+
-|    |    |    |    |
-+----+----+----+----+
++-----------------------------+
+|     status bar  (top 1/4)   |
++---------+-------------------+
+|         |                   |
+|  back   |       next        |
+|  (1/3)  |       (2/3)       |
+|         |                   |
++---------+-------------------+
+|   reader menu  (bottom 1/4) |
++-----------------------------+
 ```
 
-- Tap the middle two cells of the **left** column to go back a page, and the middle two cells of the **right** column to
-  go forward.
-- **Touch Reader Controls > Inverted Tap** swaps the two sides. **Swipe** also turns pages with a horizontal swipe.
-- Tapping the centre of the page opens the reader menu. The top and bottom rows do not turn pages.
-- A link inside a page-turn cell is followed instead of turning the page.
+- In the **middle half** of the page, tap the **left third** to go back a page and anywhere in the **right two thirds**
+  to go forward.
+- **Touch Reader Controls > Inverted Tap** mirrors the split: the right third goes back and the left two thirds go
+  forward. **Swipe** also turns pages with a horizontal swipe.
+- Tap the **bottom quarter** of the page to open the reader menu (font, chapters and the rest). Tap the centre of the
+  status bar at the top to open the Control Centre.
+- A link is followed instead of turning the page, wherever it is on the page.
 - Page-turn taps and link taps follow the touchscreen switch (the **Touch** tile in the Control Centre): with touch
   off, only the side keys turn pages.
 

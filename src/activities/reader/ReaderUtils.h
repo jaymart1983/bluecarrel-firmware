@@ -114,22 +114,23 @@ inline TouchPageTurn detectTouchPageTurn(const GfxRenderer& renderer, const Mapp
     return result;
   }
 
-  // Page-turn taps on a 4x4 grid over the page: the middle two rows of the outer
-  // columns -- two cells on the left turn back, two on the right turn forward.
-  // The top and bottom rows stay free, and the centre columns keep the
-  // reader-menu tap (isTouchMenuTap, the centre third), which these quarter-width
-  // columns do not reach. Logical coordinates, so the grid follows the reading
-  // orientation.
+  // Page-turn taps fill the middle half of the page: the left third turns back and
+  // the right two thirds turn forward, so the common tap has the larger target.
+  // Inverted Tap mirrors the split, keeping forward on the larger side. The top
+  // quarter holds the status bar (its centre opens the Control Centre, handled in
+  // ActivityManager) and the bottom quarter opens the reader menu (isTouchMenuTap).
+  // Logical coordinates, so the zones follow the reading orientation.
   const int16_t width = static_cast<int16_t>(renderer.getScreenWidth());
   const int16_t height = static_cast<int16_t>(renderer.getScreenHeight());
-  const int16_t cellWidth = width / 4;
-  const int16_t cellHeight = height / 4;
-  const int16_t bandTop = cellHeight;
-  const int16_t bandHeight = static_cast<int16_t>(height - 2 * cellHeight);
+  const int16_t bandTop = height / 4;
+  const int16_t bandHeight = static_cast<int16_t>(height - 2 * bandTop);
+  const int16_t third = width / 3;
+  const int16_t twoThirds = static_cast<int16_t>(width - third);
   const bool inverted = SETTINGS.touchReaderControls == CrossPointSettings::TOUCH_READER_INVERTED_TAP;
   const freeink::ui::TapZone zones[] = {
-      {freeink::ui::Rect{0, bandTop, cellWidth, bandHeight}, inverted ? READER_TOUCH_NEXT : READER_TOUCH_PREV},
-      {freeink::ui::Rect{static_cast<int16_t>(width - cellWidth), bandTop, cellWidth, bandHeight},
+      {freeink::ui::Rect{0, bandTop, inverted ? twoThirds : third, bandHeight},
+       inverted ? READER_TOUCH_NEXT : READER_TOUCH_PREV},
+      {freeink::ui::Rect{inverted ? twoThirds : third, bandTop, inverted ? third : twoThirds, bandHeight},
        inverted ? READER_TOUCH_PREV : READER_TOUCH_NEXT},
   };
 
@@ -143,25 +144,24 @@ inline TouchPageTurn detectTouchPageTurn(const GfxRenderer& renderer, const Mapp
   return result;
 }
 
-// Tap in the center third of the screen: the tap path into the reader menu on
-// every touch board. The page-turn tap cells are the outer quarter columns of
-// the middle band, so the centered rectangle remains free. The Off/Swipe Up
-// alternatives are only surfaced on home-key boards (SettingsList), where the
-// menu stays reachable through the key's long-press function.
+// Tap in the bottom quarter of the screen: the tap path into the reader menu on
+// every touch board. Page-turn taps take the whole middle half
+// (detectTouchPageTurn), so the menu lives below them, across the full width.
+// The Off/Swipe Up alternatives are only surfaced on home-key boards
+// (SettingsList), where the menu stays reachable through the key's long-press
+// function.
 inline bool isTouchMenuTap(const GfxRenderer& renderer, const MappedInputManager& input) {
   if (!input.hasTouch()) return false;
   if (SETTINGS.showReaderMenu != CrossPointSettings::READER_MENU_TAP) return false;
   int x = 0;
   int y = 0;
   if (!input.wasScreenTapped(x, y)) return false;
-  const int width = renderer.getScreenWidth();
   const int height = renderer.getScreenHeight();
-  const int zoneWidth = width / 3;
-  const int zoneHeight = height / 3;
-  return x >= zoneWidth && x < width - zoneWidth && y >= zoneHeight && y < height - zoneHeight;
+  // Same boundary as the bottom of the page-turn band in detectTouchPageTurn.
+  return y >= height - height / 4;
 }
 
-// Reader menu opens on the menu edge-swipe or a center-third tap. On home-key
+// Reader menu opens on the menu edge-swipe or a bottom-quarter tap. On home-key
 // boards a long press of the capacitive key runs the user-selected long-press
 // function instead (SETTINGS.longPressMenuFunction), not the menu.
 // Menu gestures honor showReaderMenu independently of touchReaderControls,

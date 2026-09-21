@@ -119,8 +119,11 @@ jobs:
         run: |
           built=$(sha256sum ".pio/build/$PIO_ENV/firmware.bin" | cut -d' ' -f1)
           # The release is created right after the tag is pushed, so allow for it landing late.
+          # Waiting is only for "not published yet"; any other download failure stops here.
           for attempt in $(seq 1 30); do
-            if gh release download "$TAG" -R "$GITHUB_REPOSITORY" -p firmware.json -D published -O firmware.json 2>/dev/null; then
+            if gh release view "$TAG" -R "$GITHUB_REPOSITORY" >/dev/null 2>&1; then
+              gh release download "$TAG" -R "$GITHUB_REPOSITORY" -p firmware.json \
+                -O published-firmware.json --clobber
               break
             fi
             if [ "$attempt" = 30 ]; then
@@ -129,8 +132,8 @@ jobs:
             fi
             sleep 10
           done
-          published=$(python -c 'import json;print(json.load(open("published/firmware.json"))["sha256"])')
-          version=$(python -c 'import json;print(json.load(open("published/firmware.json"))["version"])')
+          published=$(python -c 'import json;print(json.load(open("published-firmware.json"))["sha256"])')
+          version=$(python -c 'import json;print(json.load(open("published-firmware.json"))["version"])')
           echo "published $version $published"
           echo "rebuilt   $X4_BUILD_STAMP $built"
           if [ "$version" != "$X4_BUILD_STAMP" ]; then

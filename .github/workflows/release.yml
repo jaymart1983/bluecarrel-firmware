@@ -146,6 +146,17 @@ jobs:
           fi
           echo "The published image matches a clean rebuild of $TAG."
 
+      # On a mismatch, keep this build so the two images can be compared byte for byte.
+      - name: Keep the rebuilt image for comparison
+        if: failure() && env.PUBLISH != 'true'
+        uses: actions/upload-artifact@v4
+        with:
+          name: rebuilt-${{ env.TAG }}
+          path: |
+            .pio/build/${{ env.PIO_ENV }}/firmware.bin
+            .pio/build/${{ env.PIO_ENV }}/firmware.map
+          retention-days: 14
+
       # Written after the build so no build script runs while the key is on disk.
       - name: Write signing key
         if: env.PUBLISH == 'true'

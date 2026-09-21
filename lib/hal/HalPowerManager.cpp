@@ -11,6 +11,7 @@
 
 #include <cassert>
 
+#include "HalFrontlight.h"
 #include "HalGPIO.h"
 
 #if FREEINK_DEVICE_PAPERMONO
@@ -29,12 +30,28 @@ void HalPowerManager::begin() {
     pinMode(BoardConfig::ACTIVE.batteryAdc, INPUT);
   }
   normalFreq = getCpuFrequencyMhz();
+  freqSinceMs = millis();
   modeMutex = xSemaphoreCreateMutex();
   assert(modeMutex != nullptr);
+  freqMutex = xSemaphoreCreateMutex();
+  assert(freqMutex != nullptr);
+}
+
+bool HalPowerManager::switchFrequency(const bool low) {
+  const int target = low ? LOW_POWER_FREQ : normalFreq;
+  if (!setCpuFrequencyMhz(target)) {
+    LOG_DBG("PWR", "Failed to set CPU frequency = %d MHz", target);
+    return false;
+  }
+  const uint32_t now = millis();
+  (isLowPower ? lowMs : normalMs) += now - freqSinceMs;
+  freqSinceMs = now;
+  isLowPower = low;
+  return true;
 }
 
 void HalPowerManager::setPowerSaving(bool enabled) {
-  if (normalFreq <= 0) {
+  if (normalFreq <= 0 || freqMutex == nullptr) {
     return;  // invalid state
   }
 
@@ -50,24 +67,69 @@ void HalPowerManager::setPowerSaving(bool enabled) {
   // it's not very important if we read a slightly stale value for currentLockMode
   const LockMode mode = currentLockMode;
 
-  if (mode == None && enabled && !isLowPower) {
-    LOG_DBG("PWR", "Going to low-power mode");
-    if (!setCpuFrequencyMhz(LOW_POWER_FREQ)) {
-      LOG_DBG("PWR", "Failed to set CPU frequency = %d MHz", LOW_POWER_FREQ);
+  xSemaphoreTake(freqMutex, portMAX_DELAY);
+  if (panelWaitLow) {
+    // A panel wait owns the low clock until it ends, even under a Lock. Only a
+    // request for full speed takes it back.
+    if (enabled) {
+      xSemaphoreGive(freqMutex);
       return;
     }
-    isLowPower = true;
-
-  } else if ((!enabled || mode != None) && isLowPower) {
-    LOG_DBG("PWR", "Restoring normal CPU frequency");
-    if (!setCpuFrequencyMhz(normalFreq)) {
-      LOG_DBG("PWR", "Failed to set CPU frequency = %d MHz", normalFreq);
-      return;
-    }
-    isLowPower = false;
+    panelWaitLow = false;
   }
 
+  if (mode == None && enabled && !isLowPower) {
+    LOG_DBG("PWR", "Going to low-power mode");
+    switchFrequency(true);
+  } else if ((!enabled || mode != None) && isLowPower) {
+    LOG_DBG("PWR", "Restoring normal CPU frequency");
+    switchFrequency(false);
+  }
   // Otherwise, no change needed
+  xSemaphoreGive(freqMutex);
+}
+
+void HalPowerManager::panelWaitBeginHook() {
+  HalPowerManager& pm = powerManager;
+  if (pm.normalFreq <= 0 || pm.freqMutex == nullptr) return;
+  xSemaphoreTake(pm.freqMutex, portMAX_DELAY);
+  pm.panelWaitOpen = true;
+  pm.panelWaitStartMs = millis();
+  pm.panelWaitCount++;
+  if (!pm.isLowPower && pm.switchFrequency(true)) pm.panelWaitLow = true;
+  xSemaphoreGive(pm.freqMutex);
+}
+
+void HalPowerManager::panelWaitEndHook() {
+  HalPowerManager& pm = powerManager;
+  if (pm.normalFreq <= 0 || pm.freqMutex == nullptr) return;
+  xSemaphoreTake(pm.freqMutex, portMAX_DELAY);
+  if (pm.panelWaitOpen) {
+    pm.panelWaitMsTotal += millis() - pm.panelWaitStartMs;
+    pm.panelWaitOpen = false;
+  }
+  // Back to full speed for whatever the waiter does next; the main loop lowers
+  // it again once idle.
+  if (pm.panelWaitLow) {
+    pm.panelWaitLow = false;
+    if (pm.isLowPower) pm.switchFrequency(false);
+  }
+  xSemaphoreGive(pm.freqMutex);
+}
+
+HalPowerManager::Counters HalPowerManager::counters() const {
+  Counters c{};
+  c.normalMhz = normalFreq;
+  c.lowMhz = LOW_POWER_FREQ;
+  if (freqMutex == nullptr) return c;
+  xSemaphoreTake(freqMutex, portMAX_DELAY);
+  const uint32_t now = millis();
+  c.normalMs = normalMs + (isLowPower ? 0 : now - freqSinceMs);
+  c.lowMs = lowMs + (isLowPower ? now - freqSinceMs : 0);
+  c.panelWaitMs = panelWaitMsTotal + (panelWaitOpen ? now - panelWaitStartMs : 0);
+  c.panelWaits = panelWaitCount;
+  xSemaphoreGive(freqMutex);
+  return c;
 }
 
 void HalPowerManager::startDeepSleep(HalGPIO& gpio) const {
@@ -92,6 +154,12 @@ void HalPowerManager::startDeepSleep(HalGPIO& gpio) const {
     gpio_hold_en(XTEINK_C3_GPIO13);
   }
 #endif
+
+  // Every path to deep sleep comes through here, including the ghost-wake
+  // re-sleep in setup() that runs after the light was restored. The latch below
+  // keeps the LED driver's supply up, so the light must be parked, not left to
+  // the pad isolation.
+  Frontlight.parkForDeepSleep();
 
   // Hold every configured power-latch pin HIGH through deep sleep. These are
   // keep-alive enables (the X4 Pro's master peripheral rail on GPIO1, the

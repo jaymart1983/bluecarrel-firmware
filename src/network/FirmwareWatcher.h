@@ -16,7 +16,10 @@
 // the card mounted over USB, and both routes end here.
 //
 // Hashing an image off SD takes seconds, so it runs in HASH_CHUNK_BYTES bites
-// across main-loop ticks, and only when the staged files change. With nothing
+// across main-loop ticks, and only when the staged files change. The digest is
+// remembered in RTC memory across deep sleep, keyed by the image's size and
+// modify time and the companion hash file, so a leftover image is not re-read on
+// every wake; the installer hashes the image again before it writes flash. With nothing
 // staged a poll is two Storage::exists() calls; with something staged it also
 // reads the image size and the three small companion files.
 class FirmwareWatcher {
@@ -61,12 +64,13 @@ class FirmwareWatcher {
   // What the current verdict was reached on; any difference means a new stage.
   struct Fingerprint {
     size_t size = 0;
+    uint32_t mtime = 0;  // FAT modify time as epoch seconds; 0 when the card has none
     uint32_t generation = 0;
     std::string hash;
     std::string version;
     std::string signature;
     bool operator==(const Fingerprint& other) const {
-      return size == other.size && generation == other.generation && hash == other.hash &&
+      return size == other.size && mtime == other.mtime && generation == other.generation && hash == other.hash &&
              version == other.version && signature == other.signature;
     }
   };
@@ -77,6 +81,9 @@ class FirmwareWatcher {
   void resetStage();
   void beginHash();
   void finishHash();
+  // The verdict on `actual`, the image's SHA-256 (hex), whether just hashed or
+  // remembered across sleep.
+  void concludeWithDigest(const std::string& actual);
   void reject(firmware_signature::Verdict verdict, const char* reason);
 
   Phase phase_ = Phase::IDLE;

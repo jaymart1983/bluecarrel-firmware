@@ -30,6 +30,7 @@
 #include "CrossPointState.h"
 #include "DeviceSleep.h"
 #include "MappedInputManager.h"
+#include "PowerStats.h"
 #include "RecentBooksStore.h"
 #include "SdCardFontSystem.h"
 #include "activities/settings/FirmwareReadyActivity.h"
@@ -538,6 +539,14 @@ void setupDisplayAndFonts(bool seamless = false) {
 #endif
 
   display.begin(seamless);
+#if BOARD_HAS_PSRAM
+  // The panel's waveform runs 0.3-2 s per refresh with the CPU only polling
+  // BUSY; run that wait at the low clock (HalPowerManager::panelWaitBeginHook).
+  // PSRAM boards only: their low clock is 80 MHz, which leaves the APB (SPI to
+  // the SD card and panel) untouched. The C3's 10 MHz would retime the SD bus
+  // under a main loop that may be using it.
+  display.setBusyWaitHooks(HalPowerManager::panelWaitBeginHook, HalPowerManager::panelWaitEndHook);
+#endif
   renderer.begin();
   // Every screen that is not a reader page lays out in the device's UI frame:
   // portrait on boards that have a portrait mode, the panel's native 800x480
@@ -836,6 +845,7 @@ void loop() {
   static unsigned long maxLoopDuration = 0;
   const unsigned long loopStartTime = millis();
   static unsigned long lastMemPrint = 0;
+  power_stats::noteLoopPass(loopStartTime, gpio.touchReadCount());
 
   gpio.setSharedConfirmPowerShortPressEmitsPower(SETTINGS.shortPwrBtn == CrossPointSettings::SHORT_PWRBTN::SLEEP);
   // The side-key scheme is context-sensitive, so the input layer has to know
@@ -851,7 +861,7 @@ void loop() {
     const bool readerOpen = activityManager.isReaderActivity();
     if (readerOpen != lastReaderOpen) {
       lastReaderOpen = readerOpen;
-      BLE_LINK.notePositionChanged();
+      BLE_LINK.notePositionChanged(/*immediate=*/true);
     }
   }
 #endif

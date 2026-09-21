@@ -4,6 +4,8 @@
 
 #include <ArduinoJson.h>
 #include <HalClock.h>
+#include <HalGPIO.h>
+#include <HalPowerManager.h>
 #include <Logging.h>
 #include <Memory.h>
 #include <NimBLEDevice.h>
@@ -33,6 +35,7 @@
 #include "BuildStamp.h"
 #include "CrossPointSettings.h"
 #include "HomeShelfStore.h"
+#include "PowerStats.h"
 #include "components/UITheme.h"
 #include "FirmwareFlasher.h"
 #include "FirmwareStaging.h"
@@ -812,10 +815,11 @@ class ServerCallbacks final : public NimBLEServerCallbacks {
     // 1.2 s, and a dropped link is what the app then has to notice, reconnect
     // and re-authenticate through.
     //
-    // Latency stays 0: the peripheral answers every event, which is what keeps
-    // a notification prompt and a transfer fast. The cost is the modem floor
-    // while awake, which is already the price of the radio being always on.
-    link_.requestLinkInterval(handle, BleLink::LINK_FAST_ITVL_UNITS, BleLink::LINK_FAST_ITVL_UNITS, "connect");
+    // Latency 0 while fast: the peripheral answers every event, which is what
+    // keeps discovery, pairing and a transfer fast. The idle request that
+    // follows (updateLinkInterval) adds peripheral latency.
+    link_.requestLinkInterval(handle, BleLink::LINK_FAST_ITVL_UNITS, BleLink::LINK_FAST_ITVL_UNITS, 0,
+                              BleLink::LINK_TIMEOUT_UNITS, "connect");
     server->setDataLen(handle, 251);
     // BLE 5.0 2M PHY: double the symbol rate, which is the only throughput lever
     // left on this link. The interval is already at the 7.5 ms spec minimum and
@@ -1467,6 +1471,11 @@ void BleLink::tick() {
     }
     uploadLoop_.lastTickMs = nowMs;
   }
+  // A coalesced page turn whose gap is up.
+  if (positionPending_ && millis() - lastPositionRefreshMs_ >= POSITION_NOTIFY_GAP_MS) {
+    refreshPingSnapshot(false);
+    statusDirty_ = true;
+  }
   // Heartbeat. Only while a phone is actually listening: notifying into an
   // empty room costs radio and tells nobody anything.
   if (isPeerConnected()) {
@@ -1951,6 +1960,10 @@ void BleLink::onSecurityResult(const BleEvent& event) {
   notifyObserver();
   if (!event.accepted || event.connHandle != connHandle_.load()) return;
   securedAtMs_ = millis();
+  // hello and the first sync follow; run them fast even if a slow pairing let
+  // the connect hold lapse into the idle interval.
+  linkLastBulkMs_ = securedAtMs_;
+  linkConnectHold_ = true;
   if (event.newBond) adoptNewBond(event.value);
 }
 
@@ -2814,6 +2827,12 @@ bool BleLink::l2capChannelOpen() const {
 
 void BleLink::noteSessionAuth() {
   const bool authenticated = sessionAuthenticated();
+  // The first sync follows hello; hold the fast interval for it even when a
+  // pair prompt or a slow passkey let the link relax first.
+  if (authenticated && !sessionAuthMirror_.load()) {
+    linkLastBulkMs_ = millis();
+    linkConnectHold_ = true;
+  }
   sessionAuthMirror_.store(authenticated);
   // The channel belongs to the authenticated session and to nothing else. The
   // moment hello is reset, the peer changes, or the host is forgotten, it goes.
@@ -3112,7 +3131,7 @@ void BleLink::noteConnParams(const uint16_t connHandle, const uint16_t intervalU
 }
 
 void BleLink::requestLinkInterval(const uint16_t connHandle, const uint16_t minUnits, const uint16_t maxUnits,
-                                  const char* why) {
+                                  const uint16_t latency, const uint16_t timeoutUnits, const char* why) {
   if (!eventMutex_ || connHandle == NO_CONNECTION) return;
   // Pending before the call: the host task can settle it before the call returns.
   xSemaphoreTake(eventMutex_, portMAX_DELAY);
@@ -3128,8 +3147,8 @@ void BleLink::requestLinkInterval(const uint16_t connHandle, const uint16_t minU
   ble_gap_upd_params params{};
   params.itvl_min = minUnits;
   params.itvl_max = maxUnits;
-  params.latency = 0;
-  params.supervision_timeout = LINK_TIMEOUT_UNITS;
+  params.latency = latency;
+  params.supervision_timeout = timeoutUnits;
   params.min_ce_len = BLE_GAP_INITIAL_CONN_MIN_CE_LEN;
   params.max_ce_len = BLE_GAP_INITIAL_CONN_MAX_CE_LEN;
   // BLE_HS_EALREADY while the stack still holds an earlier update for this connection.
@@ -3144,8 +3163,9 @@ void BleLink::requestLinkInterval(const uint16_t connHandle, const uint16_t minU
   }
   const unsigned minCentiMs = static_cast<unsigned>(minUnits) * 125U;
   const unsigned maxCentiMs = static_cast<unsigned>(maxUnits) * 125U;
-  LOG_INF("BLE", "link request %u (%s): interval %u.%02u-%u.%02u ms, rc %d", static_cast<unsigned>(seq), why,
-          minCentiMs / 100U, minCentiMs % 100U, maxCentiMs / 100U, maxCentiMs % 100U, rc);
+  LOG_INF("BLE", "link request %u (%s): interval %u.%02u-%u.%02u ms, latency %u, timeout %u ms, rc %d",
+          static_cast<unsigned>(seq), why, minCentiMs / 100U, minCentiMs % 100U, maxCentiMs / 100U, maxCentiMs % 100U,
+          static_cast<unsigned>(latency), static_cast<unsigned>(timeoutUnits) * 10U, rc);
 }
 
 void BleLink::noteConnUpdate(const uint16_t connHandle, const int status, const uint16_t intervalUnits) {
@@ -3194,9 +3214,16 @@ const char* BleLink::linkRequestResultName(const LinkRequestResult result) {
 // Fast while a bulk transfer runs, idle LINK_IDLE_AFTER_MS after the last one. At most
 // one request per LINK_REQUEST_GAP_MS, never while one is pending, and a bounded
 // number per period, so a phone that keeps its own interval is not asked forever.
+//
+// Also before the link is secure: a phone that connects and then sits on the
+// passkey or never pairs relaxes after the connect hold instead of keeping the
+// 7.5 ms interval until SECURE_LINK_TIMEOUT_MS. Bulk transfers need an authenticated
+// session, so an unauthenticated link only ever gets the connect hold. Securing
+// the link (onSecurityResult) and authenticating it (noteSessionAuth) each start
+// a new hold, for `hello` and for the first sync.
 void BleLink::updateLinkInterval() {
   const uint16_t handle = connHandle_.load();
-  if (handle == NO_CONNECTION || !linkSecure_.load() || !eventMutex_ || linkMode_ == LinkMode::NONE) return;
+  if (handle == NO_CONNECTION || !eventMutex_ || linkMode_ == LinkMode::NONE) return;
   const unsigned long nowMs = millis();
   const bool bulk = ((transferOpen_ || pendingCommit_) &&
                      (transferKind_ == TransferKind::BOOK || transferKind_ == TransferKind::BMP ||
@@ -3248,11 +3275,12 @@ void BleLink::updateLinkInterval() {
     const uint16_t maxUnits = LINK_FAST_MAX_UNITS[linkFastStep_];
     if (intervalUnits <= maxUnits || linkAttempts_ >= LINK_FAST_ATTEMPTS_MAX) return;
     linkAttempts_++;
-    requestLinkInterval(handle, LINK_FAST_ITVL_UNITS, maxUnits, bulk ? "transfer" : "hold");
+    requestLinkInterval(handle, LINK_FAST_ITVL_UNITS, maxUnits, 0, LINK_TIMEOUT_UNITS, bulk ? "transfer" : "hold");
   } else {
     if (intervalUnits >= LINK_IDLE_MIN_UNITS || linkAttempts_ >= LINK_IDLE_ATTEMPTS_MAX) return;
     linkAttempts_++;
-    requestLinkInterval(handle, LINK_IDLE_MIN_UNITS, LINK_IDLE_MAX_UNITS, "idle");
+    requestLinkInterval(handle, LINK_IDLE_MIN_UNITS, LINK_IDLE_MAX_UNITS, LINK_IDLE_LATENCY, LINK_IDLE_TIMEOUT_UNITS,
+                        "idle");
   }
 }
 
@@ -3797,6 +3825,26 @@ void BleLink::startAboutDownload(const size_t offset, const size_t chunkSize) {
         j["itvl_max_ms"] = u.itvlMaxUnits * 1.25f;
       }
       if (u.request.seq != 0) putRequest(j["requested"].to<JsonObject>(), u.request);
+    }
+    // Power counters since this wake (every wake is a reset): where the awake
+    // time goes, for deciding the next power change on measurements.
+    {
+      const HalPowerManager::Counters cpu = powerManager.counters();
+      const power_stats::Rates rates = power_stats::lastMinute();
+      JsonObject p = doc["power"].to<JsonObject>();
+      p["awake_s"] = millis() / 1000UL;
+      p["cpu_full_ms"] = cpu.normalMs;
+      p["cpu_full_mhz"] = cpu.normalMhz;
+      p["cpu_low_ms"] = cpu.lowMs;
+      p["cpu_low_mhz"] = cpu.lowMhz;
+      p["loop_per_s_avg"] = rates.loopAvg;
+      p["loop_per_s_max"] = rates.loopMax;
+      p["touch_reads"] = gpio.touchReadCount();
+      p["touch_reads_per_s_avg"] = rates.touchAvg;
+      p["touch_reads_per_s_max"] = rates.touchMax;
+      p["window_s"] = rates.seconds;
+      p["panel_wait_ms"] = cpu.panelWaitMs;
+      p["panel_waits"] = cpu.panelWaits;
     }
     // Protocol features beyond the upload and download kinds. Here rather than in
     // `status`, whose read already sheds its capability lists to fit 512 bytes.
@@ -4368,6 +4416,8 @@ void BleLink::refreshPingSnapshot(const bool withLibrary) {
   // One sidecar read, no book opened. See ProgressFile.h: the record is eleven
   // bytes and carries the percentage precisely so it does not have to be
   // re-derived by opening the book.
+  positionPending_ = false;
+  lastPositionRefreshMs_ = std::max(1UL, millis());
   pingBook_.clear();
   pingPct_ = -1.0f;
   pingOpen_ = false;
@@ -4387,7 +4437,11 @@ void BleLink::refreshPingSnapshot(const bool withLibrary) {
   }
 }
 
-void BleLink::notePositionChanged() {
+void BleLink::notePositionChanged(const bool immediate) {
+  if (!immediate && lastPositionRefreshMs_ != 0 && millis() - lastPositionRefreshMs_ < POSITION_NOTIFY_GAP_MS) {
+    positionPending_ = true;  // tick() sends it when the gap is up
+    return;
+  }
   refreshPingSnapshot(false);
   statusDirty_ = true;
 }

@@ -167,9 +167,12 @@ class BleLink {
   // The reader is a peripheral: it cannot call the phone, it can only notify a
   // phone that is already connected. These are the moments worth notifying.
   //
-  // Position changed -- a page turn, or a saved position. Cheap: re-reads one
-  // eleven-byte sidecar, no book is opened.
-  void notePositionChanged();
+  // Position changed. `immediate` (a book opened or closed) notifies now. A page
+  // turn is coalesced: at most one notification per POSITION_NOTIFY_GAP_MS, and
+  // the one that goes out re-reads the sidecar, so it carries the latest
+  // position. notifySleeping() and the heartbeat flush a pending one. Cheap:
+  // re-reads one eleven-byte sidecar, no book is opened.
+  void notePositionChanged(bool immediate = false);
   // Something wrote to the card, so the library fingerprint is stale. Does not
   // recompute here; the next heartbeat pays for the walk.
   void noteLibraryChanged();
@@ -202,9 +205,17 @@ class BleLink {
   // will not grant the narrower window.
   static constexpr uint16_t LINK_FAST_ITVL_UNITS = 6;
   static constexpr std::array<uint16_t, 3> LINK_FAST_MAX_UNITS = {6, 9, 12};
-  static constexpr uint16_t LINK_IDLE_MIN_UNITS = 24;  ///< 30 ms
-  static constexpr uint16_t LINK_IDLE_MAX_UNITS = 40;  ///< 50 ms
-  static constexpr uint16_t LINK_TIMEOUT_UNITS = 400;  ///< 10 ms units: 4 s
+  // Idle: 100-150 ms with peripheral latency 4, so with nothing to say the
+  // reader's radio wakes every 500-750 ms instead of every 30-50 ms. Latency only
+  // lets the reader skip events it has nothing for: a notification still goes
+  // out at the next event, and the phone's writes wait at most one latency
+  // window. The idle timeout keeps well above the spec floor of
+  // (1 + latency) * interval * 2 = 1.5 s.
+  static constexpr uint16_t LINK_IDLE_MIN_UNITS = 80;          ///< 100 ms
+  static constexpr uint16_t LINK_IDLE_MAX_UNITS = 120;         ///< 150 ms
+  static constexpr uint16_t LINK_IDLE_LATENCY = 4;             ///< connection events
+  static constexpr uint16_t LINK_IDLE_TIMEOUT_UNITS = 600;     ///< 10 ms units: 6 s
+  static constexpr uint16_t LINK_TIMEOUT_UNITS = 400;          ///< fast: 10 ms units, 4 s
 
   // Binds the link to `connHandle`. False when another connection is bound.
   bool bindConnection(uint16_t connHandle);
@@ -242,9 +253,11 @@ class BleLink {
   // reported as `link` in `about`. Ignored for any handle but the bound one.
   void noteConnParams(uint16_t connHandle, uint16_t intervalUnits, uint16_t latency, uint16_t timeoutUnits,
                       bool connected);
-  // Asks the phone for an interval in [minUnits, maxUnits], latency 0 and a 4 s
-  // supervision timeout, and records the request for `about`. Host task or main loop.
-  void requestLinkInterval(uint16_t connHandle, uint16_t minUnits, uint16_t maxUnits, const char* why);
+  // Asks the phone for an interval in [minUnits, maxUnits] with `latency` and
+  // `timeoutUnits` (10 ms units), and records the request for `about`. Host task
+  // or main loop.
+  void requestLinkInterval(uint16_t connHandle, uint16_t minUnits, uint16_t maxUnits, uint16_t latency,
+                           uint16_t timeoutUnits, const char* why);
   // A connection update event from the host task: `status` 0 with the interval now in
   // force, or the failure status. Settles a pending requestLinkInterval().
   void noteConnUpdate(uint16_t connHandle, int status, uint16_t intervalUnits);
@@ -626,7 +639,15 @@ class BleLink {
   // than any poll, and while the reader sleeps no cadence runs at all.
   static constexpr unsigned long HEARTBEAT_INTERVAL_MS = 60UL * 1000UL;
 
-  // Refreshes the cached ping fields. `withLibrary` pays for the directory walk.
+  // Page-turn coalescing (notePositionChanged). A position change is waiting for
+  // its notification; lastPositionRefreshMs_ is when the snapshot last re-read the
+  // sidecar (0: not since boot).
+  static constexpr unsigned long POSITION_NOTIFY_GAP_MS = 10UL * 1000UL;
+  bool positionPending_ = false;
+  unsigned long lastPositionRefreshMs_ = 0;
+
+  // Refreshes the cached ping fields, position included, and so settles a
+  // pending position change. `withLibrary` pays for the directory walk.
   void refreshPingSnapshot(bool withLibrary);
   bool removePartOnExit_ = false;
   bool uploadResumable_ = false;

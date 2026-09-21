@@ -4,7 +4,10 @@
 #include <I18n.h>
 #include <Logging.h>
 
+#include <esp_attr.h>
+
 #include <algorithm>
+#include <cstring>
 
 #include "FirmwareStaging.h"
 
@@ -24,6 +27,52 @@ uint8_t gHashBuffer[HASH_CHUNK_BYTES];
 constexpr size_t MIN_IMAGE_BYTES = 64UL * 1024UL;
 // Enough to tell companion files apart; anything longer fails its own parse.
 constexpr size_t COMPANION_READ_BYTES = 400;
+
+// The last digest computed, kept in RTC slow memory: it survives deep sleep (a
+// wake is a reset, which would otherwise lose it) and is zeroed at power-on. The
+// key is what can be read without reading the image. It only spares the wake
+// re-hash: the verdict is still recomputed from it (hash file, version,
+// signature), and SdFirmwareUpdateActivity::verifyStagedDrop() hashes the image
+// again and compares before anything is written to flash, so a same-size image
+// swapped in under a stale key is refused at install. 120 bytes of RTC memory.
+struct DigestCache {
+  uint32_t magic;
+  uint32_t size;
+  uint32_t mtime;
+  char expected[65];  // the first 64 bytes of the companion .sha256 file
+  char digest[65];    // hex SHA-256 of the image
+};
+constexpr uint32_t DIGEST_CACHE_MAGIC = 0x46574443;  // "FWDC"
+RTC_DATA_ATTR DigestCache gDigestCache;
+
+void keyOf(const std::string& expectedRaw, char (&out)[65]) {
+  std::fill(out, out + sizeof(out), '\0');
+  const size_t n = std::min(expectedRaw.size(), sizeof(out) - 1);
+  std::copy(expectedRaw.begin(), expectedRaw.begin() + static_cast<std::ptrdiff_t>(n), out);
+}
+
+bool cachedDigest(const size_t size, const uint32_t mtime, const std::string& expectedRaw, std::string& digest) {
+  if (gDigestCache.magic != DIGEST_CACHE_MAGIC || gDigestCache.size != size || gDigestCache.mtime != mtime) {
+    return false;
+  }
+  char key[65];
+  keyOf(expectedRaw, key);
+  if (std::memcmp(key, gDigestCache.expected, sizeof(key)) != 0) return false;
+  gDigestCache.digest[64] = '\0';
+  digest.assign(gDigestCache.digest);
+  return digest.size() == 64;
+}
+
+void rememberDigest(const size_t size, const uint32_t mtime, const std::string& expectedRaw,
+                    const std::string& digest) {
+  if (digest.size() != 64) return;
+  gDigestCache.magic = 0;
+  gDigestCache.size = static_cast<uint32_t>(size);
+  gDigestCache.mtime = mtime;
+  keyOf(expectedRaw, gDigestCache.expected);
+  std::memcpy(gDigestCache.digest, digest.c_str(), 65);
+  gDigestCache.magic = DIGEST_CACHE_MAGIC;
+}
 
 // Main-loop task only, so the buffer is static rather than on the stack.
 std::string readRaw(const char* path) {
@@ -77,6 +126,12 @@ void FirmwareWatcher::tick() {
     reject(Verdict::BAD_IMAGE, "image too small");
     return;
   }
+  std::string remembered;
+  if (cachedDigest(print_.size, print_.mtime, print_.hash, remembered)) {
+    LOG_INF("FWDROP", "staged image unchanged since it was last hashed; not re-reading it");
+    concludeWithDigest(remembered);
+    return;
+  }
   beginHash();
 }
 
@@ -84,6 +139,7 @@ bool FirmwareWatcher::readFingerprint(Fingerprint& out) const {
   HalFile probe;
   if (!Storage.openFileForRead("FWDROP", firmware_staging::IMAGE_PATH, probe)) return false;
   out.size = probe.fileSize();
+  if (!probe.modifiedEpoch(out.mtime)) out.mtime = 0;
   probe.close();
   out.generation = firmware_staging::stageGeneration();
   out.hash = readRaw(firmware_staging::HASH_PATH);
@@ -132,6 +188,11 @@ void FirmwareWatcher::finishHash() {
   image_.close();
 
   const std::string actual = firmware_signature::toHex(digest, sizeof(digest));
+  rememberDigest(print_.size, print_.mtime, print_.hash, actual);
+  concludeWithDigest(actual);
+}
+
+void FirmwareWatcher::concludeWithDigest(const std::string& actual) {
   const Verdict verdict = firmware_staging::checkStaged(actual);
   if (verdict != Verdict::OK) {
     // The file is left alone; deleting the user's image is not this code's call.

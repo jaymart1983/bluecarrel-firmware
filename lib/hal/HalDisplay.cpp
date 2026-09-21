@@ -75,6 +75,10 @@ void HalDisplay::displayBufferAsync(HalDisplay::RefreshMode mode) {
 
 void HalDisplay::waitRefreshComplete() { einkDisplay.waitRefreshComplete(); }
 
+void HalDisplay::setBusyWaitHooks(void (*beginHook)(), void (*endHook)()) {
+  einkDisplay.setBusyWaitHooks(beginHook, endHook);
+}
+
 bool HalDisplay::supportsAsyncRefresh() const { return einkDisplay.supportsAsyncRefresh(); }
 
 void HalDisplay::refreshDisplay(HalDisplay::RefreshMode mode, bool turnOffScreen) {

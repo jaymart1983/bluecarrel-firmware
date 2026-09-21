@@ -21,6 +21,12 @@ class HalFrontlight {
   uint8_t warmth() const { return manager.colorTemperature(); }
   bool isOn() const { return lit; }
 
+  // Deep sleep: turn the light off, stop the PWM and hold the LED pads at their
+  // off level. The pads would otherwise float while the rail feeding the LED
+  // driver stays up (X4 Pro: power.latch0, held HIGH through sleep). The holds
+  // outlive the wake reset; begin() releases them.
+  void parkForDeepSleep();
+
  private:
   HalFrontlight() = default;
 

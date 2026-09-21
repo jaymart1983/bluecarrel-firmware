@@ -103,6 +103,8 @@ class HalGPIO {
   unsigned long lastTouchHeldMs() const;
   bool wasSwipe(float& nxStart, float& nyStart, float& nxEnd, float& nyEnd) const;
   bool wasTouchActivity() const;
+  // Touch controller register reads since boot, for the power counters.
+  uint32_t touchReadCount() const;
   void setSharedConfirmPowerShortPressEmitsPower(bool enabled);
 
   // Verify that the physical power button remains held through input debounce.

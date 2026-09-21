@@ -444,6 +444,9 @@ Support is advertised as `dark_mode` in the `features` list of the [`about`](#ab
   "frames_per_s_avg":68,"tick_gap_max_ms":45,"acks":197,"ack_notify_avg_ms":12,"ack_notify_max_ms":60,
   "ack_queue_max_ms":20,"notify_failed":0,"ack_shed":0,"renders":5,"render_ms":1200,
   "itvl_min_ms":7.5,"itvl_max_ms":15,"requested":{"min_ms":7.5,"max_ms":7.5,"result":"accepted"}},
+ "power":{"awake_s":1260,"cpu_full_ms":214000,"cpu_full_mhz":240,"cpu_low_ms":1043000,"cpu_low_mhz":80,
+  "loop_per_s_avg":21,"loop_per_s_max":98,"touch_reads":9200,"touch_reads_per_s_avg":6,"touch_reads_per_s_max":125,
+  "window_s":60,"panel_wait_ms":41000,"panel_waits":96},
  "features":["book_position","download_window","dark_mode","book_uuid","book_download","pair_prompt"]}
 ```
 
@@ -460,6 +463,7 @@ Support is advertised as `dark_mode` in the `features` list of the [`about`](#ab
 | `l2cap` | object | The [L2CAP channel](#the-l2cap-channel): `psm` (128) and `mtu` (the 4096-byte SDU size). Present only when the channel's server is actually registered, so a client must not open a channel without it. Absent on older firmware. |
 | `link` | object | The connection as it is now; absent when no phone is connected. See [`link`](#link-and-last_upload). |
 | `last_upload` | object | Measurements of the last `book`, `bmp` or `firmware` upload since boot. Absent before one. See [`last_upload`](#link-and-last_upload). |
+| `power` | object | Where the awake time went since this wake. See [`power`](#power). Absent on older firmware. |
 | `features` | array of strings | Protocol features beyond the upload and download kinds. `book_position`: a `book` upload accepts `position` (see [Opening position](#opening-position)). `download_window`: `start_get` accepts `window` and `get_ack` is cumulative (see [Download frames and acknowledgement](#download-frames-and-acknowledgement)). `dark_mode`: the `set_dark_mode` op is supported and `dark_mode` is reported here. `book_uuid`: `start_put` for `book` and `book_meta` accept `calibre_uuid`, and `library` reports it. `book_download`: the `book` download kind (see [`book` download](#book-download)). `pair_prompt`: a closed-window `pair` asks on the reader (see [Pair prompt](#pair-prompt)). `l2cap_coc`: `start_put` and `start_get` accept `"transport":"l2cap"` and the `l2cap` object above says where (see [The L2CAP channel](#the-l2cap-channel)). Absent on older firmware. |
 
 `about` is not listed in `download_kinds`.
@@ -487,17 +491,42 @@ logs each change at INFO (`link connected: ...`, `link updated: ...`, `link phy:
 a link layer collision with the phone's own update or an L2CAP rejection), `not_sent` (the host refused the request,
 e.g. another update still pending) or `no_answer` (no update event within 10 s).
 
-The reader asks for its own interval (latency 0, 4 s supervision timeout):
+The reader asks for its own interval. Fast requests use latency 0 and a 4 s supervision timeout; idle requests use
+peripheral latency 4 and a 6 s timeout:
 
 - On connect: 7.5 ms.
 - When a bulk transfer is running (a `book`, `bmp` or `firmware` upload, or a `book` or `library` download) and the
   interval is above 7.5 ms: 7.5 ms. If the phone refuses or picks another interval, the next attempt widens the maximum
   to 11.25 ms, then 15 ms; a link layer collision repeats the same request. At most four attempts per transfer period.
-- 3 s after the last bulk transfer ends (10 s after connecting when none has run), if the interval is below 30 ms:
-  30-50 ms, at most twice.
+- 3 s after the last bulk transfer ends (10 s after connecting, after the link is encrypted, or after `hello`, when
+  none has run), if the interval is below 100 ms: 100-150 ms with latency 4, at most twice. This applies before the
+  link is encrypted too, so a phone that connects and never pairs does not hold 7.5 ms.
 - Never while a request is pending, and at least 2 s after the previous request.
 
+With latency 4 the reader may skip up to four connection events when it has nothing to send, so a write from the
+phone can wait up to about 750 ms at the idle interval. A client that wants a fast exchange should raise its own
+connection priority first; the next bulk transfer brings the reader's 7.5 ms request back.
+
 Each request and its outcome are logged at INFO (`link request <n> (<why>): ...`, `link request <n>: <result> ...`).
+
+### `power`
+
+Counters since this wake. Every wake from deep sleep is a chip reset, so they start at zero each time the reader
+wakes. Measurements, not protocol.
+
+| Field | Type | Meaning |
+| --- | --- | --- |
+| `awake_s` | integer | Seconds since this wake (or boot). |
+| `cpu_full_ms`, `cpu_full_mhz` | integer | Time at the full CPU clock and that clock (240 MHz on the X4 Pro). |
+| `cpu_low_ms`, `cpu_low_mhz` | integer | Time at the low clock (80 MHz on the X4 Pro): idle one second after the last input, and panel BUSY waits. |
+| `loop_per_s_avg`, `loop_per_s_max` | integer | Main loop passes per second: the mean and the busiest second over `window_s`. |
+| `touch_reads` | integer | Touch controller register reads since this wake (GT911; `0` on other controllers). |
+| `touch_reads_per_s_avg`, `touch_reads_per_s_max` | integer | The same per second, mean and busiest second over `window_s`. |
+| `window_s` | integer | Complete seconds the per-second figures cover, up to `60`. |
+| `panel_wait_ms`, `panel_waits` | integer | Time in display BUSY waits longer than 20 ms, counted from the 20 ms mark, and how many. The waveform runs during these waits, so this is a lower bound on the time the panel's power supply was on. |
+
+There is no field for how long the panel's power supply was on: the display driver keeps that state private
+(`_isScreenOn` in each panel driver) and the SDK has no accessor for it.
 
 `last_upload` covers one upload from `start_put` to `commit`. The reader logs the same numbers at INFO in two lines
 (`upload <kind>: ...` and `upload loop: ...`) when the commit starts.
@@ -1228,7 +1257,10 @@ After authentication these fields are in both the GATT read and every notificati
 | `open` | bool | `true` while a book is open on screen. Absent otherwise. |
 | `sleeping` | bool | `true` in the notification sent just before the reader goes into deep sleep. The link then drops. Absent otherwise. |
 
-When they are sent: every 60 seconds while a phone is connected, when a book opens or closes, when an EPUB position is
-saved, and once on the way into sleep.
+When they are sent: every 60 seconds while a phone is connected, when a book opens or closes, and once on the way into
+sleep. A saved EPUB position (a page turn) is sent at most once every 10 seconds: the first change after a quiet
+10 seconds goes out at once, later ones wait for the 10 seconds to pass, and whichever goes out carries the latest
+saved position. A change still waiting is sent with the book-close and sleep notifications, so the last position is
+never held back.
 
 Clients should still handle `state: "error"` for rejected operations.

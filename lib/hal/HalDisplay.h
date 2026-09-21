@@ -60,6 +60,8 @@ class HalDisplay {
 
   // Power management
   void deepSleep();
+  // Called around panel BUSY waits longer than 20 ms (see EpdBus::setBusyWaitHooks).
+  void setBusyWaitHooks(void (*beginHook)(), void (*endHook)());
 
   // Access to frame buffer
   uint8_t* getFrameBuffer() const;

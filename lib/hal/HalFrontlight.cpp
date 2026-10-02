@@ -34,10 +34,35 @@ void HalFrontlight::begin(const uint8_t brightness, const uint8_t warmth, const 
   manager.setColorTemperature(warmth > 100 ? 100 : warmth);
   lit = on;
   manager.setBrightness(lit ? lastBrightness : 0);
+  energyPercentMs = 0;
+  energyLitMs = 0;
+  energySinceMs = millis();
   LOG_INF("LIGHT", "Frontlight up: %u%% warm=%u%% %s", lastBrightness, manager.colorTemperature(), lit ? "on" : "off");
 }
 
+void HalFrontlight::closeEnergySegment() {
+  const uint32_t now = millis();
+  const uint32_t elapsed = now - energySinceMs;
+  energySinceMs = now;
+  if (!lit) return;
+  energyPercentMs += static_cast<uint64_t>(lastBrightness) * elapsed;
+  energyLitMs += elapsed;
+}
+
+HalFrontlight::Energy HalFrontlight::energySinceBoot() const {
+  Energy energy{energyPercentMs, energyLitMs};
+  if (lit) {
+    const uint32_t elapsed = millis() - energySinceMs;
+    energy.percentMs += static_cast<uint64_t>(lastBrightness) * elapsed;
+    energy.litMs += elapsed;
+  }
+  return energy;
+}
+
 void HalFrontlight::setBrightness(const uint8_t percent) {
+  // Closed at the OLD level: the time just spent belongs to the brightness that
+  // was actually on the panel for it.
+  closeEnergySegment();
   lastBrightness = percent > 100 ? 100 : percent;
   if (lit) manager.setBrightness(lastBrightness);
 }
@@ -48,12 +73,15 @@ void HalFrontlight::setWarmth(const uint8_t warmPercent) {
 
 void HalFrontlight::setOn(const bool on) {
   if (on == lit) return;
+  closeEnergySegment();
   lit = on;
   manager.setBrightness(lit ? lastBrightness : 0);
 }
 
 void HalFrontlight::parkForDeepSleep() {
   if (!manager.present()) return;
+  closeEnergySegment();
+  lit = false;
   manager.setBrightness(0);
   const bool activeHigh = BoardConfig::ACTIVE.frontlight.activeHigh;
   int8_t cool = BoardConfig::PIN_UNASSIGNED;

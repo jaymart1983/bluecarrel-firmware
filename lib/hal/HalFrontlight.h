@@ -21,6 +21,17 @@ class HalFrontlight {
   uint8_t warmth() const { return manager.colorTemperature(); }
   bool isOn() const { return lit; }
 
+  // Brightness integrated over time since begin(), for the power log's line on
+  // what the light actually cost. Integer accumulation closed on each change --
+  // no timer, no per-frame work. `percentMs` is the sum of brightness% x ms lit,
+  // so dividing it by the awake time gives the mean brightness over a session.
+  // uint64_t because 100% for twelve hours overflows a uint32_t of percent-ms.
+  struct Energy {
+    uint64_t percentMs;
+    uint32_t litMs;
+  };
+  Energy energySinceBoot() const;
+
   // Deep sleep: turn the light off, stop the PWM and hold the LED pads at their
   // off level. The pads would otherwise float while the rail feeding the LED
   // driver stays up (X4 Pro: power.latch0, held HIGH through sleep). The holds
@@ -30,11 +41,18 @@ class HalFrontlight {
  private:
   HalFrontlight() = default;
 
+  // Closes the running brightness segment at the current level. Main-loop task
+  // only, like every frontlight setter.
+  void closeEnergySegment();
+
   FrontlightManager manager;
   // The SDK represents off as brightness 0. Keep the selected brightness so
   // toggling back on restores it.
   uint8_t lastBrightness = 60;
   bool lit = false;
+  uint64_t energyPercentMs = 0;
+  uint32_t energyLitMs = 0;
+  uint32_t energySinceMs = 0;
 
   static HalFrontlight instance;
 };

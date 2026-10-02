@@ -30,6 +30,7 @@
 #include "CrossPointState.h"
 #include "DeviceSleep.h"
 #include "MappedInputManager.h"
+#include "PowerLog.h"
 #include "PowerStats.h"
 #include "RecentBooksStore.h"
 #include "SdCardFontSystem.h"
@@ -502,6 +503,15 @@ void enterDeepSleep(const bool fromTimeout) {
   }
 #endif
 
+  // Before anything is torn down. noteSleep() writes the sleep line, the awake-
+  // session summary and the gauge snapshot the next wake measures against, and
+  // FLUSHES, then refuses every further write -- so the card is finished with
+  // here, not racing BleLink::prepareForDeepSleep() or the SD shutdown below.
+  // The teardown ordering is what the last release's sleep crash was.
+  // "requested" covers both ways a user asks for sleep -- the power hold and
+  // the control centre's Sleep tile -- which is all this layer can tell apart.
+  power_log::noteSleep(fromTimeout ? "idle timeout" : "requested");
+
 #if FREEINK_CAP_BLE_TRANSFER
   // Say goodnight before the radio goes down. The reader is a peripheral, so a
   // phone that is not told cannot distinguish "asleep" from "out of range" or
@@ -586,6 +596,20 @@ void setupDisplayAndFonts(bool seamless = false) {
   sdFontSystem.begin(renderer);
 
   LOG_DBG("MAIN", "Fonts setup");
+}
+
+// Short, stable names for the power log's wake line.
+static const char* wakeReasonName(const HalGPIO::WakeupReason reason) {
+  switch (reason) {
+    case HalGPIO::WakeupReason::PowerButton:
+      return "power button";
+    case HalGPIO::WakeupReason::AfterUSBPower:
+      return "usb power";
+    case HalGPIO::WakeupReason::AfterFlash:
+      return "flash";
+    default:
+      return "reset";
+  }
 }
 
 void setup() {
@@ -718,6 +742,11 @@ void setup() {
     default:
       break;
   }
+
+  // After the switch above: a ghost wake and a USB-power cold boot go straight
+  // back to sleep from there, and neither may consume the sleep snapshot the
+  // next real wake is going to measure standby drain against.
+  power_log::begin(wakeReasonName(wakeupReason));
 
   LOG_DBG("MAIN", "Starting CrossPoint version " CROSSPOINT_VERSION);
 
@@ -857,18 +886,25 @@ void loop() {
   // the side keys are page keys and nothing else; outside it they also carry
   // Back and Select on a hold (see MappedInputManager::setInBookContext).
   MappedInputManager::setInBookContext(activityManager.isReaderPageActive());
-#if FREEINK_CAP_BLE_TRANSFER
   {
-    // Tell the phone the moment a book opens or closes, rather than at the next
-    // 60-second heartbeat: the app marks the open book in its library.
+    // One edge, two consumers. The phone is told the moment a book opens or
+    // closes rather than at the next 60-second heartbeat (the app marks the open
+    // book in its library), and it is also the power log's book event: a page
+    // turn is not an event, opening and putting a book down is.
     static bool lastReaderOpen = false;
     const bool readerOpen = activityManager.isReaderActivity();
     if (readerOpen != lastReaderOpen) {
       lastReaderOpen = readerOpen;
+#if FREEINK_CAP_BLE_TRANSFER
       BLE_LINK.notePositionChanged(/*immediate=*/true);
+#endif
+      if (readerOpen) {
+        power_log::noteBookOpen(APP_STATE.openEpubPath.c_str());
+      } else {
+        power_log::noteBookClose(APP_STATE.openEpubPath.c_str());
+      }
     }
   }
-#endif
   mappedInputManager.update();
 
   if (activityManager.requiresExclusiveStorageLoop()) {
@@ -898,6 +934,11 @@ void loop() {
   // checks every thirty seconds; the hashing it may start is spread a few KB per
   // tick so nothing here blocks a page turn.
   FIRMWARE_WATCHER.tick();
+
+  // Below the exclusive-storage return above, like the link: there is no
+  // filesystem to append to while USB Drive owns the raw card.
+  power_log::noteChargerState(gpio.isUsbConnected());
+  power_log::tick();
 
   halTiltSensor.update(SETTINGS.tiltPageTurn, SETTINGS.orientation, activityManager.isReaderActivity());
 

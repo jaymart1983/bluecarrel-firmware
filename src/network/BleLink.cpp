@@ -35,6 +35,7 @@
 #include "BuildStamp.h"
 #include "CrossPointSettings.h"
 #include "HomeShelfStore.h"
+#include "PowerLog.h"
 #include "PowerStats.h"
 #include "components/UITheme.h"
 #include "FirmwareFlasher.h"
@@ -128,6 +129,8 @@ bool stagedFileMatches(const char* path, const String& json) {
 constexpr const char* PICTURES_ROOT = "/Pictures";
 constexpr const char* CRASH_REPORT_PATH = "/crash_report.txt";
 constexpr const char* CRASH_REPORT_NAME = "crash_report.txt";
+constexpr const char* POWER_LOG_PATH = "/power_log.csv";
+constexpr const char* POWER_LOG_NAME = "power_log.csv";
 // The library listing is staged on SD rather than held in RAM, then served
 // through the same frame/ack path as any other download -- which is also what
 // gives it a known size and a resumable offset.
@@ -723,6 +726,8 @@ std::string transferKindName(const BleLink::TransferKind kind) {
       return "progress_result";
     case BleLink::TransferKind::CRASH_REPORT:
       return "crash_report";
+    case BleLink::TransferKind::POWER_LOG:
+      return "power_log";
     case BleLink::TransferKind::LIBRARY:
       return "library";
     case BleLink::TransferKind::ABOUT:
@@ -2008,6 +2013,7 @@ void BleLink::onBleConnected(const uint16_t connHandle) {
   linkLastBulkMs_ = connectedAtMs_;
   linkConnectHold_ = true;
   noteSessionAuth();
+  power_log::noteBleConnected();
   setState(State::CONNECTED);
 }
 
@@ -2037,6 +2043,8 @@ void BleLink::adoptNewBond(const std::string& peerIdAddress) {
 }
 
 void BleLink::onBleDisconnected(const uint16_t) {
+  // Before the session fields are cleared: the host name is what names the line.
+  power_log::noteBleDisconnected(trustedHostName_.c_str());
   pendingPairLinkAlive_ = false;
   linkMode_ = LinkMode::NONE;
   // The Store is live or it is nothing: with the link gone there is no
@@ -2718,6 +2726,10 @@ void BleLink::onControlWrite(const std::string& value) {
     const std::string kind = doc["kind"] | "";
     if (kind == "crash_report") {
       startCrashReportDownload(offset, chunkSize);
+      return;
+    }
+    if (kind == "power_log") {
+      startPowerLogDownload(offset, chunkSize);
       return;
     }
     if (kind == "library") {
@@ -3443,6 +3455,8 @@ void BleLink::finishUploadStats(const uint64_t dataSdUs) {
   u.renders = activityManager.renderCount() - stats.renderCountAtStart;
   u.renderMs = activityManager.renderTotalMs() - stats.renderMsAtStart;
   lastUpload_ = u;
+  power_log::noteTransfer(transferKindName(u.kind).c_str(), /*up=*/true, static_cast<uint32_t>(u.bytes),
+                          static_cast<uint32_t>(u.ms));
   // Two lines: a log entry is capped at 256 bytes (lib/Logging/Logging.cpp).
   LOG_INF("BLE", "upload %s: %u B, %u frames, %lu ms; arrivals %u/s avg %u/s max, gap max %lu ms; msys min %d, "
           "acl min %d, queue max %u",
@@ -3713,12 +3727,21 @@ void BleLink::startFileDownload(const char* path, const char* name, const Transf
   downloadEof_ = sentBytes_ >= expectedSize_;
   downloadChunkSize_ = chunkSize;
   lastProgressStatusBytes_ = sentBytes_;
+  downloadStartMs_ = millis();
   downloadOpen_ = true;
   setState(State::SENDING);
 }
 
 void BleLink::startCrashReportDownload(const size_t offset, const size_t chunkSize) {
   startFileDownload(CRASH_REPORT_PATH, CRASH_REPORT_NAME, TransferKind::CRASH_REPORT, offset, chunkSize);
+}
+
+void BleLink::startPowerLogDownload(const size_t offset, const size_t chunkSize) {
+  // The log buffers in RAM between flushes, so a fresh request must see the
+  // lines this session has already produced. A resume (offset != 0) must not:
+  // the client is part way through the file this same start_get sized.
+  if (offset == 0) power_log::flush();
+  startFileDownload(POWER_LOG_PATH, POWER_LOG_NAME, TransferKind::POWER_LOG, offset, chunkSize);
 }
 
 void BleLink::startLibraryDownload(const size_t offset, const size_t chunkSize) {
@@ -4280,6 +4303,12 @@ void BleLink::pumpDownload() {
   if (downloadEof_ && downloadFrameLength_ == 0 && downloadUnacked_ == downloadSequence_) {
     downloadFile_.close();
     downloadOpen_ = false;
+    // Not the power log's own download: appending a line about sending the file
+    // would change the file the client is being told the size of.
+    if (transferKind_ != TransferKind::POWER_LOG) {
+      power_log::noteTransfer(transferKindName(transferKind_).c_str(), /*up=*/false, static_cast<uint32_t>(sentBytes_),
+                              static_cast<uint32_t>(millis() - downloadStartMs_));
+    }
     setState(State::SENT);
   }
 }
@@ -4625,6 +4654,7 @@ std::string BleLink::buildStatusJson(const StatusScope scope, const unsigned det
     downloadKinds.add("book");
     downloadKinds.add("crash_report");
     downloadKinds.add("library");
+    downloadKinds.add("power_log");
     downloadKinds.add("progress_result");
     downloadKinds.add("settings");
     }

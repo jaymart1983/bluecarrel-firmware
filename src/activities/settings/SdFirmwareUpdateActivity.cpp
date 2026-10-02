@@ -8,6 +8,7 @@
 #include <esp_ota_ops.h>
 
 #include "MappedInputManager.h"
+#include "PowerLog.h"
 #include "activities/home/FileBrowserActivity.h"
 #include "activities/util/ConfirmationActivity.h"
 #include "SilentRestart.h"
@@ -261,6 +262,10 @@ void SdFirmwareUpdateActivity::performUpdate() {
   // now, while the filesystem is still mounted and before the reboot, so the new
   // firmware does not come up and immediately offer to install itself again.
   if (stagedDrop) firmware_staging::clearStaged();
+
+  // Flushed by the call: the reboot below is the end of this session, and the
+  // install is what explains the gap in the log either side of it.
+  power_log::noteFirmwareInstall(firmwarePath.c_str());
 
   LOG_INF("FW", "SD firmware update complete, restarting");
   {

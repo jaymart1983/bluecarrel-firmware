@@ -68,6 +68,7 @@ class BleLink {
     FIRMWARE,
     PROGRESS,
     CRASH_REPORT,
+    POWER_LOG,
     LIBRARY,
     PROGRESS_RESULT,
     CATALOG_PAGE,
@@ -440,6 +441,8 @@ class BleLink {
   // transfer the authenticated session opened.
   bool transportL2cap_ = false;
   size_t downloadChunkSize_ = 0;
+  // millis() at start_get, for the power log's transfer line.
+  unsigned long downloadStartMs_ = 0;
   uint32_t expectedSequence_ = 0;
   // Next sequence to send, and the first one not yet acknowledged; frames in
   // [downloadUnacked_, downloadSequence_) are in flight.
@@ -689,6 +692,7 @@ class BleLink {
   void processCommit();
   void startFileDownload(const char* path, const char* name, TransferKind kind, size_t offset, size_t chunkSize);
   void startCrashReportDownload(size_t offset, size_t chunkSize);
+  void startPowerLogDownload(size_t offset, size_t chunkSize);
   void startLibraryDownload(size_t offset, size_t chunkSize);
   void startProgressResultDownload(size_t offset, size_t chunkSize);
   // Serialises the live settings to a scratch file and streams that, rather

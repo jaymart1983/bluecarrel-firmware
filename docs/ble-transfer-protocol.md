@@ -242,6 +242,13 @@ Downloads use `start_get`, notifications on `data-out`, and `get_ack` from the c
 Supported download kinds:
 
 - `crash_report`: reads `/crash_report.txt`
+- `power_log`: reads `/power_log.csv`, the device's power event log. Plain CSV,
+  `time,pct,mv,uptime_s,event,detail`, appended on wake, sleep, book open/close, frontlight change, BLE
+  connect/disconnect, completed transfer, firmware install, charger in/out and an hourly "still awake"
+  sample. The device rotates it to `/power_log.1.csv` at ~64 KB, which a download does not reach; a
+  `start_get` at `offset: 0` flushes the device's RAM buffer first, so the file sized by that request
+  already holds every line produced up to it. Shaped exactly like `crash_report`: one file, resumable
+  by offset
 - `book`: one EPUB from `/Books` (see [`book` download](#book-download))
 - `library`: the on-device book list with reading progress (see below)
 - `progress_result`: the per-entry outcome of the last `progress` upload (see below)
@@ -1219,7 +1226,7 @@ Status JSON includes capability fields so clients can hide unsupported controls:
   "firmware_ota_supported": true,
   "resume_supported": true,
   "upload_kinds": ["book", "bmp", "firmware", "progress", "catalog_page", "catalog_detail", "settings", "book_meta"],
-  "download_kinds": ["about", "book", "crash_report", "library", "progress_result", "settings"],
+  "download_kinds": ["about", "book", "crash_report", "library", "power_log", "progress_result", "settings"],
   "store_supported": true,
   "clock_supported": true,
   "device_time": 1725600000

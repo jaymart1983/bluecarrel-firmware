@@ -508,18 +508,22 @@ void enterDeepSleep(const bool fromTimeout) {
   // "crashed" -- it only ever sees the link drop. One notification turns that
   // ambiguity into a fact and makes the app's last-known state trustworthy
   // rather than merely stale.
+  LOG_INF("SLP", "sleep: ble stopping");
   BLE_LINK.notifySleeping();
 
-  // Before the SD card goes: end() writes nothing, but it does close files and it
-  // must not be racing a mount teardown. Deep sleep would otherwise hold the
-  // modem power domain alive for a device nobody is using.
-  BLE_LINK.end();
+  // Before the SD card goes: this closes files and clears the link's scratch
+  // documents, and must not be racing a mount teardown. It deliberately leaves
+  // the NimBLE stack up -- deep sleep powers the radio down with the rest of the
+  // chip, and deinitialising it here is where the reader panicked
+  // (BleLink::prepareForDeepSleep).
+  BLE_LINK.prepareForDeepSleep();
+  LOG_INF("SLP", "sleep: ble stopped");
 #endif
 
   halTiltSensor.deepSleep();
   display.deepSleep();
   Storage.prepareForDeepSleep();
-  LOG_DBG("MAIN", "Entering deep sleep");
+  LOG_INF("SLP", "sleep: entering deep sleep");
 
   powerManager.startDeepSleep(gpio);
 }

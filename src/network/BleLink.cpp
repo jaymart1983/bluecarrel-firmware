@@ -233,6 +233,27 @@ constexpr size_t BLE_UPLOAD_ACK_BYTES_MAX = 64UL * 1024UL;
 // chains nine of these blocks, so 32 covers that with margin to spare.
 constexpr size_t BLE_L2CAP_POOL_BLOCK_BYTES = 512;
 constexpr size_t BLE_L2CAP_POOL_BLOCKS = 32;
+// The pool is in PSRAM and is NOT msys. msys is internal RAM shared with the
+// controller's transmit path, and parking a 4 KB SDU there would crowd out the
+// blocks GATT notifications come from. Nothing the controller DMAs from lands
+// here: the host task copies an arriving frame in with the CPU
+// (ble_l2cap_coc.c:242) and copies an outgoing one back out into an msys buffer
+// (:510), so PSRAM is safe for both directions.
+//
+// Allocated once per boot and never freed, descriptors included. An mbuf points
+// at its pool through os_mbuf::om_omp, and the stack frees SDUs of its own
+// accord -- ble_hs_deinit() releases whatever a channel still holds, and a
+// COC_DISCONNECTED can land while teardown is already running. Freeing 20 KB of
+// PSRAM on the way out would make every one of those a write into returned
+// memory, so the block and the two pool descriptors simply live for the life of
+// the boot; a second begin() re-initialises the mempool over the same memory.
+os_mempool l2capMempool = {};
+os_mbuf_pool l2capPool = {};
+uint8_t* l2capPoolMem = nullptr;
+// One SDU, copied out of its mbuf chain so the shared receive path sees a flat
+// buffer. PSRAM, allocated with the pool: 4 KB is far over the 256-byte local
+// rule and a per-transfer allocation would churn the heap on every sync.
+uint8_t* l2capFrame = nullptr;
 // SDUs held for the main loop. Two, so the next SDU is already arriving into
 // the armed buffer while this one goes to the card; the third is what the
 // credits withhold. This is deliberately NOT the 32 KB control event queue: a
@@ -1049,21 +1070,8 @@ struct BleLinkRuntime {
   // --- L2CAP connection-oriented channel ------------------------------------
   //
   // All of it lives here rather than in BleLink so the NimBLE types stay out of
-  // BleLink.h, which screens include.
-  //
-  // The pool is in PSRAM and is NOT msys. msys is internal RAM shared with the
-  // controller's transmit path, and parking a 4 KB SDU there would crowd out the
-  // blocks GATT notifications come from. Nothing the controller DMAs from lands
-  // here: the host task copies an arriving frame in with the CPU
-  // (ble_l2cap_coc.c:242) and copies an outgoing one back out into an msys
-  // buffer (:510), so PSRAM is safe for both directions.
-  os_mempool l2capMempool = {};
-  os_mbuf_pool l2capPool = {};
-  uint8_t* l2capPoolMem = nullptr;
-  // One SDU, copied out of its mbuf chain so the shared receive path sees a flat
-  // buffer. PSRAM, allocated once with the pool: 4 KB is far over the 256-byte
-  // local rule and a per-transfer allocation would churn the heap on every sync.
-  uint8_t* l2capFrame = nullptr;
+  // BleLink.h, which screens include. The receive pool itself does not: it
+  // outlives every runtime (see l2capPoolMem above).
   bool l2capServerRegistered = false;
 
   // Written by the host task, read by the main loop; both under the link's
@@ -1083,21 +1091,19 @@ struct BleLinkRuntime {
   };
   std::deque<L2capSdu> l2capRx;
 
-  ~BleLinkRuntime() {
-    // The stack is down by the time this runs (BleLink::end() closes the channel
-    // and deinitialises NimBLE first), so nothing can still be holding a block.
-    if (l2capPoolMem) heap_caps_free(l2capPoolMem);
-    if (l2capFrame) heap_caps_free(l2capFrame);
-  }
-
   // Best effort: a link with no channel still works, over GATT.
   void beginL2cap() {
     const size_t poolBytes = OS_MEMPOOL_BYTES(BLE_L2CAP_POOL_BLOCKS, BLE_L2CAP_POOL_BLOCK_BYTES);
     // Raw allocation rather than makeUniqueNoThrow: this has to come from PSRAM,
-    // and the block is handed to NimBLE's mempool, which holds it for the life
-    // of the pool. The destructor above is what frees it.
-    l2capPoolMem = static_cast<uint8_t*>(heap_caps_malloc(poolBytes, MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT));
-    l2capFrame = static_cast<uint8_t*>(heap_caps_malloc(BleLink::L2CAP_SDU_BYTES, MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT));
+    // and the block is handed to NimBLE's mempool, which keeps it for the life of
+    // the boot -- nothing ever frees it.
+    if (!l2capPoolMem) {
+      l2capPoolMem = static_cast<uint8_t*>(heap_caps_malloc(poolBytes, MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT));
+    }
+    if (!l2capFrame) {
+      l2capFrame =
+          static_cast<uint8_t*>(heap_caps_malloc(BleLink::L2CAP_SDU_BYTES, MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT));
+    }
     if (!l2capPoolMem || !l2capFrame) {
       LOG_ERR("BLE", "OOM: %u byte L2CAP pool; the channel stays off", static_cast<unsigned>(poolBytes));
       return;
@@ -1302,18 +1308,42 @@ struct BleLinkRuntime {
     if (restart) advertising->start();
   }
 
+  // Stop making work, without taking the stack down. Everything deep sleep
+  // genuinely needs: the advertiser off so nothing new arrives, and the peer told
+  // to go rather than left to time out.
+  //
+  // Nothing is detached and nothing is freed, because nothing is going away --
+  // the runtime, the callback objects and the receive pool all stay exactly where
+  // the host task expects them until the power domain takes the whole chip down.
+  void quiesceForDeepSleep() {
+    if (server) {
+      server->advertiseOnDisconnect(false);
+      for (const uint16_t handle : server->getPeerDevices()) server->disconnect(handle);
+    }
+    NimBLEDevice::stopAdvertising();
+    waitForHostQuiet();
+  }
+
   // Teardown runs on the main loop task while the NimBLE host task is still
   // live on the other core, so the order below is the whole point of it.
   //
-  // THE CRASH THIS FIXES. NimBLEDevice::deinit() is nimble_port_stop() followed
-  // immediately by nimble_port_deinit(). nimble_port_stop() returns as soon as
-  // its stop event has been *dispatched* by the host task -- not when that task
-  // has left nimble_port_run(). nimble_port_deinit() then frees the default
-  // event queue (vQueueDelete on g_eventq_dflt) and deinits the controller,
-  // while the host task may still be going round its loop reading that queue.
-  // Every event still in flight when deinit() is called widens that window,
-  // and an advertising restart or a live connection is exactly such an event.
-  // So: stop making work, wait for the host to go quiet, and only then deinit.
+  // NimBLEDevice::deinit() is nimble_port_stop() followed immediately by
+  // nimble_port_deinit(). nimble_port_stop() returns as soon as its stop event
+  // has been *dispatched* by the host task -- nimble_port_stop_cb releases the
+  // semaphore it is waiting on from inside that dispatch (nimble_port.c:76-79,
+  // 265-270), so the main task resumes while the host task has not yet broken out
+  // of nimble_port_run() (:280-292), let alone reached the vTaskDelete of itself
+  // in nimble_port_freertos_deinit(). nimble_port_deinit() then frees the default
+  // event queue (vQueueDelete on g_eventq_dflt), deinits the host and deinits the
+  // controller, under a task that is still unwinding through all three. Every
+  // event still in flight when deinit() is called widens that window, and an
+  // advertising restart or a live connection is exactly such an event. So: stop
+  // making work, wait for the host to go quiet, and only then deinit.
+  //
+  // That narrows the window; it cannot close it, because both halves are inside
+  // one library call. Only a caller that needs the stack down while the device
+  // keeps running should pay for it -- deep sleep does not, and uses
+  // quiesceForDeepSleep() instead.
   void end() {
     if (server) {
       // Nothing may re-enter this runtime or the link from the host task once
@@ -1352,7 +1382,7 @@ struct BleLinkRuntime {
       resetTaskWatchdogIfSubscribed();
       delay(BLE_TEARDOWN_WAIT_STEP_MS);
     }
-    LOG_DBG("BLE", "host still busy at teardown; deinitialising anyway");
+    LOG_INF("BLE", "host still busy at teardown; carrying on anyway");
   }
 
   // And wait for the task itself to be gone before this runtime -- and with it
@@ -1363,7 +1393,7 @@ struct BleLinkRuntime {
       resetTaskWatchdogIfSubscribed();
       delay(BLE_TEARDOWN_WAIT_STEP_MS);
     }
-    LOG_DBG("BLE", "nimble host task outlived deinit");
+    LOG_INF("BLE", "nimble host task outlived deinit");
   }
 };
 
@@ -1439,13 +1469,7 @@ void BleLink::end() {
   closeL2capChannel("link stopped");
   ble_->end();
   ble_.reset();
-  // Scratch for one wake only. The Store's own thumbnails are cleared by the
-  // Store screen; these are the link's.
-  if (Storage.exists(CATALOG_PATH)) Storage.remove(CATALOG_PATH);
-  if (Storage.exists(CATALOG_PART_PATH)) Storage.remove(CATALOG_PART_PATH);
-  if (Storage.exists(LIBRARY_INDEX_PATH)) Storage.remove(LIBRARY_INDEX_PATH);
-  if (Storage.exists(PROGRESS_BATCH_PATH)) Storage.remove(PROGRESS_BATCH_PATH);
-  if (Storage.exists(PROGRESS_RESULT_PATH)) Storage.remove(PROGRESS_RESULT_PATH);
+  clearScratchDocuments();
   mbedtls_sha256_free(&shaContext_);
   // No phone can hear an answer now; the prompt, if up, closes itself.
   clearPendingPair();
@@ -1461,6 +1485,39 @@ void BleLink::end() {
   securedAtMs_ = 0;
   state_ = State::STARTING;
   LOG_INF("BLE", "link stopped");
+}
+
+// Scratch for one wake only. The Store's own thumbnails are cleared by the Store
+// screen; these are the link's.
+void BleLink::clearScratchDocuments() {
+  if (Storage.exists(CATALOG_PATH)) Storage.remove(CATALOG_PATH);
+  if (Storage.exists(CATALOG_PART_PATH)) Storage.remove(CATALOG_PART_PATH);
+  if (Storage.exists(LIBRARY_INDEX_PATH)) Storage.remove(LIBRARY_INDEX_PATH);
+  if (Storage.exists(PROGRESS_BATCH_PATH)) Storage.remove(PROGRESS_BATCH_PATH);
+  if (Storage.exists(PROGRESS_RESULT_PATH)) Storage.remove(PROGRESS_RESULT_PATH);
+}
+
+// Deep sleep deliberately does NOT deinitialise NimBLE. Deep sleep is a chip
+// power-down and wake is a fresh boot, so a torn-down stack buys nothing: there
+// is no state to hand over and nothing to reuse. What it costs is the race
+// documented on BleLinkRuntime::end() -- NimBLEDevice::deinit() frees the default
+// event queue, the host and the controller out from under a nimble_host task that
+// is still unwinding, and the reader panicked there on the way to sleep. The radio
+// dies with the power domain a few milliseconds later either way.
+//
+// So: say goodnight (the caller has already done that), stop the advertiser, send
+// the peer away, close the files, clear the card, and leave the stack standing.
+void BleLink::prepareForDeepSleep() {
+  if (!ble_) return;
+  // Before the card work below and before the radio goes quiet: nothing may
+  // arrive over the air after this point.
+  resetTransfer(true);
+  closeL2capChannel("device sleeping");
+  LOG_INF("BLE", "sleep: transfers closed");
+  ble_->quiesceForDeepSleep();
+  LOG_INF("BLE", "sleep: radio quiet, stack left standing");
+  clearScratchDocuments();
+  sleeping_ = true;
 }
 
 void BleLink::tick() {
@@ -2882,7 +2939,7 @@ int BleLink::onL2capEvent(ble_l2cap_event* event) {
       // create_srv_chan hands the channel over with NO receive buffer
       // (ble_l2cap_coc.c:388), and the first frame to arrive without one trips
       // the assert at :204. So the first buffer is armed here or not at all.
-      os_mbuf* sdu = os_mbuf_get_pkthdr(&ble_->l2capPool, 0);
+      os_mbuf* sdu = os_mbuf_get_pkthdr(&l2capPool, 0);
       if (!sdu) {
         LOG_ERR("BLE", "OOM: L2CAP receive buffer; channel refused");
         return BLE_HS_ENOMEM;
@@ -2953,7 +3010,7 @@ int BleLink::onL2capEvent(ble_l2cap_event* event) {
         ble_->l2capRx.push_back({sdu, nowMs});
         sdu = nullptr;
         if (ble_->l2capRx.size() < BLE_L2CAP_RX_QUEUE_MAX) {
-          next = os_mbuf_get_pkthdr(&ble_->l2capPool, 0);
+          next = os_mbuf_get_pkthdr(&l2capPool, 0);
           if (next) ble_->l2capArmed = true;
         }
       }
@@ -3033,14 +3090,14 @@ void BleLink::drainL2capRx() {
 
     const size_t length = OS_MBUF_PKTLEN(sdu);
     const bool copied = length > 0 && length <= L2CAP_SDU_BYTES &&
-                        os_mbuf_copydata(sdu, 0, static_cast<int>(length), ble_->l2capFrame) == 0;
+                        os_mbuf_copydata(sdu, 0, static_cast<int>(length), l2capFrame) == 0;
     os_mbuf_free_chain(sdu);
 
     // Credits go back BEFORE the frame is handled, so the phone spends the SD
     // write sending the next SDU rather than waiting on this one.
     xSemaphoreTake(eventMutex_, portMAX_DELAY);
     ble_l2cap_chan* chan = ble_->l2capChan;
-    os_mbuf* next = (chan && !ble_->l2capArmed) ? os_mbuf_get_pkthdr(&ble_->l2capPool, 0) : nullptr;
+    os_mbuf* next = (chan && !ble_->l2capArmed) ? os_mbuf_get_pkthdr(&l2capPool, 0) : nullptr;
     if (next) ble_->l2capArmed = true;
     xSemaphoreGive(eventMutex_);
     if (next && ble_l2cap_recv_ready(chan, next) != 0) {
@@ -3059,7 +3116,7 @@ void BleLink::drainL2capRx() {
     // "transport":"l2cap". Anything else arriving on the channel is dropped.
     if (!sessionAuthenticated() || !transportL2cap_ || !transferOpen_) continue;
     const unsigned long startUs = micros();
-    onDataFrame(ble_->l2capFrame, length, atMs);
+    onDataFrame(l2capFrame, length, atMs);
     uploadLoop_.dataUs += micros() - startUs;
   }
 }
@@ -3076,7 +3133,7 @@ bool BleLink::sendL2capFrame(const uint8_t* data, const size_t length) {
   // waits a tick, so a download cannot starve its own progress reports.
   if (os_msys_num_free() < BLE_L2CAP_TX_MSYS_RESERVE_BLOCKS) return false;
 
-  os_mbuf* sdu = os_mbuf_get_pkthdr(&ble_->l2capPool, 0);
+  os_mbuf* sdu = os_mbuf_get_pkthdr(&l2capPool, 0);
   if (!sdu) return false;
   if (os_mbuf_append(sdu, data, static_cast<uint16_t>(length)) != 0) {
     os_mbuf_free_chain(sdu);
@@ -4171,7 +4228,7 @@ void BleLink::pumpDownload() {
   // status notification needs. Over the channel a frame is one SDU and the
   // peer's credits pace it, so the loop simply runs until the stack stops
   // taking frames.
-  uint8_t* frame = transportL2cap_ ? ble_->l2capFrame : downloadFrame_.data();
+  uint8_t* frame = transportL2cap_ ? l2capFrame : downloadFrame_.data();
   if (!frame) {
     downloadFile_.close();
     downloadOpen_ = false;

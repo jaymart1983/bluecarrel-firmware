@@ -115,18 +115,29 @@ void BaseTheme::drawStatusLabel(const GfxRenderer& renderer, const int x, const 
   // Centre on the ink, not the font box. getTextHeight is the font-wide
   // ascender; centring short all-caps text on it sits it visibly low -- the
   // same bias that had to be taken out of the Back chip.
+  //
+  // The ink measured for the placement is a fixed REFERENCE, not this label's
+  // own: a status row mixes "9:58 PM" and "56%" with a chapter title, and a
+  // title with a descender ("Chapter 42") has a lower ink bottom, so centring
+  // each label on itself lifted the ones with descenders a couple of pixels
+  // above their neighbours. One reference keeps the whole row on one baseline.
+  static constexpr const char* kStatusInkReference = "0123456789%ABC";
   int inkTop = 0;
   int inkBottom = 0;
   const int ascender = renderer.getFontAscenderSize(SMALL_FONT_ID);
-  const bool measured = renderer.getTextInkBounds(SMALL_FONT_ID, text, inkTop, inkBottom);
+  const bool measured = renderer.getTextInkBounds(SMALL_FONT_ID, kStatusInkReference, inkTop, inkBottom);
   const int top = measured ? centerY + (inkTop + inkBottom) / 2 - ascender : centerY - ascender / 2;
   renderer.drawText(SMALL_FONT_ID, x, top, text);
 
-  if (slashed && measured) {
+  if (slashed) {
     // Corner to corner across the ink box only, so it reads as a negation of
-    // the word rather than as a rule under the whole row.
-    const int inkTopY = top + ascender - inkTop;
-    const int inkBottomY = top + ascender - inkBottom;
+    // the word rather than as a rule under the whole row -- this label's own
+    // ink, not the row's placement reference.
+    int slashTop = inkTop;
+    int slashBottom = inkBottom;
+    if (!renderer.getTextInkBounds(SMALL_FONT_ID, text, slashTop, slashBottom)) return;
+    const int inkTopY = top + ascender - slashTop;
+    const int inkBottomY = top + ascender - slashBottom;
     renderer.drawLine(x - 1, inkBottomY + 1, x + width + 1, inkTopY - 1, true);
   }
 }

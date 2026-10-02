@@ -96,9 +96,15 @@ class BleLink {
   // Start the peripheral and begin advertising. Idempotent; safe to call when
   // already running.
   void begin();
-  // Stop advertising and take the stack down. Idempotent. Called on the way into
-  // deep sleep, where the modem power domain must not be held alive.
+  // Stop advertising and take the NimBLE stack down. Idempotent. For callers that
+  // need the radio off while the device keeps running -- the USB Drive handover
+  // and a firmware install. NOT the way into deep sleep: see
+  // prepareForDeepSleep().
   void end();
+  // The way into deep sleep. Closes transfers, closes the channel, stops
+  // advertising, sends the peer away and clears the scratch documents, and leaves
+  // the NimBLE stack standing for the power domain to take down. Idempotent.
+  void prepareForDeepSleep();
   bool isRunning() const { return ble_ != nullptr; }
   // Pump the events the NimBLE host task queued. Called once per main loop,
   // whatever is on screen.
@@ -703,6 +709,7 @@ class BleLink {
   void processProgressBatch();
   void pumpDownload();
   void resetTransfer(bool removePart);
+  void clearScratchDocuments();
   void setState(State state);
   void setError(const std::string& error);
   // notifyStore=false refuses one request without failing the Store screen --

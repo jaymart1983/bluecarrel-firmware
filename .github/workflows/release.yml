@@ -117,13 +117,19 @@ jobs:
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
-          built=$(sha256sum ".pio/build/$PIO_ENV/firmware.bin" | cut -d' ' -f1)
+          # The ESP app descriptor carries the compile time and a hash of the ELF
+          # (esp_app_desc_t: time at 0x70, date at 0x80, app_elf_sha256 at 0xB0).
+          # Two builds of the same commit minutes apart differ there and nowhere
+          # else, so the comparison blanks those fields. Everything else -- all
+          # code and data -- must match byte for byte.
           # The release is created right after the tag is pushed, so allow for it landing late.
           # Waiting is only for "not published yet"; any other download failure stops here.
           for attempt in $(seq 1 30); do
             if gh release view "$TAG" -R "$GITHUB_REPOSITORY" >/dev/null 2>&1; then
               gh release download "$TAG" -R "$GITHUB_REPOSITORY" -p firmware.json \
                 -O published-firmware.json --clobber
+              gh release download "$TAG" -R "$GITHUB_REPOSITORY" \
+                -p "bluecarrel-x4pro-$X4_BUILD_STAMP.bin" -O published-firmware.bin --clobber
               break
             fi
             if [ "$attempt" = 30 ]; then
@@ -132,19 +138,40 @@ jobs:
             fi
             sleep 10
           done
-          published=$(python -c 'import json;print(json.load(open("published-firmware.json"))["sha256"])')
-          version=$(python -c 'import json;print(json.load(open("published-firmware.json"))["version"])')
-          echo "published $version $published"
-          echo "rebuilt   $X4_BUILD_STAMP $built"
-          if [ "$version" != "$X4_BUILD_STAMP" ]; then
-            echo "::error::firmware.json says version $version, this tag is $X4_BUILD_STAMP"
-            exit 1
-          fi
-          if [ "$published" != "$built" ]; then
-            echo "::error::The published image does not match a clean rebuild of $TAG. Do not install it."
-            exit 1
-          fi
-          echo "The published image matches a clean rebuild of $TAG."
+          python - "$X4_BUILD_STAMP" ".pio/build/$PIO_ENV/firmware.bin" <<'EOF'
+          import hashlib, json, sys
+          stamp, rebuilt_path = sys.argv[1], sys.argv[2]
+          manifest = json.load(open('published-firmware.json'))
+          published = open('published-firmware.bin', 'rb').read()
+          rebuilt = open(rebuilt_path, 'rb').read()
+
+          # The manifest must describe the image that is actually being served.
+          served = hashlib.sha256(published).hexdigest()
+          if manifest['sha256'] != served:
+              sys.exit(f"::error::firmware.json sha256 {manifest['sha256']} is not the published image ({served})")
+          if manifest['version'] != stamp:
+              sys.exit(f"::error::firmware.json says version {manifest['version']}, this tag is {stamp}")
+          if manifest['size'] != len(published):
+              sys.exit(f"::error::firmware.json size {manifest['size']} is not the published image ({len(published)})")
+
+          def normalise(image):
+              b = bytearray(image)
+              for start, length in ((0x70, 16), (0x80, 16), (0xB0, 32)):  # time, date, elf sha
+                  b[start:start + length] = b'\0' * length
+              return bytes(b)
+
+          a, b = normalise(published), normalise(rebuilt)
+          print(f"published {stamp} {hashlib.sha256(a).hexdigest()} (served {served})")
+          print(f"rebuilt   {stamp} {hashlib.sha256(b).hexdigest()}")
+          if len(a) != len(b):
+              sys.exit(f"::error::The published image is {len(a)} bytes, a clean rebuild is {len(b)}. Do not install it.")
+          if a != b:
+              diff = sum(1 for x, y in zip(a, b) if x != y)
+              first = next(i for i, (x, y) in enumerate(zip(a, b)) if x != y)
+              sys.exit(f"::error::The published image does not match a clean rebuild of {stamp}: "
+                       f"{diff} bytes differ, first at 0x{first:X}. Do not install it.")
+          print(f"The published image matches a clean rebuild of {stamp} (compile time and ELF hash aside).")
+          EOF
 
       # On a mismatch, keep this build so the two images can be compared byte for byte.
       - name: Keep the rebuilt image for comparison

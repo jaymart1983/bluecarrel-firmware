@@ -18,12 +18,15 @@
 #include "network/FirmwareWatcher.h"
 #if FREEINK_CAP_BLE_TRANSFER
 #include "network/BleLink.h"
+#include "network/BuildStamp.h"
 #endif
 
 void SdFirmwareUpdateActivity::onEnter() {
   Activity::onEnter();
   // Build-identity marker — confirms which firmware build owns the SD update flow.
-  LOG_INF("FW", "SdFirmwareUpdateActivity build=%s %s recovery=%d", __DATE__, __TIME__, recoveryMode ? 1 : 0);
+  // The build STAMP, not __DATE__/__TIME__: those differ between two builds of
+  // the same commit, which is the whole difference the release check reports.
+  LOG_INF("FW", "SdFirmwareUpdateActivity build=%s recovery=%d", X4_BUILD_STAMP, recoveryMode ? 1 : 0);
   if (stagedDrop) {
     firmware_staging::readVersion(stagedVersion);
     approvedHash = FIRMWARE_WATCHER.verifiedHash();

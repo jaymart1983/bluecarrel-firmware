@@ -70,7 +70,10 @@ void ActivityManager::renderTaskLoop() {
     // only an activity whose render actually paints it (via drawButtonHints)
     // exposes a Back hit rect to the loop task.
     BaseTheme::setTouchBackButtonVisible(false);
-    if (currentActivity) {
+    // A notification queued before (or during) the final frame must not repaint
+    // over it -- see stopRenderingAndPaint. Still drains the notification and
+    // still releases any waiter below.
+    if (currentActivity && !renderingStopped.load(std::memory_order_acquire)) {
       HalPowerManager::Lock powerLock;  // Ensure we don't go into low-power mode while rendering
       // Night mode is a global output polarity applied to every activity.
       // SleepActivity paints from onEnter and manages this itself: it keeps the
@@ -519,6 +522,16 @@ void ActivityManager::requestUpdateAndWait() {
   xTaskNotify(renderTaskHandle, 1, eIncrement);
   ulTaskNotifyTake(pdTRUE, portMAX_DELAY);
 }
+
+void ActivityManager::stopRenderingAndPaint(void (*paint)()) {
+  // Order is the whole point: the latch closes first, so a render that has not
+  // started yet never starts, and the lock then waits out the one that has.
+  renderingStopped.store(true, std::memory_order_release);
+  RenderLock lock;
+  if (paint) paint();
+}
+
+void ActivityManager::resumeRendering() { renderingStopped.store(false, std::memory_order_release); }
 
 // RenderLock
 

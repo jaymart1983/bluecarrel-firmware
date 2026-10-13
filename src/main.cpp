@@ -144,6 +144,12 @@ constexpr uint32_t SILENT_REBOOT_MAGIC = 0xC1EAB007;
 constexpr uint32_t SILENT_REBOOT_TARGET_HOME = 0;
 constexpr uint32_t SILENT_REBOOT_TARGET_READER = 1;
 constexpr uint32_t SILENT_REBOOT_TARGET_SLEEP = 2;
+// Home, but with the first paint on a clean waveform. The USB Drive handover
+// leaves its notice on the glass and its silent reboot tells the panel driver
+// the displayed frame is already the right one (HalDisplay::begin(seamless)),
+// so a differential first paint would leave the notice showing through.
+constexpr uint32_t SILENT_REBOOT_TARGET_HOME_CLEAN = 3;
+constexpr uint32_t SILENT_REBOOT_TARGET_MAX = SILENT_REBOOT_TARGET_HOME_CLEAN;
 
 // How the device is coming back to life, resolved once at boot. Both resume
 // flows suppress the splash and leave the panel holding its pre-boot frame; a
@@ -371,6 +377,15 @@ void requestDeviceSleep() { deviceSleepRequested = true; }
 // the filesystem is STILL ATTACHED -- see the call site -- because every glyph
 // here comes off the SD card.
 static void drawUsbDriveNotice() {
+  // This is a UI screen, so it is drawn in the UI frame -- the control centre
+  // can be opened over a reader that has the renderer turned, and the panel's
+  // own Settings and Home tiles put the frame back for the same reason.
+  ReaderUtils::applyUiOrientation(renderer);
+  // Output polarity is normally set per render by ActivityManager, which is no
+  // longer running by the time this paints: state it here so the notice follows
+  // the night-mode setting instead of whatever the last render left behind.
+  display.setInverted(SETTINGS.screenInverted != 0);
+
   const int screenWidth = renderer.getScreenWidth();
   const int screenHeight = renderer.getScreenHeight();
   renderer.clearScreen();
@@ -636,7 +651,7 @@ void setup() {
   // Bound the target range too — RTC_NOINIT memory is uninitialized on cold boot.
   const bool isSilentReboot = (silentRebootMagic == SILENT_REBOOT_MAGIC);
   const uint32_t snapshotTarget =
-      (isSilentReboot && silentRebootTarget <= SILENT_REBOOT_TARGET_SLEEP) ? silentRebootTarget : 0;
+      (isSilentReboot && silentRebootTarget <= SILENT_REBOOT_TARGET_MAX) ? silentRebootTarget : 0;
   silentRebootMagic = 0;
   silentRebootTarget = 0;
 
@@ -828,7 +843,11 @@ void setup() {
     // target == home (or reader with no open book): land on home — don't fall
     // through to the sleep-wake "resume reader" logic, which fires on stale
     // openEpubPath + lastSleepFromReader from a prior session.
-    activityManager.goHome();
+    //
+    // Coming back from USB Drive the panel still holds the full-screen notice,
+    // so that target asks Home for a clean first paint rather than a partial
+    // one that would leave the notice underneath.
+    activityManager.goHome(HomeMenuItem::NONE, snapshotTarget == SILENT_REBOOT_TARGET_HOME_CLEAN);
   } else if (APP_STATE.openEpubPath.empty() || !APP_STATE.lastSleepFromReader ||
              mappedInputManager.isPressed(MappedInputManager::Button::Back) || APP_STATE.readerActivityLoadCount > 0) {
     // Boot to home screen if no book is open, last sleep was not from reader, back button is held, or reader activity
@@ -1157,9 +1176,10 @@ void loop() {
       Storage.endUsbDrive();
       Storage.setUsbDriveHandoffPending(false);
       // Deliberately not restartToHomeAfterStorageHandoff(): that draws a popup,
-      // and the filesystem the fonts live on has only just come back. A reboot
-      // shows the boot screen anyway.
-      silentRebootTarget = SILENT_REBOOT_TARGET_HOME;
+      // and the filesystem the fonts live on has only just come back. The
+      // reboot is silent, so the notice stays on the glass until Home's first
+      // paint -- which is why that paint has to be a clean one.
+      silentRebootTarget = SILENT_REBOOT_TARGET_HOME_CLEAN;
       silentRebootMagic = SILENT_REBOOT_MAGIC;
       handoffUsbOtgToSerialJtag();
       ESP.restart();
@@ -1176,7 +1196,7 @@ void loop() {
       LOG_INF("USB", "user ended USB Drive from the device");
       Storage.endUsbDrive();
       Storage.setUsbDriveHandoffPending(false);
-      silentRebootTarget = SILENT_REBOOT_TARGET_HOME;
+      silentRebootTarget = SILENT_REBOOT_TARGET_HOME_CLEAN;
       silentRebootMagic = SILENT_REBOOT_MAGIC;
       handoffUsbOtgToSerialJtag();
       ESP.restart();
@@ -1212,14 +1232,16 @@ void loop() {
       // which is the original "USB locks it up". E-ink holds an image with no
       // power and no card, so a frame put up now simply stays up for as long as
       // the host has the volume.
-      // Settle the render task BEFORE painting, not after. requestUpdateAndWait
-      // repaints whatever activity is current -- so running it after the notice
-      // was drawn simply painted over it. Its job here is to make sure no
-      // render is in flight when the card goes away; once it returns, nothing
-      // further is queued and the framebuffer is ours.
+      // RETIRE THE RENDER TASK, THEN PAINT. Settling it with a render is not
+      // enough: closing the control centre queues a repaint of the screen
+      // underneath, and render notifications queue, so a render can start the
+      // moment the settling one ends -- into the same single framebuffer this
+      // notice is drawn in, which is what "blended with the book" is.
+      // stopRenderingAndPaint() closes the latch before waiting, so no further
+      // render starts, and nothing repaints over the notice afterwards either
+      // (the reader would reach for fonts the host now owns).
       Storage.setUsbDriveHandoffPending(true);
-      activityManager.requestUpdateAndWait();
-      drawUsbDriveNotice();
+      activityManager.stopRenderingAndPaint(&drawUsbDriveNotice);
 #if FREEINK_CAP_BLE_TRANSFER
       BLE_LINK.end();
 #endif
@@ -1233,6 +1255,9 @@ void loop() {
         BLE_LINK.begin();
 #endif
         Storage.setUsbDriveHandoffPending(false);
+        // The notice was not the last frame after all, and the card never left,
+        // so put the screen underneath back.
+        activityManager.resumeRendering();
         activityManager.requestUpdate();
       }
       return;

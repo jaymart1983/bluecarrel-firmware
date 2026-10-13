@@ -73,6 +73,10 @@ class ActivityManager {
   // This variable must only be set by the main loop, to avoid race conditions
   std::atomic<bool> requestedUpdate{false};
 
+  // Set by stopRenderingAndPaint(): the render task then drains notifications
+  // without touching the framebuffer.
+  std::atomic<bool> renderingStopped{false};
+
   // Completed renders and their summed duration since boot. Written by the render
   // task only.
   std::atomic<uint32_t> completedRenders{0};
@@ -162,6 +166,27 @@ class ActivityManager {
   // Trigger a render and block until it completes.
   // Must NOT be called from the render task or while holding a RenderLock.
   void requestUpdateAndWait();
+
+  // Retire the render task and paint one last frame from the calling task.
+  //
+  // The render task owns the framebuffer: it repaints whatever activity is
+  // current on every notification, and notifications queue (a pop's
+  // requestUpdate, a status change), so one render can start the instant the
+  // previous one returns. A caller that draws its own frame alongside that gets
+  // the two mixed in the single shared buffer. This stops rendering first, then
+  // waits out whatever was in flight, then paints -- so `paint` has the buffer
+  // to itself and nothing repaints over it afterwards.
+  //
+  // Used by the USB Drive handover, which must also not render once the card
+  // (and the fonts on it) belongs to the host. Normally the way out of a final
+  // frame is a reboot; a handover that fails to start calls resumeRendering().
+  // Must NOT be called from the render task or while holding a RenderLock.
+  void stopRenderingAndPaint(void (*paint)());
+
+  // Undo stopRenderingAndPaint() when the frame it painted turned out not to be
+  // final after all (the USB handover failed to start). The caller must request
+  // an update: the panel is showing the final frame, not the activity.
+  void resumeRendering();
 };
 
 extern ActivityManager activityManager;  // singleton, to be defined in main.cpp

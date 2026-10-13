@@ -20,4 +20,17 @@ struct Rates {
 // Over the last minute of complete one-second buckets.
 Rates lastMinute();
 
+// Once per main-loop pass: whether the BLE controller currently has its radio
+// powered down between events (modem sleep). Time-weighted, so the share below
+// is sound even though each call is a point reading -- the loop samples far
+// faster than the 100-750 ms connection interval the controller sleeps between.
+void noteRadioState(uint32_t nowMs, bool asleep);
+
+struct RadioShare {
+  uint32_t asleepMs;  // radio powered down
+  uint32_t onMs;      // radio biased: advertising, connected or mid-event
+};
+// Since boot (every wake is a reset). Both zero until the first sample.
+RadioShare radio();
+
 }  // namespace power_stats

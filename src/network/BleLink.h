@@ -107,6 +107,11 @@ class BleLink {
   // the NimBLE stack standing for the power domain to take down. Idempotent.
   void prepareForDeepSleep();
   bool isRunning() const { return ble_ != nullptr; }
+  // True while the controller has the radio powered down between its
+  // advertising or connection events. Reads false whenever controller modem
+  // sleep is not in force, so a build without it measures as "radio on all the
+  // time" rather than silently reporting nothing. Cheap: one status read.
+  bool isRadioAsleep() const;
   // Pump the events the NimBLE host task queued. Called once per main loop,
   // whatever is on screen.
   void tick();

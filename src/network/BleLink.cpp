@@ -14,6 +14,7 @@
 #include <nimble/porting/nimble/include/os/os_mbuf.h>
 #include <nimble/nimble/host/include/host/ble_l2cap.h>
 #include <nimble/porting/nimble/include/mem/mem.h>
+#include <esp_bt.h>
 #include <esp_heap_caps.h>
 #include <esp_ota_ops.h>
 #include <esp_random.h>
@@ -1460,6 +1461,8 @@ void BleLink::begin() {
   setState(State::ADVERTISING);
   publishStatus();
 }
+
+bool BleLink::isRadioAsleep() const { return ble_ != nullptr && esp_bt_controller_is_sleeping(); }
 
 void BleLink::end() {
   if (!ble_) return;
@@ -3925,6 +3928,12 @@ void BleLink::startAboutDownload(const size_t offset, const size_t chunkSize) {
       p["window_s"] = rates.seconds;
       p["panel_wait_ms"] = cpu.panelWaitMs;
       p["panel_waits"] = cpu.panelWaits;
+      // Controller modem sleep: how much of the awake stretch the radio spent
+      // powered down rather than biased. The idle floor lives or dies here --
+      // with modem sleep off this reads 0 and the radio is on continuously.
+      const power_stats::RadioShare radioShare = power_stats::radio();
+      p["radio_asleep_ms"] = radioShare.asleepMs;
+      p["radio_on_ms"] = radioShare.onMs;
     }
     // Protocol features beyond the upload and download kinds. Here rather than in
     // `status`, whose read already sheds its capability lists to fit 512 bytes.

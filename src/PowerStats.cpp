@@ -18,6 +18,14 @@ uint32_t loopsInBucket = 0;
 uint32_t touchAtBucketStart = 0;
 bool started = false;
 
+// Radio accounting: eight bytes of static DRAM, charged forward from the last
+// sample so a stalled loop cannot invent time in either state.
+uint32_t radioAsleepMs = 0;
+uint32_t radioOnMs = 0;
+uint32_t radioSampleMs = 0;
+bool radioStarted = false;
+bool radioWasAsleep = false;
+
 uint16_t saturate(const uint32_t value) { return value > 0xFFFFU ? 0xFFFFU : static_cast<uint16_t>(value); }
 
 void closeBucket(const uint32_t loops, const uint32_t touches) {
@@ -48,6 +56,27 @@ void noteLoopPass(const uint32_t nowMs, const uint32_t touchReads) {
   if (nowMs - bucketStartMs >= BUCKET_MS) bucketStartMs = nowMs;
   loopsInBucket++;
 }
+
+void noteRadioState(const uint32_t nowMs, const bool asleep) {
+  if (!radioStarted) {
+    radioStarted = true;
+    radioSampleMs = nowMs;
+    radioWasAsleep = asleep;
+    return;
+  }
+  // The elapsed time belongs to the state the previous sample reported; this
+  // sample only says what the next stretch starts in.
+  const uint32_t elapsed = nowMs - radioSampleMs;
+  if (radioWasAsleep) {
+    radioAsleepMs += elapsed;
+  } else {
+    radioOnMs += elapsed;
+  }
+  radioSampleMs = nowMs;
+  radioWasAsleep = asleep;
+}
+
+RadioShare radio() { return RadioShare{radioAsleepMs, radioOnMs}; }
 
 Rates lastMinute() {
   Rates rates{};

@@ -13,6 +13,8 @@
 #include <cstring>
 #include <ctime>
 
+#include "PowerStats.h"
+
 namespace power_log {
 namespace {
 
@@ -32,10 +34,12 @@ constexpr uint32_t BATTERY_TTL_MS = 2000UL;
 
 // Sized so no line can ever be truncated: 23 (time) + 3 + 5 + 10 (uptime) + 9
 // (event) + 5 commas + 2 quotes + DETAIL_BYTES + newline fits inside LINE_BYTES.
-// Both buffers are locals, and together with the two number fields they keep
-// writeEvent's frame under the 256-byte stack rule.
-constexpr size_t LINE_BYTES = 136;
-constexpr size_t DETAIL_BYTES = 72;
+// DETAIL_BYTES has to hold the longest detail any event builds, which is the
+// sleep line's reason followed by the whole session summary. `line` is static
+// rather than a local so the two together stay inside writeEvent's 256-byte
+// stack budget; this module is main-loop-task only, so it has one writer.
+constexpr size_t LINE_BYTES = 168;
+constexpr size_t DETAIL_BYTES = 88;
 // Eight lines. Fixed static DRAM, never reallocated, so the log costs no heap
 // and cannot grow with the session.
 constexpr size_t BUFFER_BYTES = 1024;
@@ -235,7 +239,7 @@ void writeEvent(const char* event, const char* fmt, ...) {
     snprintf(mv, sizeof(mv), "%u", static_cast<unsigned>(now.mv));
   }
   const char* quote = strchr(detail, ',') != nullptr ? "\"" : "";
-  char line[LINE_BYTES];
+  static char line[LINE_BYTES];
   const int len = snprintf(line, sizeof(line), "%s,%s,%s,%lu,%s,%s%s%s\n", when, pct, mv, millis() / 1000UL, event,
                            quote, detail, quote);
   if (len <= 0) return;
@@ -261,9 +265,17 @@ void buildSessionSummary(char* out, const size_t size) {
   formatDuration(awake, sizeof(awake), awakeMs / 1000UL);
   char ble[12];
   formatDuration(ble, sizeof(ble), bleMs / 1000UL);
-  snprintf(out, size, "awake %s, cpu %lu%%, panel %lus, light %lu%%, ble %s", awake,
+  // Share of the awake stretch the BLE controller had its radio powered down.
+  // 0 means the radio was biased the whole time, which is what an idle floor of
+  // ~100 mA looks like; a high number means modem sleep is doing its job.
+  const power_stats::RadioShare radioShare = power_stats::radio();
+  const uint32_t radioTotalMs = radioShare.asleepMs + radioShare.onMs;
+  const uint32_t radioAsleepPct =
+      radioTotalMs > 0 ? static_cast<uint32_t>((static_cast<uint64_t>(radioShare.asleepMs) * 100ULL) / radioTotalMs)
+                       : 0;
+  snprintf(out, size, "awake %s, cpu %lu%%, panel %lus, light %lu%%, ble %s, radio %lu%%", awake,
            static_cast<unsigned long>(fullPct), static_cast<unsigned long>(cpu.panelWaitMs / 1000UL),
-           static_cast<unsigned long>(lightAvgPct), ble);
+           static_cast<unsigned long>(lightAvgPct), ble, static_cast<unsigned long>(radioAsleepPct));
 }
 
 void writePendingLight() {

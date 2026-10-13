@@ -468,6 +468,15 @@ static bool loadSleepFrameBuffer() {
 
 // Enter deep sleep mode
 void enterDeepSleep(const bool fromTimeout) {
+  // The raw card belongs to the host. Sleeping paints a sleep screen (fonts come
+  // off that card) and writes state to it, so every sleep path has to stop here
+  // -- the inactivity timer, the power hold and the Sleep tile alike. Guarded in
+  // the one place every caller passes through rather than at each call site. The
+  // host releasing the card reboots the device anyway, so nothing is lost.
+  if (Storage.usbDriveHandoffPending()) {
+    LOG_INF("SLP", "sleep refused: the SD card is handed to the USB host");
+    return;
+  }
   if (installAtSleepStartedMs != 0 && millis() - installAtSleepStartedMs < INSTALL_AT_SLEEP_GRACE_MS) return;
   // "Later" on the update prompt, or auto-install: the reader is being put down,
   // the one moment an install interrupts nobody. Install, reboot, and the reboot
@@ -903,6 +912,11 @@ void loop() {
   const unsigned long loopStartTime = millis();
   static unsigned long lastMemPrint = 0;
   power_stats::noteLoopPass(loopStartTime, gpio.touchReadCount());
+#if FREEINK_CAP_BLE_TRANSFER
+  // Above every early return in this function: the radio share has to cover the
+  // whole awake stretch, including the passes that bail out early.
+  power_stats::noteRadioState(loopStartTime, BLE_LINK.isRadioAsleep());
+#endif
 
   gpio.setSharedConfirmPowerShortPressEmitsPower(SETTINGS.shortPwrBtn == CrossPointSettings::SHORT_PWRBTN::SLEEP);
   // The side-key scheme is context-sensitive, so the input layer has to know
@@ -1064,8 +1078,25 @@ void loop() {
     return;
   }
 
+  // A cable holds the inactivity timer off. A plugged-in reader is charging or
+  // being worked on from a computer, and the one thing an inactivity sleep can
+  // do there is interrupt it: USB Drive stops being offerable, the serial
+  // monitor goes quiet, and the charge the timer was meant to protect is coming
+  // in anyway. An explicit request still sleeps -- the power hold and the Sleep
+  // tile are above this and unaffected.
+  //
+  // Held as its own timestamp rather than folded into lastActivityTime so the
+  // idle clock drop and the longer loop delay at the end of loop() still happen
+  // while plugged in, and so unplugging starts a fresh timeout instead of
+  // sleeping the instant the cable leaves.
+  static unsigned long lastUsbSeenTime = millis();
+  if (gpio.isUsbConnected()) lastUsbSeenTime = millis();
+  // Signed difference, so the later of the two is picked across a millis() wrap.
+  const unsigned long idleSinceMs =
+      static_cast<long>(lastUsbSeenTime - lastActivityTime) > 0 ? lastUsbSeenTime : lastActivityTime;
+
   const unsigned long sleepTimeoutMs = SETTINGS.getSleepTimeoutMs();
-  if (sleepTimeoutMs > 0 && millis() - lastActivityTime >= sleepTimeoutMs) {
+  if (sleepTimeoutMs > 0 && millis() - idleSinceMs >= sleepTimeoutMs) {
     LOG_DBG("SLP", "Auto-sleep triggered after %lu ms of inactivity", sleepTimeoutMs);
     enterDeepSleep(true);
     // This should never be hit as `enterDeepSleep` calls esp_deep_sleep_start

@@ -6,6 +6,7 @@
 #include <FsHelpers.h>
 #include <GfxRenderer.h>
 #include <HalDisplay.h>
+#include <HalFrontlight.h>
 #include <HalGPIO.h>
 #include <HalStorage.h>
 #include <I18n.h>
@@ -494,10 +495,13 @@ void SleepActivity::onEnter() {
 
   const bool frameWasInverted = display.isInverted();
 
-  // Sleep screens always use normal polarity. This activity draws directly
-  // from onEnter (outside ActivityManager's per-render polarity resolution),
-  // so clear any inversion left over from a night-mode reader render.
-  display.setInverted(false);
+  // Park the light before the sleep screen is painted rather than leaving it to
+  // HalPowerManager::startDeepSleep, but only in night mode: that setting is
+  // the user saying the room is dark, and it is where a lit sleep paint hurts.
+  // The cover and custom-bitmap screens are authored for a white page, so they
+  // go out bright whatever the reader was showing. E-ink retains the image with
+  // the light off, so nothing is lost; a light-mode sleep stays lit as before.
+  if (frameWasInverted) Frontlight.setOn(false);
 
   const bool renderQuickResume =
       SETTINGS.sleepScreen == CrossPointSettings::SLEEP_SCREEN_MODE::QUICK_RESUME ||
@@ -505,14 +509,27 @@ void SleepActivity::onEnter() {
        SETTINGS.quickResumeSleepScreen == CrossPointSettings::QUICK_RESUME_SLEEP_SCREEN::QUICK_RESUME_AFTER_TIMEOUT);
 
   if (renderQuickResume) {
+    // Quick Resume keeps the page already on the panel as the sleep screen, so
+    // the standing polarity stays with it -- clearing it here would repaint the
+    // whole page in light polarity. The frame saved for the wake paint is the
+    // logical one either way.
     return renderLastScreenSleepScreen();
   }
 
+  // Night mode is an output polarity, resolved per render by ActivityManager
+  // (ActivityManager.cpp:77). The sleep screens below need it off: bitmaps and
+  // covers are authored for a white page, and FreeInkDisplay drops the
+  // grayscale planes entirely while inverted. Clearing it alone would repaint
+  // the page light, because the "entering sleep" popup ends in a full-frame
+  // displayBuffer() (BaseTheme::drawPopup) -- that is the bright flash a
+  // night-mode sleep used to show. Materialize the inversion into the
+  // framebuffer first instead, so the retained page keeps its dark appearance
+  // across the switch and the popup lands on a dark page.
+  if (frameWasInverted) renderer.invertScreen();
+  display.setInverted(false);
+
   if (SETTINGS.sleepScreen == CrossPointSettings::SLEEP_SCREEN_MODE::TRANSPARENT_CUSTOM) {
-    // Transparent mode retains the current framebuffer. Materialize any
-    // output-level inversion first so the retained content keeps its visible
-    // polarity after the display driver returns to normal.
-    if (frameWasInverted) renderer.invertScreen();
+    // Transparent mode keeps the retained frame and draws the overlay onto it.
     if (APP_STATE.lastSleepFromReader) {
       ReaderUtils::applyOrientation(renderer, SETTINGS.orientation);
     }

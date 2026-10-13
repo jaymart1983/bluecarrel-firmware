@@ -73,7 +73,9 @@ void ActivityManager::renderTaskLoop() {
     if (currentActivity) {
       HalPowerManager::Lock powerLock;  // Ensure we don't go into low-power mode while rendering
       // Night mode is a global output polarity applied to every activity.
-      // The sleep screen forces normal polarity itself (SleepActivity).
+      // SleepActivity paints from onEnter and manages this itself: it keeps the
+      // standing polarity for the "entering sleep" popup and clears it only for
+      // the final sleep-screen paint.
       display.setInverted(SETTINGS.screenInverted != 0);
       const unsigned long renderStartMs = millis();
       currentActivity->render(std::move(lock));

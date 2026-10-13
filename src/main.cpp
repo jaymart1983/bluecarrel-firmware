@@ -775,6 +775,11 @@ void setup() {
       APP_STATE.showBootScreen = true;
       APP_STATE.saveToFile();
       if (Storage.exists(SLEEP_FRAME_FILE) && loadSleepFrameBuffer()) {
+        // The saved frame is logical, and SleepActivity left night mode's output
+        // polarity on when it painted it. Restore that polarity before pushing
+        // it back, or the wake paint flashes the page light until the first
+        // reader render inverts it again.
+        display.setInverted(SETTINGS.screenInverted != 0);
         const bool useDifferentialRefresh = gpio.deviceIsX3();
         if (useDifferentialRefresh) {
           // begin() clears the X3 controller RAM, so restore the saved frame as

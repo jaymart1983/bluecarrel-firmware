@@ -106,6 +106,15 @@ class BleLink {
   // advertising, sends the peer away and clears the scratch documents, and leaves
   // the NimBLE stack standing for the power domain to take down. Idempotent.
   void prepareForDeepSleep();
+  // Park the radio: advertiser off, peer sent away, NimBLE stack left standing.
+  // The reader becomes invisible to the phone and the controller has nothing to
+  // transmit, but nothing is torn down, so unparkRadio() brings it straight back.
+  // This is the duty cycle's way in and out (BleDutyCycle), and it is
+  // deliberately NOT end(): a reading session cycles this many times over, and
+  // NimBLEDevice::init/deinit cannot be cycled safely.
+  void parkRadio();
+  void unparkRadio();
+  bool radioParked() const { return radioParked_; }
   bool isRunning() const { return ble_ != nullptr; }
   // True while the controller has the radio powered down between its
   // advertising or connection events. Reads false whenever controller modem
@@ -399,6 +408,7 @@ class BleLink {
   std::string storeExpectedBook_;
 
   State state_ = State::STARTING;
+  bool radioParked_ = false;
   std::unique_ptr<BleLinkRuntime> ble_;
   HalFile uploadFile_;
   HalFile downloadFile_;

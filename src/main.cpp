@@ -51,6 +51,7 @@
 #include "network/FirmwareWatcher.h"
 #include "platform/UsbSerialJtagHandoff.h"
 #if FREEINK_CAP_BLE_TRANSFER
+#include "network/BleDutyCycle.h"
 #include "network/BleLink.h"
 #endif
 #include "util/ButtonNavigator.h"
@@ -527,6 +528,19 @@ void enterDeepSleep(const bool fromTimeout) {
   }
 #endif
 
+#if FREEINK_CAP_BLE_TRANSFER
+  // The sleep screen is up, so the reader already looks asleep -- which is the
+  // moment to spend a few seconds on the phone. While a book was open the radio
+  // has been parked between windows, so this is the last chance to hand over the
+  // reading position, pick up a queued book and see a firmware drop before the
+  // chip goes down for what may be days. Above noteSleep() so the radio time it
+  // spends lands in this awake session's summary rather than vanishing.
+  if (!sleepAfterUpdateBoot && bleDutyCycle.parked()) {
+    const bool synced = bleDutyCycle.runWindowBlocking("sleep");
+    LOG_INF("SLP", "sleep sync %s", synced ? "done" : "no phone");
+  }
+#endif
+
   // Before anything is torn down. noteSleep() writes the sleep line, the awake-
   // session summary and the gauge snapshot the next wake measures against, and
   // FLUSHES, then refuses every further write -- so the card is finished with
@@ -966,6 +980,15 @@ void loop() {
   // every activity. Below the exclusive-storage return above on purpose: while
   // USB Drive owns the raw card there is no filesystem for a transfer to land on.
   BLE_LINK.tick();
+  {
+    // Decided here rather than inside the link, because the policy's input is
+    // what is on screen: a book open is the state worth parking the radio for.
+    BleDutyCycle::Context dutyCtx;
+    dutyCtx.bookOpen = activityManager.isReaderActivity();
+    dutyCtx.charging = gpio.isUsbConnected();
+    dutyCtx.holdLinkUp = BLE_LINK.pairingWindowOpen() || BLE_LINK.pairPromptPending();
+    bleDutyCycle.update(dutyCtx);
+  }
 #endif
 
   // Look for a firmware image in the drop folder. Idle cost is two existence

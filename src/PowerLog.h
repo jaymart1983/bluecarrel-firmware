@@ -42,6 +42,10 @@ void noteBookClose(const char* path);
 void noteChargerState(bool connected);
 
 void noteBleConnected();
+
+// One sync window of the Bluetooth duty cycle, so the CSV shows the cadence the
+// policy actually ran at and what each window cost.
+void noteSyncWindow(const char* why, bool synced, uint32_t ms);
 // `peerName` may be null or empty when the link never authenticated.
 void noteBleDisconnected(const char* peerName);
 

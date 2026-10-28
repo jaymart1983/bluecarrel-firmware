@@ -32,6 +32,7 @@
 #include <limits>
 #include <utility>
 
+#include "BleDutyCycle.h"
 #include "BleTrustedHostStore.h"
 #include "BuildStamp.h"
 #include "CrossPointSettings.h"
@@ -1314,20 +1315,35 @@ struct BleLinkRuntime {
     if (restart) advertising->start();
   }
 
-  // Stop making work, without taking the stack down. Everything deep sleep
-  // genuinely needs: the advertiser off so nothing new arrives, and the peer told
-  // to go rather than left to time out.
+  // Stop making work, without taking the stack down: the advertiser off so
+  // nothing new arrives, and the peer told to go rather than left to time out.
   //
   // Nothing is detached and nothing is freed, because nothing is going away --
   // the runtime, the callback objects and the receive pool all stay exactly where
-  // the host task expects them until the power domain takes the whole chip down.
-  void quiesceForDeepSleep() {
+  // the host task expects them. That is what makes this the reversible half of
+  // the teardown, and the reason the duty cycle parks through here rather than
+  // through end(): a reading session parks and unparks many times over, and
+  // NimBLEDevice::init/deinit is the pair that cannot survive being cycled.
+  void park() {
     if (server) {
       server->advertiseOnDisconnect(false);
       for (const uint16_t handle : server->getPeerDevices()) server->disconnect(handle);
     }
     NimBLEDevice::stopAdvertising();
     waitForHostQuiet();
+  }
+
+  // Back on the air. The advertiser is the only thing a phone can find, so this
+  // is all a parked link needs to become connectable again.
+  void unpark() {
+    if (server) server->advertiseOnDisconnect(true);
+    startAdvertising();
+  }
+
+  // Deep sleep wants the same quiet as a park; the only difference is that
+  // nothing unparks it afterwards, because the chip is about to go down.
+  void quiesceForDeepSleep() {
+    park();
   }
 
   // Teardown runs on the main loop task while the NimBLE host task is still
@@ -1338,8 +1354,11 @@ struct BleLinkRuntime {
   // has been *dispatched* by the host task -- nimble_port_stop_cb releases the
   // semaphore it is waiting on from inside that dispatch (nimble_port.c:76-79,
   // 265-270), so the main task resumes while the host task has not yet broken out
-  // of nimble_port_run() (:280-292), let alone reached the vTaskDelete of itself
-  // in nimble_port_freertos_deinit(). nimble_port_deinit() then frees the default
+  // of nimble_port_run() (:280-292). Worse, on ESP_PLATFORM the host task falls out
+  // of its task function and self-destructs, while nimble_port_freertos_deinit ->
+  // esp_nimble_disable() vTaskDeletes that same handle from the main task
+  // (nimble_port_freertos.c:67-74) -- two frees of one TCB, which is the
+  // esp_cleanup_r frame seen in the field. nimble_port_deinit() then frees the default
   // event queue (vQueueDelete on g_eventq_dflt), deinits the host and deinits the
   // controller, under a task that is still unwinding through all three. Every
   // event still in flight when deinit() is called widens that window, and an
@@ -1410,6 +1429,8 @@ BleLink& BleLink::getInstance() {
 
 void BleLink::begin() {
   if (ble_) return;
+  // A fresh stack always comes up advertising, whatever the last one was doing.
+  radioParked_ = false;
 
   // A wake from deep sleep is a chip reset, so this IS the "just woke up" path.
   // Take the snapshot now so the first status a phone reads or is notified with
@@ -1515,6 +1536,24 @@ void BleLink::clearScratchDocuments() {
 //
 // So: say goodnight (the caller has already done that), stop the advertiser, send
 // the peer away, close the files, clear the card, and leave the stack standing.
+void BleLink::parkRadio() {
+  if (!ble_ || radioParked_) return;
+  // The duty cycle never parks over live work, but a park must not leave a
+  // half-finished transfer or an open channel behind if it ever does.
+  resetTransfer(true);
+  closeL2capChannel("link parked");
+  ble_->park();
+  radioParked_ = true;
+  LOG_INF("BLE", "radio parked");
+}
+
+void BleLink::unparkRadio() {
+  if (!ble_ || !radioParked_) return;
+  radioParked_ = false;
+  ble_->unpark();
+  LOG_INF("BLE", "radio advertising");
+}
+
 void BleLink::prepareForDeepSleep() {
   if (!ble_) return;
   // Before the card work below and before the radio goes quiet: nothing may
@@ -3944,7 +3983,17 @@ void BleLink::startAboutDownload(const size_t offset, const size_t chunkSize) {
     features.add("book_uuid");
     features.add("book_download");
     features.add("pair_prompt");
+    features.add("ble_duty_cycle");
     if (l2capServerUp()) features.add("l2cap_coc");
+    // The duty cycle, so the app can tell "parked between sync windows" from
+    // "the reader is gone" and say so rather than reporting an error. Read on
+    // every connect, which is always inside a window.
+    {
+      JsonObject d = doc["duty"].to<JsonObject>();
+      d["interval_ms"] = BleDutyCycle::INTERVAL_MS;
+      d["window_ms"] = BleDutyCycle::WINDOW_MS;
+      d["syncs_at_sleep"] = true;
+    }
     String json;
     serializeJson(doc, json);
     // The app reads `about` on every connect and it rarely changes.

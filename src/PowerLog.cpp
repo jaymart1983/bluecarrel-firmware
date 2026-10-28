@@ -428,6 +428,12 @@ void noteBleConnected() {
   writeEvent("ble", "connected");
 }
 
+void noteSyncWindow(const char* why, const bool synced, const uint32_t ms) {
+  if (!started || sealed) return;
+  writeEvent("sync", "%s window %s in %lus", why, synced ? "synced" : "no phone",
+             static_cast<unsigned long>((ms + 500) / 1000));
+}
+
 void noteBleDisconnected(const char* peerName) {
   if (!started || sealed) return;
   uint32_t heldS = 0;

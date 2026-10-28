@@ -745,6 +745,19 @@ void setup() {
   // light off unless Restore Light on Wake is enabled; silent maintenance
   // reboots preserve the live state so they do not unexpectedly go dark.
   const bool restoreLightOn = SETTINGS.frontlightOn != 0 && (SETTINGS.frontlightRestoreOnWake != 0 || isSilentReboot);
+#ifdef FREEINK_FRONTLIGHT_LS
+  // The light has to keep burning while the CPU dozes between page turns, so its
+  // LEDC timer is clocked from RC_FAST rather than the APB that light sleep stops.
+  // RC_FAST is only ~17.5 MHz and cannot divide the board profile's stock 25 kHz
+  // at 10-bit (that needs 25.6 MHz); ledc_timer_config() would refuse and leave
+  // the reader with no frontlight at all. 10 kHz divides to 1750 steps, so the
+  // full 10-bit duty range survives, and it is far above anything visible as
+  // flicker. Set here rather than in the board profile because the profile lives
+  // in the freeink-sdk submodule, which a release checks out clean.
+  if (BoardConfig::isX4Pro() && BoardConfig::ACTIVE.frontlight.pwmFrequency > 10000) {
+    BoardConfig::ACTIVE.frontlight.pwmFrequency = 10000;
+  }
+#endif
   Frontlight.begin(SETTINGS.frontlightBrightness, SETTINGS.frontlightWarmth, restoreLightOn);
 
   switch (wakeupReason) {

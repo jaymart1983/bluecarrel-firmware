@@ -11,6 +11,7 @@
 
 #include "CrossPointSettings.h"
 #include "components/themes/BaseTheme.h"
+#include "reader/ReaderUtils.h"
 #include "boot_sleep/BootActivity.h"
 #include "boot_sleep/SleepActivity.h"
 #include "home/CrashActivity.h"
@@ -168,10 +169,20 @@ void ActivityManager::loop() {
       int tx = 0;
       int ty = 0;
       const int width = renderer.getScreenWidth();
-      // The band's own height rather than a hard-coded 44, so the target is
-      // exactly the strip the user can see.
-      controlCenterTap = mappedInput.wasScreenTapped(tx, ty) && ty < BaseTheme::readerTopBarHeight() &&
-                         tx >= width / 3 && tx < (width * 2) / 3;
+      if (mappedInput.wasScreenTapped(tx, ty)) {
+        // In a book the target is the 4x4 grid's top two centre cells, the
+        // mirror of the reader menu at the foot of the page: everything else
+        // on the page turns pages (ReaderUtils::detectTouchPageTurn), so a
+        // strip only as tall as the status bar would be a sliver inside a
+        // page-turn zone.
+        controlCenterTap = currentActivity->name == "EpubReader"
+                               ? ReaderUtils::isReaderGridCentreCell(renderer, tx, ty, /*bottomRow=*/false)
+                               // Elsewhere: the band's own height rather than a hard-coded 44, so the
+                               // target is exactly the strip the user can see, and the left and right
+                               // thirds stay free for a screen's own chrome.
+                               : (ty < BaseTheme::readerTopBarHeight() && tx >= width / 3 &&
+                                  tx < (width * 2) / 3);
+      }
     }
     if (currentActivity->name != "FrontlightPanel" && controlCenterTap) {
       pushActivity(std::make_unique<FrontlightPanelActivity>(renderer, mappedInput));

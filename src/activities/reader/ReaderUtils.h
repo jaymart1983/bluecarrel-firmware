@@ -114,24 +114,41 @@ inline TouchPageTurn detectTouchPageTurn(const GfxRenderer& renderer, const Mapp
     return result;
   }
 
-  // Page-turn taps fill the middle half of the page: the left third turns back and
-  // the right two thirds turn forward, so the common tap has the larger target.
-  // Inverted Tap mirrors the split, keeping forward on the larger side. The top
-  // quarter holds the status bar (its centre opens the Control Centre, handled in
-  // ActivityManager) and the bottom quarter opens the reader menu (isTouchMenuTap).
-  // Logical coordinates, so the zones follow the reading orientation.
+  // A 4x4 grid over the page. The outer columns turn pages for their whole
+  // height, and the two centre columns turn pages too except for their top and
+  // bottom rows, which are the only cells the page turn gives up:
+  //
+  //     +------+------+------+------+
+  //     | back |  control centre    |   <- top centre two cells
+  //     |      +------+------+ next |
+  //     | back | next | next | next |
+  //     | back | next | next | next |
+  //     |      +------+------+      |
+  //     | back |  reader menu       |   <- bottom centre two cells
+  //     +------+------+------+------+
+  //
+  // Forward therefore takes everything but the left column and those four
+  // cells. Inverted Tap mirrors it left to right, so forward keeps the larger
+  // side. Logical coordinates, so the grid follows the reading orientation.
   const int16_t width = static_cast<int16_t>(renderer.getScreenWidth());
   const int16_t height = static_cast<int16_t>(renderer.getScreenHeight());
-  const int16_t bandTop = height / 4;
-  const int16_t bandHeight = static_cast<int16_t>(height - 2 * bandTop);
-  const int16_t third = width / 3;
-  const int16_t twoThirds = static_cast<int16_t>(width - third);
+  const int16_t column = width / 4;
+  const int16_t row = height / 4;
+  const int16_t rightColumn = static_cast<int16_t>(width - column);
+  const int16_t centreWidth = static_cast<int16_t>(rightColumn - column);
+  const int16_t centreHeight = static_cast<int16_t>(height - 2 * row);
+  // Inverted Tap swaps the two outer columns. The centre block is symmetric, so
+  // it is unaffected by the mirror and always turns forward -- which is also
+  // what keeps forward on the larger area either way up.
   const bool inverted = SETTINGS.touchReaderControls == CrossPointSettings::TOUCH_READER_INVERTED_TAP;
+  const auto leftColumn = inverted ? READER_TOUCH_NEXT : READER_TOUCH_PREV;
+  const auto rightColumnAction = inverted ? READER_TOUCH_PREV : READER_TOUCH_NEXT;
   const freeink::ui::TapZone zones[] = {
-      {freeink::ui::Rect{0, bandTop, inverted ? twoThirds : third, bandHeight},
-       inverted ? READER_TOUCH_NEXT : READER_TOUCH_PREV},
-      {freeink::ui::Rect{inverted ? twoThirds : third, bandTop, inverted ? third : twoThirds, bandHeight},
-       inverted ? READER_TOUCH_PREV : READER_TOUCH_NEXT},
+      // The outer columns, full height.
+      {freeink::ui::Rect{0, 0, column, height}, leftColumn},
+      {freeink::ui::Rect{rightColumn, 0, column, height}, rightColumnAction},
+      // The centre columns, minus the top and bottom rows.
+      {freeink::ui::Rect{column, row, centreWidth, centreHeight}, READER_TOUCH_NEXT},
   };
 
   for (const auto& zone : zones) {
@@ -144,21 +161,31 @@ inline TouchPageTurn detectTouchPageTurn(const GfxRenderer& renderer, const Mapp
   return result;
 }
 
-// Tap in the bottom quarter of the screen: the tap path into the reader menu on
-// every touch board. Page-turn taps take the whole middle half
-// (detectTouchPageTurn), so the menu lives below them, across the full width.
-// The Off/Swipe Up alternatives are only surfaced on home-key boards
-// (SettingsList), where the menu stays reachable through the key's long-press
-// function.
+// One cell test for the 4x4 reader grid's centre columns, shared by the menu tap
+// here and the Control Centre tap in ActivityManager so the two cannot drift
+// apart from detectTouchPageTurn's zones.
+inline bool isReaderGridCentreCell(const GfxRenderer& renderer, const int x, const int y, const bool bottomRow) {
+  const int width = renderer.getScreenWidth();
+  const int height = renderer.getScreenHeight();
+  const int column = width / 4;
+  const int row = height / 4;
+  if (x < column || x >= width - column) return false;
+  return bottomRow ? y >= height - row : y < row;
+}
+
+// The bottom two centre cells of the 4x4 grid: the tap path into the reader menu
+// on every touch board. The page turn owns everything around them
+// (detectTouchPageTurn), and the matching cells at the top open the Control
+// Centre (ActivityManager). The Off/Swipe Up alternatives are only surfaced on
+// home-key boards (SettingsList), where the menu stays reachable through the
+// key's long-press function.
 inline bool isTouchMenuTap(const GfxRenderer& renderer, const MappedInputManager& input) {
   if (!input.hasTouch()) return false;
   if (SETTINGS.showReaderMenu != CrossPointSettings::READER_MENU_TAP) return false;
   int x = 0;
   int y = 0;
   if (!input.wasScreenTapped(x, y)) return false;
-  const int height = renderer.getScreenHeight();
-  // Same boundary as the bottom of the page-turn band in detectTouchPageTurn.
-  return y >= height - height / 4;
+  return isReaderGridCentreCell(renderer, x, y, /*bottomRow=*/true);
 }
 
 // Reader menu opens on the menu edge-swipe or a bottom-quarter tap. On home-key

@@ -805,27 +805,28 @@ The role of the side buttons can be swapped in the **[Controls Settings](#363-co
 
 If the **Short Power Button Click** setting is set to "Page Turn", you can also turn to the next page by briefly pressing the Power button.
 
-**Touch page turns (touch devices such as the X4 Pro).** The page is split into three bands:
+**Touch page turns (touch devices such as the X4 Pro).** Think of the page as a 4 x 4 grid. Page turns own every
+cell except the four in the middle of the top and bottom rows:
 
 ```
-+-----------------------------+
-|     status bar  (top 1/4)   |
-+---------+-------------------+
-|         |                   |
-|  back   |       next        |
-|  (1/3)  |       (2/3)       |
-|         |                   |
-+---------+-------------------+
-|   reader menu  (bottom 1/4) |
-+-----------------------------+
++------+------+------+------+
+| back |  Control Centre    |
+|      +------+------+ next |
+| back | next | next | next |
+| back | next | next | next |
+|      +------+------+      |
+| back |   Reader Menu      |
++------+------+------+------+
 ```
 
-- In the **middle half** of the page, tap the **left third** to go back a page and anywhere in the **right two thirds**
-  to go forward.
-- **Touch Reader Controls > Inverted Tap** mirrors the split: the right third goes back and the left two thirds go
-  forward. **Swipe** also turns pages with a horizontal swipe.
-- Tap the **bottom quarter** of the page to open the reader menu (font, chapters and the rest). Tap the centre of the
-  status bar at the top to open the Control Centre.
+- Tap anywhere in the **left column** to go back a page. Everything else turns forward: the **right column** and the
+  **middle block**.
+- **Touch Reader Controls > Inverted Tap** swaps the two outer columns, so the left column turns forward. The middle
+  block always turns forward. **Swipe** also turns pages with a horizontal swipe.
+- Tap the **top centre** (the two middle cells of the top row) to open the Control Centre: brightness, warmth, dark
+  mode and the rest.
+- Tap the **bottom centre** (the two middle cells of the bottom row) to open the reader menu: font, chapters and the
+  rest.
 - A link is followed instead of turning the page, wherever it is on the page.
 - Page-turn taps and link taps follow the touchscreen switch (the **Touch** tile in the Control Centre): with touch
   off, only the side keys turn pages.

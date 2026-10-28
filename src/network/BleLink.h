@@ -201,6 +201,11 @@ class BleLink {
   // "out of range" or "crashed"; it just sees the link drop. Waking is a chip
   // reset, so the first status after boot already reports the reader awake.
   void notifySleeping();
+  // Say "parked, next window in `nextWindowMs`" before the radio goes dark. A
+  // park is otherwise indistinguishable from the reader going out of range, and
+  // a phone that cannot tell them apart spends the whole interval reconnecting
+  // to something that is deliberately not listening.
+  void notifyParking(uint32_t nextWindowMs);
 
   // --- observers -------------------------------------------------------------
   void setObserver(Observer* observer) { observer_ = observer; }
@@ -645,6 +650,11 @@ class BleLink {
   bool pingLibDirty_ = true;
   // Reported to the app so it can tell "gone to sleep" from "went away".
   bool sleeping_ = false;
+  // The radio is about to park between duty-cycle sync windows, and how long
+  // until the next one. Published once, just before the peer is sent away, so a
+  // phone can tell a park from the reader vanishing.
+  bool parked_ = false;
+  uint32_t parkNextMs_ = 0;
   // start_put asked to overwrite an existing book (a Calibre update). Reset per transfer.
   bool replaceExisting_ = false;
   // The `position` a book start_put carried, applied at commit. Reset per transfer.

@@ -31,6 +31,14 @@ void BleDutyCycle::openWindow(const char* why) {
   LOG_INF("BLEDUTY", "sync window open (%s)", why);
 }
 
+// Tell the phone before the radio goes dark, so a park is not mistaken for the
+// reader going out of range. Only worth saying while someone is listening.
+void BleDutyCycle::park() {
+  if (BLE_LINK.radioParked()) return;
+  if (BLE_LINK.isPeerConnected()) BLE_LINK.notifyParking(INTERVAL_MS);
+  BLE_LINK.parkRadio();
+}
+
 void BleDutyCycle::closeWindow() {
   if (windowStartedMs_ == 0) return;
   const uint32_t heldMs = millis() - windowStartedMs_;
@@ -74,7 +82,7 @@ void BleDutyCycle::update(const Context& ctx) {
   // Never paired: there is no phone to open a window for, so stay dark.
   if (!BLE_LINK.hasTrustedHost()) {
     closeWindow();
-    BLE_LINK.parkRadio();
+    park();
     return;
   }
 
@@ -101,7 +109,7 @@ void BleDutyCycle::update(const Context& ctx) {
       // not retried sooner, or a reader out of range would never park.
       lastSyncMs_ = now;
       closeWindow();
-      BLE_LINK.parkRadio();
+      park();
     }
     return;
   }
@@ -110,7 +118,7 @@ void BleDutyCycle::update(const Context& ctx) {
     openWindow("interval");
     return;
   }
-  BLE_LINK.parkRadio();
+  park();
 }
 
 bool BleDutyCycle::runWindowBlocking(const char* why) {

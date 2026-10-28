@@ -582,9 +582,13 @@ window or a pair prompt is on screen.
 
 What this means for a client:
 
-- A reader that stops advertising has not gone away. With `ble_duty_cycle` in `features`, treat a disconnect while a
-  book is open as "parked until the next window", not as an error, and say so to the user rather than showing a
-  failure.
+- **The reader says so before it goes dark.** The last status notification before a park carries `"parked":true` and
+  `"next_ms"` (milliseconds until the next window), the same way sleep is announced with `"sleeping":true`. A client
+  that sees it knows the reader is deliberately not listening and should stop trying until then. The notification can
+  be lost -- the peer is disconnected moments later -- so a client must also cope without it: `ble_duty_cycle` in
+  `features` means any disconnect while a book is open may be a park.
+- A reader that stops advertising has not gone away. Treat a disconnect while a book is open as "parked until the
+  next window", not as an error, and say so to the user rather than showing a failure.
 - **Reconnect on advertisement, not on a timer.** The client cannot know when a window opens, so it has to be
   scanning (or holding an OS-level auto-connect) to catch one. A client that only connects when the user opens a
   screen will miss most windows.
@@ -1001,7 +1005,7 @@ fits. It never truncates: a client always receives parseable JSON.
 
 `chunk_size` is added to a `sending` status only when it fits the document that was chosen without dropping
 anything more, so it never costs another field.
-| never | `state`, the heartbeat fields `lib_n`, `lib_h`, `pct`, `open`, `sleeping`, and `pending` |
+| never | `state`, the heartbeat fields `lib_n`, `lib_h`, `pct`, `open`, `sleeping`, `parked`, `next_ms`, and `pending` |
 
 If even the floor does not fit, no notification is sent; the GATT read still carries the session.
 
@@ -1294,6 +1298,8 @@ After authentication these fields are in both the GATT read and every notificati
 | `pct` | number | Progress through that book, `0`–`1`, from its saved position. Absent when unknown. |
 | `open` | bool | `true` while a book is open on screen. Absent otherwise. |
 | `sleeping` | bool | `true` in the notification sent just before the reader goes into deep sleep. The link then drops. Absent otherwise. |
+| `parked` | bool | `true` in the notification sent just before the reader parks its radio between duty-cycle sync windows. The link then drops, and the reader stops advertising until the next window. Absent otherwise. See [Bluetooth duty cycle](#bluetooth-duty-cycle). |
+| `next_ms` | integer | Milliseconds until the next sync window. Present only beside `parked`. |
 
 When they are sent: every 60 seconds while a phone is connected, when a book opens or closes, and once on the way into
 sleep. A saved EPUB position (a page turn) is sent at most once every 10 seconds: the first change after a quiet

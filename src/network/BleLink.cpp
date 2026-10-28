@@ -1550,6 +1550,8 @@ void BleLink::parkRadio() {
 void BleLink::unparkRadio() {
   if (!ble_ || !radioParked_) return;
   radioParked_ = false;
+  parked_ = false;
+  parkNextMs_ = 0;
   ble_->unpark();
   LOG_INF("BLE", "radio advertising");
 }
@@ -4604,6 +4606,14 @@ void BleLink::notifySleeping() {
   publishStatusNow();
 }
 
+void BleLink::notifyParking(const uint32_t nextWindowMs) {
+  if (!ble_) return;
+  refreshPingSnapshot(pingLibDirty_);
+  parked_ = true;
+  parkNextMs_ = nextWindowMs;
+  publishStatusNow();
+}
+
 void BleLink::publishStatus() {
   statusDirty_ = false;
   if (!ble_) return;
@@ -4690,6 +4700,10 @@ std::string BleLink::buildStatusJson(const StatusScope scope, const unsigned det
   if (pingPct_ >= 0.0f) doc["pct"] = pingPct_;
   if (pingOpen_) doc["open"] = true;
   if (sleeping_) doc["sleeping"] = true;
+  if (parked_) {
+    doc["parked"] = true;
+    doc["next_ms"] = parkNextMs_;
+  }
   if (wantSession) doc["protocol_version"] = BLE_PROTOCOL_VERSION;
   if (full) {
     if (wantDecoration) {

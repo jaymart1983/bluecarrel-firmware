@@ -55,6 +55,7 @@ class BleDutyCycle {
  private:
   void openWindow(const char* why);
   void closeWindow();
+  void park();
 
   bool started_ = false;
   uint32_t lastSyncMs_ = 0;

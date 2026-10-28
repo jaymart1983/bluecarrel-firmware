@@ -38,6 +38,7 @@
 #include "activities/settings/BlePairPromptActivity.h"
 #include "activities/Activity.h"
 #include "activities/ActivityManager.h"
+#include "activities/RenderLock.h"
 #include "activities/settings/SdFirmwareUpdateActivity.h"
 #include "activities/reader/ReaderUtils.h"
 #include "components/UITheme.h"
@@ -51,6 +52,7 @@
 #include "network/FirmwareWatcher.h"
 #include "platform/UsbSerialJtagHandoff.h"
 #if FREEINK_CAP_BLE_TRANSFER
+#include "CpuDoze.h"
 #include "network/BleDutyCycle.h"
 #include "network/BleLink.h"
 #endif
@@ -915,6 +917,10 @@ void setup() {
     gpio.update();
   }
 
+  // After the input layer and the touch rail are up: the doze samples the touch
+  // interrupt's resting level to work out which way it asserts.
+  cpu_doze::begin();
+
   allowSleepAt = millis() + 2000;
 
 #if FREEINK_CAP_BLE_TRANSFER
@@ -1380,10 +1386,22 @@ void loop() {
     if (millis() - lastActivityTime >= HalPowerManager::IDLE_POWER_SAVING_MS) {
       // If we've been inactive for a while, increase the delay to save power
       powerManager.setPowerSaving(true);  // Lower CPU frequency after extended inactivity
+      // Nothing has happened for seconds, which on this device means a page is
+      // being read. Spend the wait with the core stopped rather than spinning at
+      // 80 MHz; a key or a touch wakes it early, so a page turn pays nothing.
+      cpu_doze::Preconditions doze;
+      float heldX = 0.0f;
+      float heldY = 0.0f;
+      doze.usbPresent = gpio.isUsbConnected() || static_cast<bool>(Serial);
+      doze.inputIdle = !gpio.isPressed(HalGPIO::BTN_UP) && !gpio.isPressed(HalGPIO::BTN_DOWN) &&
+                       !gpio.isPressed(HalGPIO::BTN_POWER) && !gpio.isTouchHeldAt(heldX, heldY);
+      doze.renderIdle = !RenderLock::peek();
 #if FREEINK_CAP_BLE_TRANSFER
-      BLE_LINK.waitForWork(50);
+      doze.radioParked = BLE_LINK.radioParked();
+      if (!cpu_doze::doze(50, doze)) BLE_LINK.waitForWork(50);
 #else
-      delay(50);
+      doze.radioParked = true;  // no radio to keep awake on this board
+      if (!cpu_doze::doze(50, doze)) delay(50);
 #endif
     } else {
       // Short delay to prevent tight loop while still being responsive

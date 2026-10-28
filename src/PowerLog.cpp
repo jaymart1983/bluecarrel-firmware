@@ -4,6 +4,8 @@
 #include <BatteryMonitor.h>
 #include <HalClock.h>
 #include <HalFrontlight.h>
+
+#include "CpuDoze.h"
 #include <HalPowerManager.h>
 #include <HalStorage.h>
 #include <Logging.h>
@@ -273,8 +275,14 @@ void buildSessionSummary(char* out, const size_t size) {
   const uint32_t radioAsleepPct =
       radioTotalMs > 0 ? static_cast<uint32_t>((static_cast<uint64_t>(radioShare.asleepMs) * 100ULL) / radioTotalMs)
                        : 0;
-  snprintf(out, size, "awake %s, cpu %lu%%, panel %lus, light %lu%%, ble %s, radio %lu%%", awake,
-           static_cast<unsigned long>(fullPct), static_cast<unsigned long>(cpu.panelWaitMs / 1000UL),
+  // Share of the awake stretch the core was actually stopped. The counterpart to
+  // cpu %%: that says what clock it ran at, this says whether it ran at all.
+  const cpu_doze::Counters doze = cpu_doze::counters();
+  const uint32_t dozePct =
+      awakeMs > 0 ? static_cast<uint32_t>((static_cast<uint64_t>(doze.dozedMs) * 100ULL) / awakeMs) : 0;
+  snprintf(out, size, "awake %s, cpu %lu%%, doze %lu%%, panel %lus, light %lu%%, ble %s, radio %lu%%", awake,
+           static_cast<unsigned long>(fullPct), static_cast<unsigned long>(dozePct),
+           static_cast<unsigned long>(cpu.panelWaitMs / 1000UL),
            static_cast<unsigned long>(lightAvgPct), ble, static_cast<unsigned long>(radioAsleepPct));
 }
 

@@ -3,8 +3,8 @@
 #include <Arduino.h>
 #include <Logging.h>
 
-#include "PowerLog.h"
 #include "BleLink.h"
+#include "PowerLog.h"
 
 BleDutyCycle bleDutyCycle;
 

@@ -530,6 +530,16 @@ void enterDeepSleep(const bool fromTimeout) {
   }
 #endif
 
+  // The sleep screen is the last frame. Nothing may repaint over it, and in
+  // night mode nothing may even re-resolve the polarity: SleepActivity bakes the
+  // inversion into the framebuffer and then clears the output polarity, so a
+  // later render re-applies it on top and the whole page comes back LIGHT -- a
+  // white flash in a dark room. The sync window below connects a phone after
+  // that paint, and publishStatus() asks for a repaint when the link
+  // authenticates, which is exactly that render. Closing the latch here also
+  // waits out any render already in flight.
+  activityManager.stopRenderingAndPaint(nullptr);
+
 #if FREEINK_CAP_BLE_TRANSFER
   // The sleep screen is up, so the reader already looks asleep -- which is the
   // moment to spend a few seconds on the phone. While a book was open the radio

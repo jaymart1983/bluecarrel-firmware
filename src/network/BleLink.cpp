@@ -4652,7 +4652,11 @@ std::string BleLink::buildStatusJson(const StatusScope scope, const unsigned det
   const bool wantClock = !full || detail >= 3;       // clock_supported, device_time
   const bool wantSession = full || detail >= 5;   // session-constant capability facts
   const bool wantIdentity = full || detail >= 4;  // who this device is, and to whom
-  const bool wantProgress = full || detail >= 2;  // byte counters and the error text
+  // byte counters and the error text. While an upload is open these are not
+  // decoration: `received` is the client's flow control, and a notification that
+  // sheds it is a client that stops sending and waits for a byte count that can
+  // now only arrive if it sends more (the ackShed counter was built for this).
+  const bool wantProgress = full || detail >= 2 || transferOpen_;
   // NEVER shed. The reader is a peripheral and cannot call out, so a notification
   // carrying `pending` is the ONLY way it can ask the phone anything. Shedding it
   // to make the document fit produces a doorbell with no question behind it: the

@@ -108,7 +108,10 @@ void BleDutyCycle::update(const Context& ctx) {
   if (BLE_LINK.isBusy()) {
     authSeenInWindow_ = true;
     idleSinceMs_ = 0;
-    if (windowStartedMs_ == 0) windowStartedMs_ = nonZero(now);
+    // The window lasts as long as the work does. Holding the original deadline
+    // would park the radio out from under a phone that is still sending, once a
+    // sync of several files ran past the budget.
+    windowStartedMs_ = nonZero(now);
     BLE_LINK.unparkRadio();
     return;
   }

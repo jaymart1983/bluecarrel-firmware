@@ -32,6 +32,12 @@ class BleDutyCycle {
   // handshake measures 3-20 s in the field, so this is that with headroom; an
   // empty window costs about two seconds of radio per quarter hour.
   static constexpr uint32_t WINDOW_MS = 25UL * 1000UL;
+  // The window after a wake is longer. Waking is a chip reset, so the phone has
+  // to be told by the presence scan, connect, authenticate and then sync, and a
+  // wake-to-connected handshake has been measured at up to 20 s. This is the one
+  // window where falling short means the reader carries a stale position and no
+  // clock for the next quarter hour.
+  static constexpr uint32_t WAKE_WINDOW_MS = 45UL * 1000UL;
   // After the phone has authenticated, the window closes once the link has been
   // idle this long -- the phone has said what it came to say.
   static constexpr uint32_t SETTLE_MS = 2000UL;
@@ -53,7 +59,7 @@ class BleDutyCycle {
   uint32_t msUntilWindow() const;
 
  private:
-  void openWindow(const char* why);
+  void openWindow(const char* why, uint32_t windowMs = WINDOW_MS);
   void closeWindow();
   void park();
 
@@ -63,8 +69,13 @@ class BleDutyCycle {
   uint32_t idleSinceMs_ = 0;
   bool authSeenInWindow_ = false;
   bool parking_ = false;
+  // A wake is a chip reset, and the reader wakes into the book it was put down
+  // in. Until this reader has talked to the phone once, a book open is not a
+  // reason to park. See update().
+  bool syncedSinceWake_ = false;
   // Points at a string literal from the caller, so it needs no storage.
   const char* windowWhy_ = "interval";
+  uint32_t windowMs_ = WINDOW_MS;
 };
 
 extern BleDutyCycle bleDutyCycle;

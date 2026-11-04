@@ -39,6 +39,15 @@ void begin();
 // fails or the platform refused, and the caller then waits the ordinary way.
 bool doze(uint32_t ms, const Preconditions& pre);
 
+// Hand the sleep configuration back before the device enters DEEP sleep.
+//
+// MUST be called on every path to deep sleep. The timer and GPIO wake sources
+// are global and persistent, not per-call: the 50 ms timer armed for a doze was
+// still armed when the reader later slept for the night, so it woke 50 ms
+// later, booted, idled, slept, and woke again -- a flat battery in a day, and a
+// reader that was rebooting too often for Bluetooth to ever connect.
+void disarmForDeepSleep();
+
 struct Counters {
   uint32_t dozedMs;  // time the core was actually stopped
   uint32_t dozes;    // how many times

@@ -34,6 +34,15 @@ uint32_t dozeCount = 0;
 gpio_num_t touchIrq = GPIO_NUM_NC;
 int touchIdleLevel = 1;
 
+// Every pin armed as a wake source, so disarmForDeepSleep() can hand them back.
+constexpr size_t MAX_WAKE_PINS = 4;
+gpio_num_t wakePins[MAX_WAKE_PINS] = {GPIO_NUM_NC, GPIO_NUM_NC, GPIO_NUM_NC, GPIO_NUM_NC};
+size_t wakePinCount = 0;
+
+void rememberWakePin(const gpio_num_t gpio) {
+  if (wakePinCount < MAX_WAKE_PINS) wakePins[wakePinCount++] = gpio;
+}
+
 // A pressed button holds its pin at the active level, which is the only thing
 // light sleep can wake on.
 void armButton(const int8_t pin, const bool activeHigh) {
@@ -42,7 +51,9 @@ void armButton(const int8_t pin, const bool activeHigh) {
   const gpio_int_type_t level = activeHigh ? GPIO_INTR_HIGH_LEVEL : GPIO_INTR_LOW_LEVEL;
   if (gpio_wakeup_enable(gpio, level) != ESP_OK) {
     LOG_ERR("DOZE", "GPIO%d refused as a wake source", pin);
+    return;
   }
+  rememberWakePin(gpio);
 }
 
 }  // namespace
@@ -59,7 +70,9 @@ void begin() {
     touchIrq = static_cast<gpio_num_t>(touch.irq);
     touchIdleLevel = gpio_get_level(touchIrq);
     const gpio_int_type_t level = touchIdleLevel == 0 ? GPIO_INTR_HIGH_LEVEL : GPIO_INTR_LOW_LEVEL;
-    if (gpio_wakeup_enable(touchIrq, level) != ESP_OK) {
+    if (gpio_wakeup_enable(touchIrq, level) == ESP_OK) {
+      rememberWakePin(touchIrq);
+    } else {
       LOG_ERR("DOZE", "touch IRQ GPIO%d refused as a wake source", touch.irq);
       touchIrq = GPIO_NUM_NC;
     }
@@ -82,7 +95,9 @@ bool doze(const uint32_t ms, const Preconditions& pre) {
 
   if (esp_sleep_enable_timer_wakeup(static_cast<uint64_t>(ms) * 1000ULL) != ESP_OK) return false;
   const int64_t startUs = esp_timer_get_time();
-  if (esp_light_sleep_start() != ESP_OK) {
+  const esp_err_t slept = esp_light_sleep_start();
+  esp_sleep_disable_wakeup_source(ESP_SLEEP_WAKEUP_TIMER);
+  if (slept != ESP_OK) {
     if (++failures >= MAX_FAILURES) {
       givenUp = true;
       LOG_ERR("DOZE", "light sleep refused %u times; giving up for this session", failures);
@@ -90,11 +105,27 @@ bool doze(const uint32_t ms, const Preconditions& pre) {
     return false;
   }
   failures = 0;
+  // Disarmed immediately, not just before deep sleep: a source left armed here
+  // is one an unexpected path to deep sleep would inherit.
+  esp_sleep_disable_wakeup_source(ESP_SLEEP_WAKEUP_TIMER);
   const int64_t sleptUs = esp_timer_get_time() - startUs;
   if (sleptUs < MIN_USEFUL_US) return false;
   dozedUs += static_cast<uint64_t>(sleptUs);
   dozeCount++;
   return true;
+}
+
+void disarmForDeepSleep() {
+  // Deep sleep must wake on the power button and nothing else. The power button
+  // is armed separately by PowerManager::armPowerButtonWakeup() through ext1, so
+  // dropping the timer and GPIO sources here does not take it away.
+  esp_sleep_disable_wakeup_source(ESP_SLEEP_WAKEUP_TIMER);
+  esp_sleep_disable_wakeup_source(ESP_SLEEP_WAKEUP_GPIO);
+  for (size_t i = 0; i < wakePinCount; i++) {
+    if (wakePins[i] != GPIO_NUM_NC) gpio_wakeup_disable(wakePins[i]);
+  }
+  armed = false;
+  LOG_INF("DOZE", "wake sources handed back before deep sleep");
 }
 
 Counters counters() { return Counters{static_cast<uint32_t>(dozedUs / 1000ULL), dozeCount}; }

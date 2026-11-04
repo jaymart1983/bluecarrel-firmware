@@ -22,11 +22,12 @@ uint32_t BleDutyCycle::msUntilWindow() const {
   return elapsed >= INTERVAL_MS ? 0 : INTERVAL_MS - elapsed;
 }
 
-void BleDutyCycle::openWindow(const char* why) {
+void BleDutyCycle::openWindow(const char* why, const uint32_t windowMs) {
   windowStartedMs_ = nonZero(millis());
   idleSinceMs_ = 0;
   authSeenInWindow_ = false;
   windowWhy_ = why;
+  windowMs_ = windowMs;
   BLE_LINK.unparkRadio();
   LOG_INF("BLEDUTY", "sync window open (%s)", why);
 }
@@ -57,6 +58,7 @@ void BleDutyCycle::update(const Context& ctx) {
     closeWindow();
     parking_ = false;
     started_ = false;
+    syncedSinceWake_ = false;
     return;
   }
 
@@ -73,6 +75,9 @@ void BleDutyCycle::update(const Context& ctx) {
     closeWindow();
     parking_ = false;
     lastSyncMs_ = now;
+    // The link being up outside a book is the wake sync, so opening a book from
+    // here parks straight away rather than contacting a phone it just left.
+    syncedSinceWake_ = true;
     BLE_LINK.unparkRadio();
     return;
   }
@@ -83,6 +88,18 @@ void BleDutyCycle::update(const Context& ctx) {
   if (!BLE_LINK.hasTrustedHost()) {
     closeWindow();
     park();
+    return;
+  }
+
+  // The first pass since the reader woke, with a book already open. Waking is a
+  // chip reset and the reader comes back into the book it was put down in, so
+  // without this the radio parked within a loop pass of boot and stayed dark for
+  // a full interval: no position handed over, no clock from the phone, and
+  // nothing for the phone to find at all. Waking is exactly when the phone
+  // should be contacted, so a wake opens a window like any other.
+  if (!syncedSinceWake_) {
+    syncedSinceWake_ = true;
+    openWindow("wake", WAKE_WINDOW_MS);
     return;
   }
 
@@ -104,7 +121,7 @@ void BleDutyCycle::update(const Context& ctx) {
       idleSinceMs_ = now;
     }
     const bool settled = authSeenInWindow_ && idleSinceMs_ != 0 && now - idleSinceMs_ >= SETTLE_MS;
-    if (settled || now - windowStartedMs_ >= WINDOW_MS) {
+    if (settled || now - windowStartedMs_ >= windowMs_) {
       // Either way the next window is a full interval away: an empty window is
       // not retried sooner, or a reader out of range would never park.
       lastSyncMs_ = now;
@@ -123,7 +140,7 @@ void BleDutyCycle::update(const Context& ctx) {
 
 bool BleDutyCycle::runWindowBlocking(const char* why) {
   if (!BLE_LINK.isRunning() || !BLE_LINK.hasTrustedHost()) return false;
-  openWindow(why);
+  openWindow(why, WINDOW_MS);
   const uint32_t startMs = millis();
   uint32_t idleSinceMs = 0;
   bool authSeen = false;

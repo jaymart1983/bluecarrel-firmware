@@ -570,6 +570,11 @@ void enterDeepSleep(const bool fromTimeout) {
   LOG_INF("SLP", "sleep: ble stopped");
 #endif
 
+  // Before anything arms the real sleep: the doze's timer and GPIO wake sources
+  // are global, so one left armed from a 50 ms doze would wake the reader 50 ms
+  // into a night's sleep, over and over.
+  cpu_doze::disarmForDeepSleep();
+
   halTiltSensor.deepSleep();
   display.deepSleep();
   Storage.prepareForDeepSleep();

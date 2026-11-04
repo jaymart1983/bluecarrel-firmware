@@ -25,9 +25,14 @@ class BleDutyCycle {
     bool holdLinkUp = false;
   };
 
-  // The user-facing promise: while reading, the reader talks to the phone every
-  // quarter of an hour, and again as it goes to sleep.
-  static constexpr uint32_t INTERVAL_MS = 15UL * 60UL * 1000UL;
+  // While reading, the reader talks to the phone this often, and again as it is
+  // put down. Five minutes rather than the fifteen this started at: fifteen is
+  // how long the user waits before the phone can do ANYTHING they ask of it, and
+  // a quarter of an hour of a dead app is not worth what it saves. An empty
+  // window is about 25 s of advertising, so five minutes is an 8% duty on a
+  // radio that now sleeps between events -- well under a milliamp against the
+  // 45-75 mA of reading.
+  static constexpr uint32_t INTERVAL_MS = 5UL * 60UL * 1000UL;
   // How long a window stays open waiting for the phone. A wake-to-connected
   // handshake measures 3-20 s in the field, so this is that with headroom; an
   // empty window costs about two seconds of radio per quarter hour.
@@ -41,6 +46,11 @@ class BleDutyCycle {
   // After the phone has authenticated, the window closes once the link has been
   // idle this long -- the phone has said what it came to say.
   static constexpr uint32_t SETTLE_MS = 2000UL;
+  // How long a connected phone may say nothing before its session is treated as
+  // finished. Generous on purpose: this is the window a user has to open the
+  // app, pick a book or a firmware image and start it, and the cost of being
+  // wrong is the reader going dark under their hands.
+  static constexpr uint32_t SESSION_IDLE_MS = 30UL * 1000UL;
 
   // Called once per main loop pass. Parks and unparks the radio as the policy
   // requires; does nothing at all when the link is not running.

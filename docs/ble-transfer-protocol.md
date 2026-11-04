@@ -473,7 +473,7 @@ Support is advertised as `dark_mode` in the `features` list of the [`about`](#ab
 | `link` | object | The connection as it is now; absent when no phone is connected. See [`link`](#link-and-last_upload). |
 | `last_upload` | object | Measurements of the last `book`, `bmp` or `firmware` upload since boot. Absent before one. See [`last_upload`](#link-and-last_upload). |
 | `power` | object | Where the awake time went since this wake. See [`power`](#power). Absent on older firmware. |
-| `duty` | object | The [Bluetooth duty cycle](#bluetooth-duty-cycle): `interval_ms` between sync windows while a book is open, `window_ms` that each window stays open, and `syncs_at_sleep` (the reader opens one more window as it is put down). Absent on older firmware, which keeps the radio up the whole time. |
+| `duty` | object | The [Bluetooth duty cycle](#bluetooth-duty-cycle): `interval_ms` between sync windows while a book is open (five minutes), `window_ms` that each window stays open, and `syncs_at_sleep` (the reader opens one more window as it is put down). Absent on older firmware, which keeps the radio up the whole time. |
 | `features` | array of strings | Protocol features beyond the upload and download kinds. `book_position`: a `book` upload accepts `position` (see [Opening position](#opening-position)). `download_window`: `start_get` accepts `window` and `get_ack` is cumulative (see [Download frames and acknowledgement](#download-frames-and-acknowledgement)). `dark_mode`: the `set_dark_mode` op is supported and `dark_mode` is reported here. `book_uuid`: `start_put` for `book` and `book_meta` accept `calibre_uuid`, and `library` reports it. `book_download`: the `book` download kind (see [`book` download](#book-download)). `pair_prompt`: a closed-window `pair` asks on the reader (see [Pair prompt](#pair-prompt)). `ble_duty_cycle`: the reader parks its radio between sync windows while a book is open, and reports the schedule in `duty` (see [Bluetooth duty cycle](#bluetooth-duty-cycle)). `l2cap_coc`: `start_put` and `start_get` accept `"transport":"l2cap"` and the `l2cap` object above says where (see [The L2CAP channel](#the-l2cap-channel)). Absent on older firmware. |
 
 `about` is not listed in `download_kinds`.
@@ -572,7 +572,7 @@ There is no field for how long the panel's power supply was on: the display driv
 
 Reading is the one thing the reader does for hours with nobody touching it, and an idle advertiser costs current for
 all of it. So **while a book is open** the reader parks its radio: the advertiser stops and any peer is disconnected.
-It comes back on the air for a `window_ms` sync window every `interval_ms`, and for one more window as the reader is
+It comes back on the air for a `window_ms` sync window every `interval_ms`, and a window that a phone actually joins stays open until that phone stops talking, and for one more window as the reader is
 put to sleep, behind the sleep screen. A window closes early once a phone has authenticated and then gone quiet, so a
 sync that takes two seconds costs two seconds.
 

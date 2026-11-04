@@ -113,8 +113,15 @@ class BleLink {
   // deliberately NOT end(): a reading session cycles this many times over, and
   // NimBLEDevice::init/deinit cannot be cycled safely.
   void parkRadio();
+  void noteInbound();
   void unparkRadio();
   bool radioParked() const { return radioParked_; }
+  // Milliseconds since the phone last sent anything, or UINT32_MAX if it has
+  // sent nothing since the stack came up.
+  uint32_t msSinceInbound() const {
+    const uint32_t at = lastInboundMs_.load(std::memory_order_relaxed);
+    return at == 0 ? UINT32_MAX : millis() - at;
+  }
   bool isRunning() const { return ble_ != nullptr; }
   // True while the controller has the radio powered down between its
   // advertising or connection events. Reads false whenever controller modem
@@ -414,6 +421,11 @@ class BleLink {
 
   State state_ = State::STARTING;
   bool radioParked_ = false;
+  // millis() of the last thing the phone sent -- a control op or a data frame.
+  // The duty cycle needs "is this session still doing something", which isBusy()
+  // cannot answer: between two operations no transfer is open, and parking there
+  // hangs up on a phone that is only drawing breath.
+  std::atomic<uint32_t> lastInboundMs_{0};
   std::unique_ptr<BleLinkRuntime> ble_;
   HalFile uploadFile_;
   HalFile downloadFile_;

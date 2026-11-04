@@ -117,14 +117,33 @@ void BleDutyCycle::update(const Context& ctx) {
   }
 
   if (windowStartedMs_ != 0) {
-    if (BLE_LINK.isAuthenticated()) {
+    // A phone that has turned up OWNS the window. The budget below is for
+    // waiting for one, not for hanging up on one that arrived: a connect takes
+    // 3-20 s, and reading status and `about` is not "busy", so a budget that
+    // counted against a live session cut the phone off seconds after it got in
+    // and sent it away for a whole interval. That is what made sending a book or
+    // a firmware image unreliable.
+    //
+    // A session is over when the phone stops sending, not when a transfer
+    // closes -- between two operations no transfer is open.
+    if (BLE_LINK.isPeerConnected()) {
+      authSeenInWindow_ = true;
+      if (BLE_LINK.msSinceInbound() < SESSION_IDLE_MS) {
+        idleSinceMs_ = 0;
+        BLE_LINK.unparkRadio();
+        return;
+      }
+      // Connected but saying nothing for a while: let the rules below close it.
+      if (idleSinceMs_ == 0) idleSinceMs_ = now;
+    } else if (BLE_LINK.isAuthenticated()) {
       authSeenInWindow_ = true;
       idleSinceMs_ = 0;
     } else if (authSeenInWindow_ && idleSinceMs_ == 0) {
       idleSinceMs_ = now;
     }
     const bool settled = authSeenInWindow_ && idleSinceMs_ != 0 && now - idleSinceMs_ >= SETTLE_MS;
-    if (settled || now - windowStartedMs_ >= windowMs_) {
+    // A window that never found a phone still has to end.
+    if (settled || (!authSeenInWindow_ && now - windowStartedMs_ >= windowMs_)) {
       // Either way the next window is a full interval away: an empty window is
       // not retried sooner, or a reader out of range would never park.
       lastSyncMs_ = now;

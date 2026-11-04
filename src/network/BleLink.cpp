@@ -1536,6 +1536,17 @@ void BleLink::clearScratchDocuments() {
 //
 // So: say goodnight (the caller has already done that), stop the advertiser, send
 // the peer away, close the files, clear the card, and leave the stack standing.
+namespace {
+// millis() can legitimately be 0 for a millisecond, and 0 is the "nothing yet"
+// sentinel for lastInboundMs_.
+uint32_t nonZeroMs(const uint32_t ms) { return ms == 0 ? 1 : ms; }
+}  // namespace
+
+void BleLink::noteInbound() {
+  // Called from the NimBLE host task, so this is the one atomic store it takes.
+  lastInboundMs_.store(nonZeroMs(millis()), std::memory_order_relaxed);
+}
+
 void BleLink::parkRadio() {
   if (!ble_ || radioParked_) return;
   // The duty cycle never parks over live work, but a park must not leave a
@@ -1962,12 +1973,14 @@ void BleLink::enqueueSecurityResult(const uint16_t connHandle, const bool accept
 }
 
 void BleLink::enqueueControlWrite(const uint16_t connHandle, std::string value) {
+  noteInbound();
   BleEvent event{BleEventType::CONTROL, std::move(value)};
   event.connHandle = connHandle;
   enqueueBleEvent(std::move(event));
 }
 
 void BleLink::enqueueDataWrite(const uint16_t connHandle, std::string value) {
+  noteInbound();
   BleEvent event{BleEventType::DATA, std::move(value)};
   event.connHandle = connHandle;
   enqueueBleEvent(std::move(event));

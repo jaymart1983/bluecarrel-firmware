@@ -831,6 +831,17 @@ void setup() {
 
   setupDisplayAndFonts(resume != BootResume::Splash);
 
+  // State the output polarity BEFORE anything paints. ActivityManager resolves
+  // it per render, but a wake starts from the driver's default (not inverted),
+  // so in dark mode the first render CHANGES it -- and a changed polarity marks
+  // the inversion dirty, which promotes that paint from FAST to HALF
+  // (FreeInkDisplay::displayBuffer). A HALF refresh is a full flashing cycle, so
+  // switching the reader on in dark mode flashed the page white every time.
+  // Setting it here makes the first render's call a no-op and the paint stays
+  // FAST. The Quick Resume branch below states it again for its own restore,
+  // which is now redundant but harmless.
+  display.setInverted(SETTINGS.screenInverted != 0);
+
   switch (resume) {
     case BootResume::Silent:
       // Splash skipped: the routing block below picks the target activity; the
@@ -873,8 +884,6 @@ void setup() {
       break;
   }
 
-  // Output polarity is resolved per render by ActivityManager (night mode
-  // inverts only the reading surfaces), so nothing to restore here.
 
   if (recoveryFirmwareMode) {
     // Skip normal home/reader routing: jump straight into the SD firmware picker.
